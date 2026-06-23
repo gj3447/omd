@@ -11,14 +11,22 @@ from __future__ import annotations
 import json
 import time
 
+import os
+
 from . import fsm
 from .disjoint import sets_overlap
+from .gitio import GitRepo
 from .store import Store
 
 
 class Coordinator:
-    def __init__(self, db_path: str = ":memory:"):
+    def __init__(self, db_path: str = ":memory:", repo: str | None = None,
+                 worktrees_dir: str | None = None):
         self.store = Store(db_path)
+        self.git = GitRepo(repo) if repo else None
+        if self.git:
+            self.worktrees_dir = worktrees_dir or (self.git.root.rstrip("/") + "-omd-worktrees")
+            os.makedirs(self.worktrees_dir, exist_ok=True)
 
     # ---- 내부 ----
     def _conflicts(self, pathspec, mode) -> list[str]:
@@ -110,14 +118,29 @@ class Coordinator:
         return None
 
     def start(self, task_id, agent_id):
-        """READY task에 agent 배정 → IN_ORBIT."""
+        """READY task에 agent 배정 → IN_ORBIT. repo 바인딩 시 물방울 worktree 발사."""
         t = self.store.get_task(task_id)
         s = t["state"]
         if s == "READY":
             s = fsm.advance("task", s, "claim")
         s = fsm.advance("task", s, "start")  # CLAIMED→IN_ORBIT
-        self.store.set_task(task_id, state=s, agent_id=agent_id)
-        return {"task_id": task_id, "state": s}
+        worktree = branch = None
+        if self.git:
+            branch = f"omd/{task_id}"
+            worktree = os.path.join(self.worktrees_dir, task_id)
+            self.git.add_worktree(branch, worktree)
+        self.store.set_task(task_id, state=s, agent_id=agent_id,
+                            worktree=worktree if self.git else ...,
+                            branch=branch if self.git else ...)
+        return {"task_id": task_id, "state": s, "worktree": worktree, "branch": branch}
+
+    def commit(self, task_id, msg):
+        """물방울 worktree의 변경을 커밋(repo 바인딩 시)."""
+        if not self.git:
+            return {"ok": False, "reason": "no repo bound"}
+        t = self.store.get_task(task_id)
+        sha = self.git.commit_all(t["worktree"], msg)
+        return {"ok": True, "sha": sha}
 
     def finish(self, task_id):
         t = self.store.get_task(task_id)
@@ -140,16 +163,26 @@ class Coordinator:
         s = t["state"]
         if s == "IN_ORBIT":
             s = fsm.advance("task", s, "finish")
-        s = fsm.advance("task", s, "connect")
-        s = fsm.advance("task", s, "merged")
+        s = fsm.advance("task", s, "connect")  # DONE→CONNECTING
         self.store.set_task(task_id, state=s)
+        merge_sha = None
+        if self.git:
+            from .gitio import GitError
+            try:
+                merge_sha = self.git.merge(t["branch"], f"CLOUD CONNECT {task_id}")
+            except GitError as e:
+                self.store.set_task(task_id, state=fsm.advance("task", "CONNECTING", "abort"))
+                return {"ok": False, "reason": str(e), "task_id": task_id, "state": "ABORTED"}
+        self.store.set_task(task_id, state=fsm.advance("task", "CONNECTING", "merged"))
         for o in writes:
             self.store.set_orbit(o["orbit_id"],
                                  state=fsm.advance("orbit", "HELD", "release"),
                                  released_at=time.time())
+        if self.git:
+            self.git.remove_worktree(t["worktree"])
         self.store.set_flag(task_id, "merged")
         self._promote_pending()
-        return {"ok": True, "task_id": task_id, "state": "MERGED"}
+        return {"ok": True, "task_id": task_id, "state": "MERGED", "merge_sha": merge_sha}
 
     def flag_set(self, key, value, agent_id=None):
         self.store.set_flag(key, value, set_by=agent_id)
