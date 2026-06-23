@@ -157,7 +157,7 @@ ARMED ──arrive×N──► TRIPPED ──(대기자 일괄 해제)──► 
 
 ## 4. glob 교집합(입체 판정) & 영속화
 
-- **교집합**: pathspec(glob) 두 집합이 겹치는지. 단순구현=정규화 후 prefix-tree(trie) 또는 `pathspec`(git wildmatch, Agent Mail `app.py:4367`의 union PathSpec 방식) 차용.
+- **교집합(입체 판정)**: `omd_server/disjoint.py` 구현 완료 — 세그먼트('/')별 패턴-교집합. `**`=0+세그먼트 흡수, `*`=세그먼트내 0+문자, `?`=1문자, 문자클래스 `[...]`는 보수적 True. **soundness 우선**(false-negative 0). 예: `src/*.py` ∩ `src/auth/**` = ∅(정확히 서로소), `src/**` ∩ `src/auth/x.py` = 충돌.
 - **영속화**: 모든 `P` 엔티티를 SQLite(또는 Postgres) state 컬럼으로. crash 복구 = 재기동 시 HELD/IN_ORBIT 재구성 + 만료 sweeper 재가동.
 - **만료 sweeper**: 주기적으로 `now ≥ expires_at` HELD orbit → expire. (Agent Mail `FILE_RESERVATIONS_CLEANUP_INTERVAL` 방식.)
 
