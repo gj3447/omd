@@ -22,7 +22,8 @@ CREATE INDEX IF NOT EXISTS idx_orbits_state ON orbits(state);
 CREATE INDEX IF NOT EXISTS idx_orbits_task ON orbits(task_id);
 CREATE TABLE IF NOT EXISTS tasks (
   task_id TEXT PRIMARY KEY, name TEXT, writes TEXT, reads TEXT, deps TEXT,
-  state TEXT NOT NULL, agent_id TEXT, priority INTEGER, created_at REAL
+  state TEXT NOT NULL, agent_id TEXT, priority INTEGER, created_at REAL,
+  worktree TEXT, branch TEXT
 );
 CREATE TABLE IF NOT EXISTS agents (
   agent_id TEXT PRIMARY KEY, name TEXT, state TEXT, last_heartbeat REAL
@@ -115,12 +116,12 @@ class Store:
     def get_task(self, task_id) -> dict | None:
         return _row(self.db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)))
 
-    def set_task(self, task_id, *, state=..., agent_id=...):
+    def set_task(self, task_id, *, state=..., agent_id=..., worktree=..., branch=...):
         sets, args = [], []
-        if state is not ...:
-            sets.append("state=?"); args.append(state)
-        if agent_id is not ...:
-            sets.append("agent_id=?"); args.append(agent_id)
+        for col, val in (("state", state), ("agent_id", agent_id),
+                         ("worktree", worktree), ("branch", branch)):
+            if val is not ...:
+                sets.append(f"{col}=?"); args.append(val)
         if not sets:
             return
         args.append(task_id)

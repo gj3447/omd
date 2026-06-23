@@ -1,0 +1,83 @@
+"""End-to-end: 실물 git 레포에서 OMD 명제 증명 —
+서로소(입체) write-set 두 물방울이 각자 worktree에서 작업 → CLOUD CONNECT(merge) 무충돌."""
+
+import subprocess
+from pathlib import Path
+
+from omd_server import Coordinator
+
+
+def _git(args, cwd):
+    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True)
+
+
+def _init_repo(root: Path):
+    root.mkdir()
+    _git(["init", "-b", "main"], root)
+    _git(["config", "user.name", "t"], root)
+    _git(["config", "user.email", "t@t"], root)
+    (root / "README.md").write_text("base\n")
+    _git(["add", "-A"], root)
+    _git(["commit", "-m", "base"], root)
+
+
+def test_end_to_end_disjoint_merge(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"), repo=str(repo),
+                      worktrees_dir=str(tmp_path / "wt"))
+
+    omd.declare("A", writes=["a/**"])
+    omd.declare("B", writes=["b/**"])
+
+    # 물방울 A: 자기 궤도(a/**) + worktree에서 a/x.py 작성
+    assert omd.next_task("agA")["task_id"] == "A"
+    omd.claim("agA", ["a/**"], task_id="A")
+    sa = omd.start("A", "agA")
+    (Path(sa["worktree"]) / "a").mkdir(parents=True)
+    (Path(sa["worktree"]) / "a" / "x.py").write_text("x = 1\n")
+    omd.commit("A", "feat: a/x")
+    omd.finish("A")
+
+    # 물방울 B: 서로소 궤도(b/**) → next가 A의 활성 궤도와 안 겹쳐 배정
+    assert omd.next_task("agB")["task_id"] == "B"
+    omd.claim("agB", ["b/**"], task_id="B")
+    sb = omd.start("B", "agB")
+    (Path(sb["worktree"]) / "b").mkdir(parents=True)
+    (Path(sb["worktree"]) / "b" / "y.py").write_text("y = 2\n")
+    omd.commit("B", "feat: b/y")
+    omd.finish("B")
+
+    # CLOUD CONNECT (응결=실제 merge) — 둘 다 무충돌
+    ra = omd.connect("A")
+    rb = omd.connect("B")
+    assert ra["ok"] and ra["state"] == "MERGED", ra
+    assert rb["ok"] and rb["state"] == "MERGED", rb
+
+    # 통합 브랜치에 두 파일 모두 존재 = 분열 0
+    assert (repo / "a" / "x.py").exists()
+    assert (repo / "b" / "y.py").exists()
+    log = subprocess.run(["git", "log", "--oneline"], cwd=str(repo),
+                         capture_output=True, text=True).stdout
+    assert "CLOUD CONNECT A" in log and "CLOUD CONNECT B" in log
+
+
+def test_connect_stale_lease_does_not_merge(tmp_path):
+    """작업 중 lease 만료 → fencing으로 merge 거부(통합 브랜치 불변)."""
+    import time
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"), repo=str(repo),
+                      worktrees_dir=str(tmp_path / "wt"))
+    omd.declare("A", writes=["a/**"])
+    omd.next_task("agA")
+    omd.claim("agA", ["a/**"], "write", ttl=0.05, task_id="A")
+    sa = omd.start("A", "agA")
+    (Path(sa["worktree"]) / "a").mkdir(parents=True)
+    (Path(sa["worktree"]) / "a" / "x.py").write_text("x = 1\n")
+    omd.commit("A", "feat: a/x")
+    omd.finish("A")
+    time.sleep(0.08)
+    res = omd.connect("A")
+    assert res["ok"] is False and "stale" in res["reason"]
+    assert not (repo / "a" / "x.py").exists()  # merge 안 됨
