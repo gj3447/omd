@@ -26,8 +26,21 @@ def test_overlap_siblings_disjoint():
     assert sets_overlap(["src/a/**", "docs/**"], ["src/b/**", "test/**"]) is False
 
 
-def test_overlap_wildcard_head_is_conservative():
-    assert globs_overlap("*.py", "src/a.py") is True  # 전체 매칭은 보수적 충돌
+def test_overlap_precise_segments():
+    # 정밀: src/*.py(직접 자식만) 와 src/auth/**(서브트리)는 서로소
+    assert globs_overlap("src/*.py", "src/auth/x.py") is False
+    assert globs_overlap("src/**", "src/auth/x.py") is True
+    # 세그먼트 깊이 다르면 서로소
+    assert globs_overlap("*.py", "src/a.py") is False
+    # 재귀 와일드카드는 깊이 가로질러 겹침
+    assert globs_overlap("**/*.py", "src/a.py") is True
+    # 디렉토리 선언(trailing /) = 서브트리
+    assert globs_overlap("src/auth/", "src/auth/login.py") is True
+
+
+def test_overlap_charclass_conservative():
+    # 문자클래스는 안전하게 overlap=True (false-negative 금지)
+    assert globs_overlap("src/[ab].py", "src/c.py") is True
 
 
 # ---- claim: 입체면 둘 다 HELD, 겹치면 두번째 PENDING ----
