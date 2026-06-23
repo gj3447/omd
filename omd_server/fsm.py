@@ -1,0 +1,56 @@
+"""Orbit / Task 상태머신 — pytransitions 기반 (deep-research 추천 A).
+
+상태 자체는 SQLite에 별도 영속(store.py). 여기 FSM은 **전이 합법성 검증기**:
+저장된 state로 머신을 재수화 → trigger → 불법이면 MachineError. 새 state를 돌려줌.
+"""
+
+from __future__ import annotations
+
+from transitions import Machine
+
+ORBIT_STATES = ["PENDING", "HELD", "RELEASED", "EXPIRED", "DENIED"]
+ORBIT_TRANSITIONS = [
+    {"trigger": "hold", "source": "PENDING", "dest": "HELD"},     # 요청 즉시 grant(입체)
+    {"trigger": "grant", "source": "PENDING", "dest": "HELD"},    # 대기 후 promote
+    {"trigger": "renew", "source": "HELD", "dest": "HELD"},
+    {"trigger": "release", "source": "HELD", "dest": "RELEASED"},
+    {"trigger": "expire", "source": "HELD", "dest": "EXPIRED"},
+    {"trigger": "deny", "source": "PENDING", "dest": "DENIED"},
+]
+
+TASK_STATES = [
+    "PENDING", "BLOCKED", "READY", "CLAIMED", "IN_ORBIT",
+    "DONE", "CONNECTING", "MERGED", "ABORTED",
+]
+TASK_TRANSITIONS = [
+    {"trigger": "block", "source": "PENDING", "dest": "BLOCKED"},
+    {"trigger": "ready", "source": ["PENDING", "BLOCKED"], "dest": "READY"},
+    {"trigger": "claim", "source": "READY", "dest": "CLAIMED"},
+    {"trigger": "start", "source": "CLAIMED", "dest": "IN_ORBIT"},
+    {"trigger": "finish", "source": "IN_ORBIT", "dest": "DONE"},
+    {"trigger": "connect", "source": "DONE", "dest": "CONNECTING"},
+    {"trigger": "merged", "source": "CONNECTING", "dest": "MERGED"},
+    {"trigger": "abort", "source": "*", "dest": "ABORTED"},
+    {"trigger": "requeue", "source": "ABORTED", "dest": "PENDING"},
+]
+
+
+class _M:
+    """state 속성만 갖는 빈 모델."""
+
+
+def _machine(states, transitions, state):
+    m = _M()
+    Machine(
+        model=m, states=states, transitions=transitions,
+        initial=state, auto_transitions=False, ignore_invalid_triggers=False,
+    )
+    return m
+
+
+def advance(kind: str, state: str, trigger: str) -> str:
+    """(kind, 현재 state)에서 trigger 적용 → 새 state. 불법 전이면 MachineError."""
+    states, trans = (ORBIT_STATES, ORBIT_TRANSITIONS) if kind == "orbit" else (TASK_STATES, TASK_TRANSITIONS)
+    m = _machine(states, trans, state)
+    getattr(m, trigger)()
+    return m.state
