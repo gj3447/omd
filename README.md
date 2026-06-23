@@ -9,12 +9,15 @@ N개의 코딩 에이전트(물방울)를 **입체(서로소 write-set 궤도)**
 ## 문서
 - [`CONCEPT.md`](./CONCEPT.md) — 컨셉·은유·아키텍처·선행연구 & 차별점(Longinus 바인딩)
 - [`SERVER_SPEC.md`](./SERVER_SPEC.md) — 데이터 모델·상태머신(Orbit/Task/Agent/Barrier)·SINGULON 불변식·OSS 검증(ABC)·추천 스택
+- [`CONCURRENCY.md`](./CONCURRENCY.md) — **동시성·실패모드 정밀 설계** (긴급 탈출·고아 lease/플래그·데드락/기아·크래시 복구·14차원 + 교차작용 A–H + P0/P1/P2 로드맵)
 
 ## 캐논 계층
 `사도 OMC(입체운행구름) → 군단장 OMD → 군단(병렬 에이전트 물방울들)`
 
 ## 상태
 **프로토타입 동작 (19 tests green).** 구현됨: 입체 glob 교집합 · SQLite lease+fence · Orbit/Task FSM · SINGULON 2지점 강제 · 실물 git worktree+CLOUD CONNECT(merge)+fencing · 좀비 회수 · 데드락 wait-for 사이클 감지 · 우선순위 promote · FastMCP 13툴 · CLI.
+
+> ⚠ **동시성 한계(정직한 표기).** 위는 *단일 호출자* 가정에서 green이다. 동시 호출/긴급 탈출/크래시/분단까지 견디려면 아직 11개 P0 버그가 남아있다 — claim TOCTOU·fence 중복·release 무소유체크·connect fence-blind·공유레포 동시merge·이중쓰기 무복구·`agent_ttl` 기본 None(회수 비활성)·reclaim 브랜치 미삭제·CONNECTING 무시·의존 사이클 미검출·write-set FS 미강제. 전수 분석·기제·로드맵은 [`CONCURRENCY.md`](./CONCURRENCY.md). (예: 좀비 회수는 `agent_ttl`을 켜야 동작, 기본 비활성.)
 
 ## Quickstart
 ```bash

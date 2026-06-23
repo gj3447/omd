@@ -3,6 +3,8 @@
 OMD 군단장(코디네이터) 백엔드의 데이터 모델과 상태머신. 코어 불변식 = **SINGULON**
 (서로소=입체 write-set ⇒ 무충돌 응결 ⇒ 분열=0). [`CONCEPT.md`](./CONCEPT.md) 참조.
 
+> 본 문서는 *정상 경로* 데이터모델·FSM. 동시 호출·긴급 탈출·크래시·분단의 **비정상 경로 정밀 설계**(통합 lease 기반·전 동사 fencing·split-phase connect·크래시 복구·스키마/FSM/verb 델타)는 **[`CONCURRENCY.md`](./CONCURRENCY.md)** 에 있다. 아래 모델은 그 경화 설계의 출발점이며, CONCURRENCY가 컬럼/상태/동사를 확장한다.
+
 ---
 
 ## 1. 데이터 모델 (엔티티)

@@ -118,7 +118,8 @@ omd status                                                # 전체 궤도/물방
 2. `omd declare`로 write-set(궤도) 등록 → 자기 **worktree + 브랜치**(자존자) 생성
 3. 경로 `omd claim --mode=write`
    — 다중 claim은 **경로 정렬 순서 획득** → 순환 대기(=데드락) 방지
-4. 궤도 운행(개발). 의존 입력은 `omd flag wait <producer>=done`으로 producer 대기
+4. 궤도 운행(개발). 의존 입력은 `omd flag wait <producer>=merged`로 producer 대기
+   — ⚠ `=done`이 아니라 **`=merged`**: done 후에도 producer의 connect가 conflict→requeue로 같은 경로를 재작성할 수 있어 입체 전제가 깨진다([`CONCURRENCY.md`](./CONCURRENCY.md) §3.H). 그리고 wait는 **timeout 필수**(producer 사망 시 BROKEN 기상, §1.2).
 5. 완료 → 커밋 → `omd flag set <task>=done` → `omd barrier connect` 도착
 6. 모두 도착하면 군단장이 **CLOUD CONNECT(응결)** 순서대로 merge (write-set 서로소이므로 무충돌=분열0)
 
@@ -126,10 +127,13 @@ omd status                                                # 전체 궤도/물방
 
 ## 7. 안전장치
 
-- **데드락**: 다중 claim 정렬 순서 강제 + 서버가 wait-for 그래프에서 **사이클 감지 → 거부/abort**
-- **레이스(분열)**: 선언 안 한 경로 쓰기 → 궤도 lease 없으면 서버가 차단
-- **좀비**: TTL 만료 자동 회수
-- **기아(starvation)**: 대기 큐 FIFO + 우선순위
+> 정밀 설계·잔여 버그·실패모드 14차원·교차작용·로드맵은 **[`CONCURRENCY.md`](./CONCURRENCY.md)** 에 분리. 아래는 요약.
+
+- **데드락**: 다중 claim 정렬 순서 강제 + 서버가 wait-for 그래프에서 **사이클 감지 → 거부/abort** (+ declare 의존 DAG 비순환 검사)
+- **레이스(분열)**: 선언 안 한 경로 쓰기 → 궤도 lease 없으면 서버가 차단 (+ 실제 FS 강제는 connect 게이트의 diff 감사 — CONCURRENCY §D10)
+- **좀비/긴급 탈출**: heartbeat-TTL 만료 자동 회수 + 자발적 `bail` — **둘이 단일 회수 루틴**(CONCURRENCY §1). 모든 보유물(궤도/플래그/permit/좌석)이 owner+fence+TTL lease라 영구 고아 불가.
+- **기아(starvation)**: 대기 큐 FIFO + 우선순위 + **no-overtaking 입장 배리어**(broad 궤도가 작은 claim 스트림에 굶지 않게, CONCURRENCY §D7)
+- **fencing**: 모든 변이 동사가 `(agent, fence)`를 들고 와야 하며 현재 소유자가 아니면 거부 — 오추방된 좀비의 늦은 쓰기/merge 차단(CONCURRENCY §D6)
 
 ---
 
