@@ -115,6 +115,21 @@ def test_next_task_skips_overlapping():
     assert picked["task_id"] == "T3"
 
 
+def test_zombie_reclaim_requeues():
+    omd = Coordinator(agent_ttl=0.05)
+    omd.declare("T", writes=["a/**"])
+    omd.next_task("agA")
+    omd.claim("agA", ["a/**"], task_id="T")
+    omd.start("T", "agA")
+    assert omd.store.get_task("T")["state"] == "IN_ORBIT"
+    time.sleep(0.08)
+    res = omd.reclaim_zombies()
+    assert "agA" in res["reclaimed"]
+    assert omd.store.get_task("T")["state"] == "PENDING"      # 작업 requeue
+    r = omd.claim("agB", ["a/**"], task_id="T")               # 회수된 궤도 재획득
+    assert r["state"] == "HELD"
+
+
 def test_next_task_respects_deps():
     omd = Coordinator()
     omd.declare("base", writes=["src/base/**"])

@@ -79,6 +79,11 @@ def build_server(db_path: str = "omd.db"):
         return omd.flag_get(key)
 
     @mcp.tool()
+    def heartbeat(agent: str) -> dict:
+        """물방울 생존 신호. 끊기면(agent_ttl 초과) 좀비 회수로 궤도/작업 반환."""
+        return omd.heartbeat(agent)
+
+    @mcp.tool()
     def sweep() -> dict:
         return omd.sweep()
 
