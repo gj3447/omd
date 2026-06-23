@@ -6,6 +6,7 @@
 
 from .core import Coordinator
 from .disjoint import globs_overlap, sets_overlap, glob_prefix
+from .events import Emitter
 
-__all__ = ["Coordinator", "globs_overlap", "sets_overlap", "glob_prefix"]
+__all__ = ["Coordinator", "Emitter", "globs_overlap", "sets_overlap", "glob_prefix"]
 __version__ = "0.0.1"

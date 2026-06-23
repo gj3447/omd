@@ -1,0 +1,13 @@
+# Red artifact (LTDD): claim이 관측가능하게 무엇을 방출해야 하는가 — store가 심판.
+# 코드/에이전트의 "HELD" 자기보고가 아니라 외부 store에 도착한 이벤트로 판정한다.
+cid: omd-claim-demo        # 테스트는 이 cid(=agent_id)로 claim 한다
+service: omd
+expect:
+  - event: orbit_requested
+    op: "=="
+    count: 1
+  - event: orbit_granted   # 첫 grant의 fence는 1 — value-pinned(존재만이 아님)
+    where: {fence: 1}
+    op: "=="
+    count: 1
+  - must_order: [orbit_requested, orbit_granted]   # 요청 → 부여 순서

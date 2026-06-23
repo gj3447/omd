@@ -7,7 +7,9 @@ dependencies = ["transitions>=0.9"]
 
 [project.optional-dependencies]
 server = ["fastmcp>=2.0"]
-dev = ["pytest>=8"]
+# ooptdd(LTDD): 동사별 구조화 이벤트를 store에서 도착-검증하는 게이트. 이 워크스페이스에선
+# `uv pip install -e ../ooptdd` 로 editable 설치한다(자매 레포).
+dev = ["pytest>=8", "ooptdd>=0.4"]
 
 [project.scripts]
 omd = "omd_server.cli:main"
@@ -15,6 +17,14 @@ omd = "omd_server.cli:main"
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+# ooptdd pytest 플러그인: OMD 단위테스트는 인프로세스 memory backend로 자체검증(결정적·고속).
+# 네트워크 backend(openobserve/otlp)에 의존하지 않는다 — OMD의 LTDD 게이트 테스트는 각자
+# MemoryBackend를 직접 만들어 evaluate()를 호출하므로 플러그인의 자동 ship에 의존하지 않는다.
+[tool.ooptdd]
+backend = "memory"
+service = "omd.tests"
+verify = "warn"     # 관측은 보고만(빌드 verdict를 뒤집지 않음)
 
 [tool.setuptools]
 packages = ["omd_server"]

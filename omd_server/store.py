@@ -2,6 +2,12 @@
 
 deep-research 추천대로 SQLite expires_ts + sweeper로 시작(Agent Mail 검증 방식).
 state는 컬럼으로 별도 영속(pytransitions pickle 스냅샷 의존 금지).
+
+**동시성(D1, CONCURRENCY.md §D1).** 연결은 autocommit(`isolation_level=None`) + WAL로 열고,
+모든 변이는 `with store.tx():`(= `BEGIN IMMEDIATE … COMMIT/ROLLBACK`) 한 트랜잭션 안에서 일어난다.
+이로써 check-then-act(예: claim의 충돌검사→grant)가 원자적이 되어 SINGULON TOCTOU(P0-1)가 닫히고,
+fence 발급(P0-2)이 단조·유일해진다. `tx()`는 깊이 카운터로 **재진입 가능**(중첩 호출은 새 BEGIN을 안 연다) —
+Coordinator가 한 동사 안에서 sweep/_promote_pending을 같은 트랜잭션으로 호출할 수 있게 한다.
 """
 
 from __future__ import annotations
@@ -10,6 +16,7 @@ import json
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -21,6 +28,8 @@ CREATE TABLE IF NOT EXISTS orbits (
 );
 CREATE INDEX IF NOT EXISTS idx_orbits_state ON orbits(state);
 CREATE INDEX IF NOT EXISTS idx_orbits_task ON orbits(task_id);
+-- 발급된 fence는 단조·전역 유일(P0-2). 코드 회귀로 중복을 만들면 IntegrityError로 fail-closed.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_orbits_fence ON orbits(fence) WHERE fence IS NOT NULL;
 CREATE TABLE IF NOT EXISTS tasks (
   task_id TEXT PRIMARY KEY, name TEXT, writes TEXT, reads TEXT, deps TEXT,
   state TEXT NOT NULL, agent_id TEXT, priority INTEGER, created_at REAL,
@@ -32,6 +41,8 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE TABLE IF NOT EXISTS flags (
   key TEXT PRIMARY KEY, value TEXT, set_by TEXT, set_at REAL
 );
+-- 단조 fence 카운터 시드(0). next_fence는 이 행을 in-statement로 +1 한다(읽고-쓰기 갭 없음).
+INSERT OR IGNORE INTO meta(key,value) VALUES('fence','0');
 """
 
 
@@ -46,20 +57,48 @@ def _rows(c) -> list[dict]:
 
 class Store:
     def __init__(self, db_path: str = ":memory:"):
-        self.db = sqlite3.connect(db_path)
+        # autocommit 모드: BEGIN을 우리가 명시 발행(tx()). 기본("") 모드는 DML 전 암묵 BEGIN을
+        # 끼워넣어 BEGIN IMMEDIATE를 무력화하므로 반드시 None.
+        self.db = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        # WAL: 동시 reader가 단일 writer를 안 막음 + 멀티프로세스 안전(BEGIN IMMEDIATE 백스톱).
+        # busy_timeout: writer 경합 시 즉시 SQLITE_BUSY 대신 블록-재시도. (CONCURRENCY §D1)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA busy_timeout=5000")
+        self.db.execute("PRAGMA foreign_keys=ON")
+        self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(_SCHEMA)
-        self.db.commit()
+        self._txn_depth = 0
 
-    # --- fence: 단조 증가 토큰 ---
+    # --- 트랜잭션 경계(재진입 가능) ---
+    @contextmanager
+    def tx(self):
+        """BEGIN IMMEDIATE … COMMIT(정상) / ROLLBACK(예외). 깊이 카운터로 재진입 안전:
+        중첩 호출은 새 BEGIN을 열지 않고, 최외곽에서만 COMMIT/ROLLBACK 한다.
+        예외가 최외곽까지 전파되면 전체를 롤백(부분쓰기 없음); 중간에서 잡혀 정상 종료하면 COMMIT."""
+        if self._txn_depth == 0:
+            self.db.execute("BEGIN IMMEDIATE")
+        self._txn_depth += 1
+        try:
+            yield
+        except BaseException:
+            self._txn_depth -= 1
+            if self._txn_depth == 0:
+                self.db.execute("ROLLBACK")
+            raise
+        else:
+            self._txn_depth -= 1
+            if self._txn_depth == 0:
+                self.db.execute("COMMIT")
+
+    # --- fence: 단조 증가·유일 토큰 (P0-2: 단일문 +1, 읽고-쓰기 갭 제거) ---
     def next_fence(self) -> int:
-        cur = self.db.execute("SELECT value FROM meta WHERE key='fence'")
-        row = cur.fetchone()
-        n = (int(row["value"]) if row else 0) + 1
-        self.db.execute("INSERT INTO meta(key,value) VALUES('fence',?) "
-                        "ON CONFLICT(key) DO UPDATE SET value=?", (str(n), str(n)))
-        self.db.commit()
-        return n
+        self.db.execute("UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='fence'")
+        return int(self.db.execute("SELECT value FROM meta WHERE key='fence'").fetchone()["value"])
+
+    def current_fence(self) -> int:
+        r = self.db.execute("SELECT value FROM meta WHERE key='fence'").fetchone()
+        return int(r["value"]) if r else 0
 
     # --- orbits ---
     def add_orbit(self, *, task_id, agent_id, pathspec, mode, state,
@@ -70,7 +109,6 @@ class Store:
             "fence,expires_at,created_at,reason,priority) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (oid, task_id, agent_id, json.dumps(pathspec), mode, state,
              fence, expires_at, time.time(), reason, priority))
-        self.db.commit()
         return oid
 
     def get_orbit(self, oid) -> dict | None:
@@ -86,7 +124,6 @@ class Store:
             sets.append("fence=?"); args.append(fence)
         args.append(oid)
         self.db.execute(f"UPDATE orbits SET {','.join(sets)} WHERE orbit_id=?", args)
-        self.db.commit()
 
     def held_orbits(self) -> list[dict]:
         return _rows(self.db.execute("SELECT * FROM orbits WHERE state='HELD'"))
@@ -113,7 +150,6 @@ class Store:
             "deps=excluded.deps,priority=excluded.priority",
             (task_id, name, json.dumps(writes), json.dumps(reads),
              json.dumps(deps), state, priority, time.time()))
-        self.db.commit()
 
     def get_task(self, task_id) -> dict | None:
         return _row(self.db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)))
@@ -128,7 +164,6 @@ class Store:
             return
         args.append(task_id)
         self.db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE task_id=?", args)
-        self.db.commit()
 
     def tasks_by_state(self, states) -> list[dict]:
         q = ",".join("?" * len(states))
@@ -142,7 +177,6 @@ class Store:
             "INSERT INTO flags(key,value,set_by,set_at) VALUES(?,?,?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=?,set_by=?,set_at=?",
             (key, value, set_by, time.time(), value, set_by, time.time()))
-        self.db.commit()
 
     def get_flag(self, key) -> str | None:
         r = _row(self.db.execute("SELECT value FROM flags WHERE key=?", (key,)))
@@ -156,11 +190,9 @@ class Store:
             "ON CONFLICT(agent_id) DO UPDATE SET state=excluded.state,"
             "last_heartbeat=excluded.last_heartbeat,name=COALESCE(excluded.name,agents.name)",
             (agent_id, name, state, now))
-        self.db.commit()
 
     def set_agent_state(self, agent_id, state):
         self.db.execute("UPDATE agents SET state=? WHERE agent_id=?", (state, agent_id))
-        self.db.commit()
 
     def stale_agents(self, cutoff) -> list[dict]:
         return _rows(self.db.execute(
