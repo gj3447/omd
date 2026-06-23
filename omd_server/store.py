@@ -146,6 +146,31 @@ class Store:
         r = _row(self.db.execute("SELECT value FROM flags WHERE key=?", (key,)))
         return r["value"] if r else None
 
+    # --- agents (물방울 heartbeat / 좀비 회수) ---
+    def upsert_agent(self, agent_id, name=None, state="WORKING", now=None):
+        now = now if now is not None else time.time()
+        self.db.execute(
+            "INSERT INTO agents(agent_id,name,state,last_heartbeat) VALUES(?,?,?,?) "
+            "ON CONFLICT(agent_id) DO UPDATE SET state=excluded.state,"
+            "last_heartbeat=excluded.last_heartbeat,name=COALESCE(excluded.name,agents.name)",
+            (agent_id, name, state, now))
+        self.db.commit()
+
+    def set_agent_state(self, agent_id, state):
+        self.db.execute("UPDATE agents SET state=? WHERE agent_id=?", (state, agent_id))
+        self.db.commit()
+
+    def stale_agents(self, cutoff) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM agents WHERE state!='RETIRED' AND last_heartbeat<?", (cutoff,)))
+
+    def orbits_held_by_agent(self, agent_id) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE agent_id=? AND state='HELD'", (agent_id,)))
+
+    def tasks_for_agent(self, agent_id) -> list[dict]:
+        return _rows(self.db.execute("SELECT * FROM tasks WHERE agent_id=?", (agent_id,)))
+
     def snapshot(self) -> dict:
         return {
             "orbits": _rows(self.db.execute("SELECT orbit_id,task_id,mode,state,fence,expires_at FROM orbits")),

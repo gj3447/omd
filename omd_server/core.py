@@ -21,8 +21,9 @@ from .store import Store
 
 class Coordinator:
     def __init__(self, db_path: str = ":memory:", repo: str | None = None,
-                 worktrees_dir: str | None = None):
+                 worktrees_dir: str | None = None, agent_ttl: float | None = None):
         self.store = Store(db_path)
+        self.agent_ttl = agent_ttl  # heartbeat 만료 시 좀비 회수 (None=비활성)
         self.git = GitRepo(repo) if repo else None
         if self.git:
             self.worktrees_dir = worktrees_dir or (self.git.root.rstrip("/") + "-omd-worktrees")
@@ -57,6 +58,7 @@ class Coordinator:
 
     def claim(self, agent_id, pathspec, mode="write", *, ttl=600.0, task_id=None, reason=""):
         self.sweep()
+        self.store.upsert_agent(agent_id)
         if isinstance(pathspec, str):
             pathspec = [pathspec]
         conf = self._conflicts(pathspec, mode)
@@ -88,15 +90,42 @@ class Coordinator:
         self._promote_pending()
         return {"ok": True}
 
+    def heartbeat(self, agent_id):
+        self.store.upsert_agent(agent_id)
+        return {"ok": True}
+
+    def reclaim_zombies(self):
+        """heartbeat 끊긴 물방울 회수: HELD 궤도 만료 + 작업 requeue + worktree 정리."""
+        if not self.agent_ttl:
+            return {"reclaimed": []}
+        cutoff = time.time() - self.agent_ttl
+        out = []
+        for a in self.store.stale_agents(cutoff):
+            aid = a["agent_id"]
+            for o in self.store.orbits_held_by_agent(aid):
+                self.store.set_orbit(o["orbit_id"],
+                                     state=fsm.advance("orbit", "HELD", "expire"))
+            for t in self.store.tasks_for_agent(aid):
+                if t["state"] in ("CLAIMED", "IN_ORBIT"):
+                    s = fsm.advance("task", t["state"], "abort")
+                    s = fsm.advance("task", s, "requeue")  # ABORTED→PENDING
+                    self.store.set_task(t["task_id"], state=s, agent_id=None)
+                    if self.git and t["worktree"]:
+                        self.git.remove_worktree(t["worktree"])
+            self.store.set_agent_state(aid, "RETIRED")
+            out.append(aid)
+        return {"reclaimed": out}
+
     def sweep(self):
+        if self.agent_ttl:
+            self.reclaim_zombies()
         now = time.time()
         expired = []
         for o in self.store.due_orbits(now):
             self.store.set_orbit(o["orbit_id"],
                                  state=fsm.advance("orbit", "HELD", "expire"))
             expired.append(o["orbit_id"])
-        if expired:
-            self._promote_pending()
+        self._promote_pending()
         return {"expired": expired}
 
     def next_task(self, agent_id):
@@ -124,6 +153,7 @@ class Coordinator:
         if s == "READY":
             s = fsm.advance("task", s, "claim")
         s = fsm.advance("task", s, "start")  # CLAIMED→IN_ORBIT
+        self.store.upsert_agent(agent_id)
         worktree = branch = None
         if self.git:
             branch = f"omd/{task_id}"
