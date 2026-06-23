@@ -426,8 +426,17 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
 - **변이검증(이빨 확인)**: `tx()` 무력화 시 two-coordinator claim이 **300회 중 76회 double-grant(분열)** → 테스트가 잡고 BEGIN IMMEDIATE가 닫음을 실증(fake green 아님).
 - **알려진 부채**: start/connect의 git 서브프로세스가 아직 임계구역(lock+tx) *안에서* 돈다 → 멀티프로세스 stall 가능. split-phase connect(§3.B, §D8)로 다음 증분에서 분리.
 
+### ✅ 증분 2 — D2 긴급탈출/통합회수 + D6(부분) — DONE (P0-3·P0-7·P0-8·P0-9)
+- `core.py`: **단일 `_reclaim_agent_inline`**(자발 `bail` ∪ 비자발 좀비회수) — 보유 궤도(HELD/PENDING) 전부 해제 + 진행중 작업(CLAIMED/IN_ORBIT/**CONNECTING**, P0-9) requeue + worktree/브랜치 정리 + RETIRE. 멱등.
+- `bail(agent)` 공개 동사(긴급 탈출). `agent_ttl` **기본 90s = 회수 ON**(P0-7; None=비활성).
+- `release`/`renew`: **소유+fence 가드**(`_check_owner`) — 아무나 남의 궤도 해제 불가(P0-3). 오추방 좀비의 renew=FENCED_OUT. release 재시도는 멱등 no-op.
+- `gitio.delete_branch`/`branch_exists`: reclaim 시 `omd/<task>` 삭제(P0-8) — 안 지우면 다음 `start()`가 '브랜치 존재'로 wedge.
+- 테스트(38 green, 신규 11): `test_d2_reclaim.py`(bail→해제+requeue+promote, 멱등, 자발/비자발 수렴, 기본 ON, LTDD `gates/bail.yaml`), `test_d6_fence.py`(non-owner/stale-fence 거부·HELD 유지, 멱등 replay, 좀비 renew FENCED_OUT), `test_git_integration.py::test_reclaim_deletes_branch_so_restart_works`(P0-8 E2E).
+- **변이검증**: `_check_owner` 우회 시 비소유 agent가 남의 궤도를 RELEASED 시킴(이중부여) → 테스트가 'not owner'로 잡음.
+- 시그니처 변경: `release(orbit_id, agent, fence)` / `renew(orbit_id, agent, fence, ttl)` + `bail(agent)` (server/cli/tests 동반 갱신).
+
 ### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
-P0-3 release owner+fence 체크 · P0-7 `agent_ttl` 기본 ON + 통합 `reclaim_agent`(D2) + `bail` 동사 · P0-4 connect fence captured 비교 · P0-8 reclaim 시 `git branch -D` · P0-5/§D11 merge_token + split-phase connect · P0-6/§D8 `_recover()` · P0-10 의존 DAG 사이클 · P0-11/§D10 connect diff 감사 · D3 플래그(EPHEMERAL/LATCH+wait) · D4 세마포어 · D5 배리어.
+P0-4 connect fence captured 비교 · P0-5/§D11 merge_token + split-phase connect · P0-6/§D8 `_recover()` · P0-10 의존 DAG 사이클 · P0-11/§D10 connect diff 감사 · D3 플래그(EPHEMERAL/LATCH+wait) · D4 세마포어 · D5 배리어 · D6 잔여(finish/commit/connect 소유+fence + bail_epoch).
 
 ---
 

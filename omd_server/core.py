@@ -35,10 +35,12 @@ from .store import Store
 
 class Coordinator:
     def __init__(self, db_path: str = ":memory:", repo: str | None = None,
-                 worktrees_dir: str | None = None, agent_ttl: float | None = None,
+                 worktrees_dir: str | None = None, agent_ttl: float | None = 90.0,
                  events=None):
         self.store = Store(db_path)
-        self.agent_ttl = agent_ttl  # heartbeat 만료 시 좀비 회수 (None=비활성)
+        # heartbeat 만료 시 좀비 회수. 기본 ON(P0-7) — None=비활성. 끄면 죽은 물방울의
+        # 궤도/작업이 영구 고아가 된다(사용자 핵심 우려). 권장 90s, renew는 TTL/3 주기.
+        self.agent_ttl = agent_ttl
         self.events = events or NOOP
         self._lock = threading.RLock()  # 프로세스내 단일 writer(actor 대용) — D1
         self.git = GitRepo(repo) if repo else None
@@ -119,27 +121,56 @@ class Coordinator:
         self._promote_pending()
 
     def _reclaim_zombies_inline(self):
+        """heartbeat 끊긴 물방울(involuntary) — 단일 회수 루틴으로 위임."""
         if not self.agent_ttl:
             return []
         cutoff = time.time() - self.agent_ttl
         out = []
         for a in self.store.stale_agents(cutoff):
-            aid = a["agent_id"]
-            for o in self.store.orbits_held_by_agent(aid):
-                self.store.set_orbit(o["orbit_id"],
-                                     state=fsm.advance("orbit", "HELD", "expire"))
-                self._emit("orbit_expired", aid, orbit_id=o["orbit_id"], zombie=True)
-            for t in self.store.tasks_for_agent(aid):
-                if t["state"] in ("CLAIMED", "IN_ORBIT"):
-                    s = fsm.advance("task", t["state"], "abort")
-                    s = fsm.advance("task", s, "requeue")  # ABORTED→PENDING
-                    self.store.set_task(t["task_id"], state=s, agent_id=None)
-                    if self.git and t["worktree"]:
-                        self.git.remove_worktree(t["worktree"])
-            self.store.set_agent_state(aid, "RETIRED")
-            self._emit("agent_reclaimed", aid)
-            out.append(aid)
+            self._reclaim_agent_inline(a["agent_id"], voluntary=False)
+            out.append(a["agent_id"])
         return out
+
+    def _reclaim_agent_inline(self, agent_id, *, voluntary):
+        """긴급탈출(voluntary `bail`) / 좀비회수(involuntary) **단일 루틴** (D2).
+        이 agent가 쥔 모든 궤도(HELD/PENDING)를 해제하고, 진행중 작업(CLAIMED/IN_ORBIT/CONNECTING)을
+        requeue하고, worktree+브랜치를 정리하고, agent를 RETIRE한다 → 어떤 보유물도 고아가 안 된다.
+        멱등 — 도중 죽어도 sweeper가 같은 루틴으로 마저 정리(이중해제·누락 없음)."""
+        ag = self.store.get_agent(agent_id)
+        if ag is None or ag["state"] == "RETIRED":
+            return {"agent": agent_id, "noop": True}
+        self.store.set_agent_state(agent_id, "BAILING" if voluntary else "ZOMBIE")
+        freed, requeued = [], []
+        for o in self.store.orbits_owned_by_agent(agent_id, ("HELD", "PENDING")):
+            trig = "expire" if o["state"] == "HELD" else "deny"  # HELD→EXPIRED, PENDING→DENIED
+            self.store.set_orbit(o["orbit_id"], state=fsm.advance("orbit", o["state"], trig))
+            freed.append(o["orbit_id"])
+            self._emit("orbit_released", agent_id, orbit_id=o["orbit_id"],
+                       reason="bail" if voluntary else "reclaim")
+        for t in self.store.tasks_for_agent(agent_id):
+            if t["state"] in ("CLAIMED", "IN_ORBIT", "CONNECTING"):  # CONNECTING 포함(P0-9)
+                s = fsm.advance("task", t["state"], "abort")
+                s = fsm.advance("task", s, "requeue")  # ABORTED→PENDING
+                self.store.set_task(t["task_id"], state=s, agent_id=None)
+                requeued.append(t["task_id"])
+                if self.git and t["worktree"]:
+                    self.git.remove_worktree(t["worktree"])
+                    if t["branch"]:
+                        self.git.delete_branch(t["branch"])  # P0-8: 안 지우면 다음 start() 막힘
+        self.store.set_agent_state(agent_id, "RETIRED")
+        self._emit("agent_reclaimed", agent_id, voluntary=voluntary,
+                   orbits=len(freed), tasks=len(requeued))
+        self._promote_pending()
+        return {"agent": agent_id, "voluntary": voluntary, "orbits": freed, "tasks": requeued}
+
+    def _check_owner(self, o, agent_id, fence):
+        """소유+fence 가드(D6). 통과면 None, 아니면 거부 dict. 오추방된 좀비/타 agent 차단."""
+        if o["agent_id"] != agent_id:
+            return {"ok": False, "reason": "not owner", "owner": o["agent_id"]}
+        if o["fence"] != fence:
+            return {"ok": False, "reason": "stale fence", "fenced_out": True,
+                    "current": o["fence"], "yours": fence}
+        return None
 
     # ---- 공개 API (= MCP 툴 / CLI 동사) ----
     def declare(self, task_id, *, name="", writes=None, reads=None, deps=None, priority=0):
@@ -177,26 +208,47 @@ class Coordinator:
             self._emit("orbit_granted", agent_id, orbit_id=oid, fence=fence, mode=mode)
             return {"orbit_id": oid, "state": "HELD", "fence": fence, "conflicts": []}
 
-    def renew(self, orbit_id, ttl=600.0):
+    def renew(self, orbit_id, agent_id, fence, ttl=600.0):
+        """궤도 lease 갱신(keepalive). 소유+fence 일치해야 — 오추방된 좀비는 FENCED_OUT."""
         with self._cs():
             o = self.store.get_orbit(orbit_id)
-            if not o or o["state"] != "HELD":
-                return {"ok": False, "reason": f"orbit not HELD: {o and o['state']}"}
+            if not o:
+                return {"ok": False, "reason": "no such orbit"}
+            if o["state"] != "HELD":
+                return {"ok": False, "reason": f"not HELD: {o['state']}", "fenced_out": True}
+            bad = self._check_owner(o, agent_id, fence)
+            if bad:
+                return bad
             self.store.set_orbit(orbit_id, state=fsm.advance("orbit", "HELD", "renew"),
                                  expires_at=time.time() + ttl)
-            self._emit("orbit_renewed", o["agent_id"], orbit_id=orbit_id)
+            self._emit("orbit_renewed", agent_id, orbit_id=orbit_id)
             return {"ok": True, "expires_in": ttl}
 
-    def release(self, orbit_id):
+    def release(self, orbit_id, agent_id, fence):
+        """궤도 lease 반납. 소유+fence 일치해야(P0-3) — 아무나 남의 궤도 해제 불가.
+        이미 RELEASED/EXPIRED면 멱등 OK(MCP 재시도 안전)."""
         with self._cs():
             o = self.store.get_orbit(orbit_id)
-            if not o or o["state"] != "HELD":
-                return {"ok": False, "reason": "not HELD"}
+            if not o:
+                return {"ok": False, "reason": "no such orbit"}
+            if o["state"] in ("RELEASED", "EXPIRED", "DENIED"):
+                return {"ok": True, "noop": True, "state": o["state"]}
+            if o["state"] != "HELD":
+                return {"ok": False, "reason": f"not HELD: {o['state']}"}
+            bad = self._check_owner(o, agent_id, fence)
+            if bad:
+                return bad
             self.store.set_orbit(orbit_id, state=fsm.advance("orbit", "HELD", "release"),
                                  released_at=time.time())
-            self._emit("orbit_released", o["agent_id"], orbit_id=orbit_id)
+            self._emit("orbit_released", agent_id, orbit_id=orbit_id)
             self._promote_pending()
             return {"ok": True}
+
+    def bail(self, agent_id):
+        """물방울 긴급 탈출(자발). 보유 궤도 전부 해제 + 작업 requeue + worktree/브랜치 정리.
+        멱등 — 비자발 좀비회수와 **단일 루틴**을 공유(둘 사이 누락/이중해제 없음)."""
+        with self._cs():
+            return self._reclaim_agent_inline(agent_id, voluntary=True)
 
     def heartbeat(self, agent_id):
         with self._cs():

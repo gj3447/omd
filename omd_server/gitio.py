@@ -63,3 +63,18 @@ class GitRepo:
             self._git("worktree", "remove", "--force", str(Path(path).resolve()))
         except GitError:
             pass
+
+    def branch_exists(self, branch: str) -> bool:
+        try:
+            self._git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+            return True
+        except GitError:
+            return False
+
+    def delete_branch(self, branch: str):
+        """requeue 시 omd/<task> 브랜치 삭제(P0-8). 안 지우면 다음 start()의
+        `worktree add -b <branch>`가 '브랜치 이미 존재'로 실패해 task가 영구 wedge된다."""
+        try:
+            self._git("branch", "-D", branch)
+        except GitError:
+            pass
