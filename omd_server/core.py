@@ -41,13 +41,41 @@ class Coordinator:
         return out
 
     def _promote_pending(self):
-        for o in self.store.pending_orbits():
+        for o in self.store.pending_orbits():  # 우선순위 DESC → FIFO
             if not self._conflicts(json.loads(o["pathspec"]), o["mode"]):
                 fence = self.store.next_fence()
                 self.store.set_orbit(
                     o["orbit_id"],
                     state=fsm.advance("orbit", "PENDING", "grant"),
                     expires_at=time.time() + 600, fence=fence)
+
+    def _wait_for(self) -> dict:
+        """wait-for 그래프: PENDING 요청 agent → 그 경로를 쥔 HELD agent."""
+        held = self.store.held_orbits()
+        edges: dict = {}
+        for p in self.store.pending_orbits():
+            req, md = p["agent_id"], p["mode"]
+            ps = json.loads(p["pathspec"])
+            for o in held:
+                if md == "read" and o["mode"] == "read":
+                    continue
+                if o["agent_id"] != req and sets_overlap(ps, json.loads(o["pathspec"])):
+                    edges.setdefault(req, set()).add(o["agent_id"])
+        return edges
+
+    def _cycle_with(self, node) -> bool:
+        """node가 wait-for 그래프에서 자기 자신으로 되돌아오는 사이클에 있나(데드락)."""
+        edges = self._wait_for()
+
+        def dfs(n, path):
+            for m in edges.get(n, ()):
+                if m == node:
+                    return True
+                if m not in path and dfs(m, path | {m}):
+                    return True
+            return False
+
+        return dfs(node, {node})
 
     # ---- 공개 API (= MCP 툴 / CLI 동사) ----
     def declare(self, task_id, *, name="", writes=None, reads=None, deps=None, priority=0):
@@ -56,7 +84,8 @@ class Coordinator:
                             priority=priority)
         return {"task_id": task_id, "state": "PENDING"}
 
-    def claim(self, agent_id, pathspec, mode="write", *, ttl=600.0, task_id=None, reason=""):
+    def claim(self, agent_id, pathspec, mode="write", *, ttl=600.0, task_id=None,
+              reason="", priority=0):
         self.sweep()
         self.store.upsert_agent(agent_id)
         if isinstance(pathspec, str):
@@ -65,12 +94,17 @@ class Coordinator:
         if conf:
             oid = self.store.add_orbit(task_id=task_id, agent_id=agent_id,
                                        pathspec=pathspec, mode=mode, state="PENDING",
-                                       reason=reason)
+                                       reason=reason, priority=priority)
+            if self._cycle_with(agent_id):  # 대기 시 데드락 사이클이면 거부
+                self.store.set_orbit(oid, state=fsm.advance("orbit", "PENDING", "deny"))
+                return {"orbit_id": oid, "state": "DENIED", "deadlock": True,
+                        "conflicts": conf}
             return {"orbit_id": oid, "state": "PENDING", "conflicts": conf}
         fence = self.store.next_fence()
         oid = self.store.add_orbit(task_id=task_id, agent_id=agent_id, pathspec=pathspec,
                                    mode=mode, state="HELD", fence=fence,
-                                   expires_at=time.time() + ttl, reason=reason)
+                                   expires_at=time.time() + ttl, reason=reason,
+                                   priority=priority)
         return {"orbit_id": oid, "state": "HELD", "fence": fence, "conflicts": []}
 
     def renew(self, orbit_id, ttl=600.0):

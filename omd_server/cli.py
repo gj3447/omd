@@ -15,7 +15,7 @@ def main(argv=None):
 
     c = sub.add_parser("claim"); c.add_argument("agent"); c.add_argument("paths", nargs="+")
     c.add_argument("--mode", default="write"); c.add_argument("--ttl", type=float, default=600.0)
-    c.add_argument("--task")
+    c.add_argument("--task"); c.add_argument("--priority", type=int, default=0)
 
     for verb in ("release", "renew"):
         s = sub.add_parser(verb); s.add_argument("orbit_id")
@@ -36,7 +36,8 @@ def main(argv=None):
     a = p.parse_args(argv)
     omd = Coordinator(a.db)
     out = {
-        "claim": lambda: omd.claim(a.agent, a.paths, a.mode, ttl=a.ttl, task_id=a.task),
+        "claim": lambda: omd.claim(a.agent, a.paths, a.mode, ttl=a.ttl, task_id=a.task,
+                                   priority=a.priority),
         "release": lambda: omd.release(a.orbit_id),
         "renew": lambda: omd.renew(a.orbit_id, a.ttl),
         "declare": lambda: omd.declare(a.task, name=a.name, writes=a.writes,

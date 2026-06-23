@@ -31,10 +31,10 @@ def build_server(db_path: str = "omd.db"):
     omd = Coordinator(db_path)
 
     @mcp.tool()
-    def claim(agent: str, paths: list[str], mode: str = "write",
-              ttl: float = 600.0, task: str | None = None) -> dict:
-        """궤도(write-set) lease 획득. 입체(서로소)면 HELD, 충돌이면 PENDING+conflicts."""
-        return omd.claim(agent, paths, mode, ttl=ttl, task_id=task)
+    def claim(agent: str, paths: list[str], mode: str = "write", ttl: float = 600.0,
+              task: str | None = None, priority: int = 0) -> dict:
+        """궤도(write-set) lease 획득. 입체면 HELD, 충돌이면 PENDING(+우선순위), 데드락이면 DENIED."""
+        return omd.claim(agent, paths, mode, ttl=ttl, task_id=task, priority=priority)
 
     @mcp.tool()
     def release(orbit_id: str) -> dict:
