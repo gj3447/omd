@@ -37,12 +37,19 @@ def build_server(db_path: str = "omd.db"):
         return omd.claim(agent, paths, mode, ttl=ttl, task_id=task, priority=priority)
 
     @mcp.tool()
-    def release(orbit_id: str) -> dict:
-        return omd.release(orbit_id)
+    def release(orbit_id: str, agent: str, fence: int) -> dict:
+        """궤도 lease 반납. 소유+fence 일치해야(아무나 남의 궤도 해제 불가)."""
+        return omd.release(orbit_id, agent, fence)
 
     @mcp.tool()
-    def renew(orbit_id: str, ttl: float = 600.0) -> dict:
-        return omd.renew(orbit_id, ttl)
+    def renew(orbit_id: str, agent: str, fence: int, ttl: float = 600.0) -> dict:
+        """궤도 lease 갱신(keepalive, TTL/3 주기). 소유+fence 불일치=FENCED_OUT."""
+        return omd.renew(orbit_id, agent, fence, ttl)
+
+    @mcp.tool()
+    def bail(agent: str) -> dict:
+        """물방울 긴급 탈출(자발). 보유 궤도 전부 해제 + 작업 requeue + worktree/브랜치 정리(멱등)."""
+        return omd.bail(agent)
 
     @mcp.tool()
     def declare(task: str, name: str = "", writes: list[str] | None = None,

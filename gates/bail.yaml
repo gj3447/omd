@@ -1,0 +1,13 @@
+# Red artifact (LTDD): 긴급 탈출(bail)이 관측가능하게 무엇을 방출해야 하는가.
+# 보유 궤도 해제(reason=bail) + agent_reclaimed 가 순서대로 store에 도착해야 한다.
+cid: omd-bail-demo
+service: omd
+expect:
+  - event: orbit_released
+    where: {reason: bail}     # 자발 탈출로 해제됨(value-pinned)
+    op: ">="
+    count: 1
+  - event: agent_reclaimed
+    op: "=="
+    count: 1
+  - must_order: [orbit_released, agent_reclaimed]

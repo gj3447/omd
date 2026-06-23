@@ -62,6 +62,30 @@ def test_end_to_end_disjoint_merge(tmp_path):
     assert "CLOUD CONNECT A" in log and "CLOUD CONNECT B" in log
 
 
+def test_reclaim_deletes_branch_so_restart_works(tmp_path):
+    """P0-8: 회수가 worktree+브랜치를 지워야 requeue된 작업을 다시 start할 수 있다.
+    (예전엔 브랜치가 남아 `worktree add -b omd/A`가 실패 → 작업 영구 wedge.)"""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"), repo=str(repo),
+                      worktrees_dir=str(tmp_path / "wt"))
+    omd.declare("A", writes=["a/**"])
+    omd.next_task("agA")
+    omd.claim("agA", ["a/**"], task_id="A")
+    omd.start("A", "agA")
+    assert omd.git.branch_exists("omd/A")
+
+    omd.bail("agA")                                   # worktree + 브랜치 삭제 + 작업 requeue
+    assert not omd.git.branch_exists("omd/A")          # 브랜치 지워짐(P0-8)
+    assert omd.store.get_task("A")["state"] == "PENDING"
+
+    # 새 물방울이 requeue된 같은 작업을 다시 start — 브랜치 충돌 없이 성공
+    assert omd.next_task("agB")["task_id"] == "A"
+    omd.claim("agB", ["a/**"], task_id="A")
+    s2 = omd.start("A", "agB")
+    assert s2["worktree"] and s2["state"] == "IN_ORBIT"
+
+
 def test_connect_stale_lease_does_not_merge(tmp_path):
     """작업 중 lease 만료 → fencing으로 merge 거부(통합 브랜치 불변)."""
     import time

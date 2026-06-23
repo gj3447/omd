@@ -131,7 +131,7 @@ def test_promote_priority_order():
     lo = omd.claim("LO", ["a/**"], "write", priority=1)
     hi = omd.claim("HI", ["a/**"], "write", priority=5)
     assert lo["state"] == "PENDING" and hi["state"] == "PENDING"
-    omd.release(h["orbit_id"])                  # promote: 높은 우선순위 먼저
+    omd.release(h["orbit_id"], "H", h["fence"])  # promote: 높은 우선순위 먼저 (소유+fence)
     assert omd.store.get_orbit(hi["orbit_id"])["state"] == "HELD"
     assert omd.store.get_orbit(lo["orbit_id"])["state"] == "PENDING"
 

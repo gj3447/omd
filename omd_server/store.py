@@ -191,6 +191,9 @@ class Store:
             "last_heartbeat=excluded.last_heartbeat,name=COALESCE(excluded.name,agents.name)",
             (agent_id, name, state, now))
 
+    def get_agent(self, agent_id) -> dict | None:
+        return _row(self.db.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)))
+
     def set_agent_state(self, agent_id, state):
         self.db.execute("UPDATE agents SET state=? WHERE agent_id=?", (state, agent_id))
 
@@ -201,6 +204,12 @@ class Store:
     def orbits_held_by_agent(self, agent_id) -> list[dict]:
         return _rows(self.db.execute(
             "SELECT * FROM orbits WHERE agent_id=? AND state='HELD'", (agent_id,)))
+
+    def orbits_owned_by_agent(self, agent_id, states=("HELD", "PENDING")) -> list[dict]:
+        q = ",".join("?" * len(states))
+        return _rows(self.db.execute(
+            f"SELECT * FROM orbits WHERE agent_id=? AND state IN ({q})",
+            (agent_id, *states)))
 
     def tasks_for_agent(self, agent_id) -> list[dict]:
         return _rows(self.db.execute("SELECT * FROM tasks WHERE agent_id=?", (agent_id,)))
