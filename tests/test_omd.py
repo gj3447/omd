@@ -115,6 +115,27 @@ def test_next_task_skips_overlapping():
     assert picked["task_id"] == "T3"
 
 
+def test_deadlock_denied():
+    omd = Coordinator()
+    omd.claim("A", ["a/**"], "write")          # A가 a 점유
+    omd.claim("B", ["b/**"], "write")          # B가 b 점유
+    r1 = omd.claim("A", ["b/**"], "write")     # A는 B를 대기
+    assert r1["state"] == "PENDING"
+    r2 = omd.claim("B", ["a/**"], "write")     # B는 A를 대기 → 사이클
+    assert r2["state"] == "DENIED" and r2.get("deadlock")
+
+
+def test_promote_priority_order():
+    omd = Coordinator()
+    h = omd.claim("H", ["a/**"], "write")
+    lo = omd.claim("LO", ["a/**"], "write", priority=1)
+    hi = omd.claim("HI", ["a/**"], "write", priority=5)
+    assert lo["state"] == "PENDING" and hi["state"] == "PENDING"
+    omd.release(h["orbit_id"])                  # promote: 높은 우선순위 먼저
+    assert omd.store.get_orbit(hi["orbit_id"])["state"] == "HELD"
+    assert omd.store.get_orbit(lo["orbit_id"])["state"] == "PENDING"
+
+
 def test_zombie_reclaim_requeues():
     omd = Coordinator(agent_ttl=0.05)
     omd.declare("T", writes=["a/**"])

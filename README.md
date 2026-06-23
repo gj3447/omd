@@ -14,4 +14,31 @@ N개의 코딩 에이전트(물방울)를 **입체(서로소 write-set 궤도)**
 `사도 OMC(입체운행구름) → 군단장 OMD → 군단(병렬 에이전트 물방울들)`
 
 ## 상태
-설계 단계. 추천 스택: Python+FastMCP(MCP+CLI) · `transitions` FSM · SQLite `expires_ts`+sweeper lease(+fencing token) · 자체 빌드 = glob-교집합·wait-for 그래프·서로소 스케줄러.
+**프로토타입 동작 (19 tests green).** 구현됨: 입체 glob 교집합 · SQLite lease+fence · Orbit/Task FSM · SINGULON 2지점 강제 · 실물 git worktree+CLOUD CONNECT(merge)+fencing · 좀비 회수 · 데드락 wait-for 사이클 감지 · 우선순위 promote · FastMCP 13툴 · CLI.
+
+## Quickstart
+```bash
+pip install -e .            # 코어 + transitions   (서버: -e '.[server]')
+pytest -q                   # 19 passed
+
+# CLI (MCP 툴과 동일 동사)
+omd declare auth --writes 'src/auth/**'
+omd declare ui   --writes 'src/ui/**'
+omd next agA                                 # → {"task_id":"auth", ...}  (서로소 작업 추천)
+omd claim agA 'src/auth/**' --task auth       # → HELD (fence 1)
+omd claim agB 'src/auth/login.py'             # → PENDING (겹침=비입체)
+omd claim agC 'src/ui/**'   --task ui         # → HELD (서로소)
+omd status
+
+# MCP 서버 기동
+python -m omd_server.server omd.db
+```
+```python
+from omd_server import Coordinator
+omd = Coordinator(repo="/path/to/repo")       # 실물 git 연동
+omd.declare("A", writes=["a/**"]); omd.next_task("agA")
+s = omd.start("A", "agA")                      # 물방울 worktree 발사
+# ... s["worktree"] 에서 작업 ...
+omd.commit("A", "feat: a"); omd.finish("A")
+omd.connect("A")                               # CLOUD CONNECT = 실제 merge (fencing 검증)
+```

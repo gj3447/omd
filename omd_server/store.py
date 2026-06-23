@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS orbits (
   orbit_id TEXT PRIMARY KEY, task_id TEXT, agent_id TEXT,
   pathspec TEXT NOT NULL, mode TEXT NOT NULL, state TEXT NOT NULL,
-  fence INTEGER, expires_at REAL, created_at REAL, released_at REAL, reason TEXT
+  fence INTEGER, expires_at REAL, created_at REAL, released_at REAL, reason TEXT,
+  priority INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_orbits_state ON orbits(state);
 CREATE INDEX IF NOT EXISTS idx_orbits_task ON orbits(task_id);
@@ -62,13 +63,13 @@ class Store:
 
     # --- orbits ---
     def add_orbit(self, *, task_id, agent_id, pathspec, mode, state,
-                  fence=None, expires_at=None, reason="") -> str:
+                  fence=None, expires_at=None, reason="", priority=0) -> str:
         oid = "orb-" + uuid.uuid4().hex[:12]
         self.db.execute(
             "INSERT INTO orbits(orbit_id,task_id,agent_id,pathspec,mode,state,"
-            "fence,expires_at,created_at,reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "fence,expires_at,created_at,reason,priority) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (oid, task_id, agent_id, json.dumps(pathspec), mode, state,
-             fence, expires_at, time.time(), reason))
+             fence, expires_at, time.time(), reason, priority))
         self.db.commit()
         return oid
 
@@ -91,8 +92,9 @@ class Store:
         return _rows(self.db.execute("SELECT * FROM orbits WHERE state='HELD'"))
 
     def pending_orbits(self) -> list[dict]:
+        # 우선순위 DESC → 같으면 FIFO(created_at ASC). 기아 방지 기본.
         return _rows(self.db.execute(
-            "SELECT * FROM orbits WHERE state='PENDING' ORDER BY created_at"))
+            "SELECT * FROM orbits WHERE state='PENDING' ORDER BY priority DESC, created_at ASC"))
 
     def orbits_for_task(self, task_id) -> list[dict]:
         return _rows(self.db.execute("SELECT * FROM orbits WHERE task_id=?", (task_id,)))
