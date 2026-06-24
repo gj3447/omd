@@ -33,6 +33,7 @@ def main(argv=None):
     st = sub.add_parser("start"); st.add_argument("task"); st.add_argument("agent")
     fi = sub.add_parser("finish"); fi.add_argument("task")
     cn = sub.add_parser("connect"); cn.add_argument("task")
+    cn.add_argument("--agent"); cn.add_argument("--fence", type=int)
     sub.add_parser("sweep")
     sub.add_parser("status")
 
@@ -49,7 +50,8 @@ def main(argv=None):
         "next": lambda: omd.next_task(a.agent),
         "start": lambda: omd.start(a.task, a.agent),
         "finish": lambda: omd.finish(a.task),
-        "connect": lambda: omd.connect(a.task),
+        "connect": lambda: omd.connect(a.task, getattr(a, "agent", None),
+                                       getattr(a, "fence", None)),
         "sweep": lambda: omd.sweep(),
         "status": lambda: omd.status(),
     }[a.cmd]()

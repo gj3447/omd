@@ -73,9 +73,10 @@ def build_server(db_path: str = "omd.db"):
         return omd.finish(task)
 
     @mcp.tool()
-    def connect(task: str) -> dict:
-        """CLOUD CONNECT(응결=merge). 작업 중 lease 만료면 fencing으로 거부."""
-        return omd.connect(task)
+    def connect(task: str, agent: str | None = None, fence: int | None = None) -> dict:
+        """CLOUD CONNECT(응결=merge, split-phase). agent/fence를 주면 write-orbit fence==captured
+        까지 재검증(P0-4). 작업 중 lease 만료/ABA면 fencing으로 거부. merge_token으로 직렬화."""
+        return omd.connect(task, agent, fence)
 
     @mcp.tool()
     def flag_set(key: str, value: str, agent: str | None = None) -> dict:

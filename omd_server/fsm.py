@@ -30,6 +30,9 @@ TASK_TRANSITIONS = [
     {"trigger": "finish", "source": "IN_ORBIT", "dest": "DONE"},
     {"trigger": "connect", "source": "DONE", "dest": "CONNECTING"},
     {"trigger": "merged", "source": "CONNECTING", "dest": "MERGED"},
+    # D8/P0-6: split-phase connect 가 Phase B(락밖 merge)에서 실패하거나, 재기동 복구가
+    # git상 미머지로 판정하면 CONNECTING→DONE 으로 되돌린다(connect 재호출 가능 = 재시도가능).
+    {"trigger": "rollback", "source": "CONNECTING", "dest": "DONE"},
     {"trigger": "abort", "source": "*", "dest": "ABORTED"},
     {"trigger": "requeue", "source": "ABORTED", "dest": "PENDING"},
 ]

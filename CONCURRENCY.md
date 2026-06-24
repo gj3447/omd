@@ -435,8 +435,26 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
 - **변이검증**: `_check_owner` 우회 시 비소유 agent가 남의 궤도를 RELEASED 시킴(이중부여) → 테스트가 'not owner'로 잡음.
 - 시그니처 변경: `release(orbit_id, agent, fence)` / `renew(orbit_id, agent, fence, ttl)` + `bail(agent)` (server/cli/tests 동반 갱신).
 
+### ✅ 증분 3 — split-phase connect + merge_token + 복구 (P0-4·P0-5·P0-6) — DONE
+- `core.py` **split-phase `connect(task, agent=None, fence=None)`** (§3.B/§D8/§D11) — git merge가 락(_cs)/tx **밖**에서 돈다("멀티프로세스 stall" TODO 해소):
+  - **Phase A**(`_connect_phase_a`, 락+tx): 모든 write-orbit `state==HELD` 재검증, 호출자가 `(agent,fence)`를 주면 `owner==agent ∧ fence==captured`까지(P0-4 ABA 가드) → 불일치면 `fenced_out`. **repo-wide `merge_token`**(`kind='merge_token'`, capacity 1 = `held_merge_token` 단일행 → 가용 아니면 retry) 획득. task→CONNECTING, 궤도 **pin**(`merging=1`+유계 `merge_deadline`, §E), intent 영속(`connect_fence`/`branch_tip_sha`/`connect_intent_at`).
+  - **Phase B**(`_connect_phase_b`, **락 밖, live tx 없음**): 전용 **통합 worktree**(`<root>-omd-integration`)에서 `checkout integration_branch` + `merge --no-ff`(고유 trailer `OMD-Connect: <task>`) + **subprocess 타임아웃**(`merge_timeout`, 기본 120s, §E). 충돌/타임아웃이면 `merge --abort`(`GitTimeout` 분리). **사용자 HEAD(root) 불침범**(§D11).
+  - **Phase C**(`_connect_phase_c`, 락+tx): 성공이면 **`merge_sha` 먼저 기록**(P0-6 순서 버그 수정) → task→MERGED → write-orbit 해제+unpin → merge_token 반납 → droplet worktree 제거 → promote. 실패면 **CONNECTING→DONE rollback**(재시도가능, FSM 신규 전이) + unpin + 토큰 반납.
+- **merge_token crash-safe**(§D11): `merge_started_mono` 저장. `_reclaim_agent_inline`이 죽은 보유자의 토큰을 `_abort_dangling_merge`(통합 worktree `merge --abort`) 후 반납 + 보유 궤도 unpin.
+- **`_recover()`**(`__init__` 끝, 멱등, §D8/P0-6): 통합 worktree 보장 후 CONNECTING task를 git 진실과 조정 — trailer-probe(`branch_in_integration`, **줄단위 `^…$` 정확매칭** = prefix 오탐 차단)로 통합에 있으면 전진수정(merge_sha 기록+해제+worktree 제거), 없으면 rollback→DONE. 잔존 merge_token은 전부 abort+반납(재기동 시점 HELD=정의상 dangling).
+- 스키마(`store.py`, additive·fresh-DB 친화 + 멱등 `_migrate` ALTER): orbits `kind`/`resource_key`/`merging`/`merge_deadline`/`merge_started_mono`; tasks `connect_fence`/`connect_intent_at`/`branch_tip_sha`/`merge_sha`/`merged_at`. `held_orbits`/`pending_orbits`/`due_orbits`는 `kind='orbit'`만(merge_token 제외) + `due_orbits`는 `merging=0`만(pin skip, §E).
+- `gitio.py`: `_git(timeout=)` + `GitTimeout`, `ensure_integration_worktree`, `merge_into`(전용 worktree·명시 checkout), `branch_in_integration`(anchored trailer-probe), `branch_tip`, `abort_merge`/`has_merge_in_progress`. 구 `merge()`(root HEAD 변이) 제거.
+- 테스트(**47 passed, 1 skipped**; 신규 10 = `test_d8_connect_splitphase.py`, +`gates/connect.yaml`): merge_token 상호배제(서로소 2 task 동시 connect→둘 다 MERGED·통합에 두 파일·index clean·동시 토큰 ≤1·누수 0), **git이 락 밖**(Phase B 시 `_txn_depth==0` ∧ 머지 중 다른 변이 interleave), P0-4 stale fence(만료+ABA) + 정상대조, `_recover()`(통합有→MERGED+merge_sha+해제+토큰반납 / 통합無→DONE rollback+재connect / trailer prefix 오탐 차단 / 멱등). 기존 git E2E는 통합 worktree 모델로 갱신(아래 deviation).
+- **변이검증(이빨 3건 실증)**: ① merge_token 상호배제 무력화 → 동시 connect가 같은 통합 worktree index 경합으로 `fatal: 스태시 실패`, task B가 MERGED 못 됨 → 테스트 RED. ② P0-4 fence/owner-equality 가드 무력화 → ABA(궤도 HELD·fence bump) connect가 잘못 MERGED → 테스트 RED. ③ trailer-probe를 substring(-F)으로 회귀 → 미머지 'A'가 'AB' 응결로 오탐돼 MERGED → 복구 테스트 RED. 셋 다 복원 후 green.
+- 시그니처: `connect(task, agent=None, fence=None)`(하위호환 — 기존 무인자 호출 유지) + `Coordinator(integration_branch=, merge_timeout=)`; server/cli 동반 갱신.
+- **deviation(정직 표기)**:
+  1. **통합 worktree는 별 브랜치 필요**. git은 한 브랜치를 두 worktree에 못 건다. 그래서 root(사용자 HEAD)와 integration_branch가 **다른 브랜치**여야 한다(§D11 "사용자 HEAD 불침범"의 자연스러운 귀결). 기존 git E2E 테스트를 root=`dev`/통합=`main`으로 갱신하고 단언을 통합 worktree 경로로 옮김(merge 결과를 root가 아니라 통합 worktree에서 확인). 명시 안 하면 `integration_branch=현재 브랜치`인데, 그게 root에 체크아웃돼 있으면 통합 worktree 생성이 실패하므로 **운영 계약 = root는 통합 브랜치에 머무르지 않는다**(또는 `integration_branch=`를 명시).
+  2. merge_token 경합 시 `connect`는 즉시 실패가 아니라 **내부 재시도 루프**(deadline까지 10ms 폴링)로 직렬화 — 동시 connect 둘 다 결국 MERGED. (명세는 "획득"만 규정; non-blocking retry-return도 가능하나 호출자 단순화를 위해 내부 직렬화 택함.)
+  3. P0-4 fence 가드는 **호출자가 `(agent,fence)`를 줄 때만** 엄격(ABA 차단). 무인자 `connect(task)`(기존 경로)는 write-orbit `state==HELD`만 검사(증분2까지의 동작 유지) — 즉 strict-fence는 opt-in. server/cli는 `--agent/--fence`를 노출.
+- **남은 P0 부채**: P0-7~P0-9는 증분2에서 닫힘(merge_token reclaim도 이번에 추가). 미구현 = **P0-10**(declare/depend 의존 DAG 사이클 — claim 사이클만 잡힘), **P0-11/§D10**(connect 게이트의 `git diff --name-only` vs 궤도 glob 감사 = write-set FS 강제, "최대 구멍" 여전히 미강제). D3/D4/D5(플래그·세마포어·배리어), D6 잔여(finish/commit 소유+fence, bail_epoch), D9 idempotency 테이블, D12 read-set 코히런스, D14 HA 입장도 설계만.
+
 ### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
-P0-4 connect fence captured 비교 · P0-5/§D11 merge_token + split-phase connect · P0-6/§D8 `_recover()` · P0-10 의존 DAG 사이클 · P0-11/§D10 connect diff 감사 · D3 플래그(EPHEMERAL/LATCH+wait) · D4 세마포어 · D5 배리어 · D6 잔여(finish/commit/connect 소유+fence + bail_epoch).
+P0-10 의존 DAG 사이클 · P0-11/§D10 connect diff 감사(write-set FS 강제) · D3 플래그(EPHEMERAL/LATCH+wait) · D4 세마포어 · D5 배리어 · D6 잔여(finish/commit 소유+fence + bail_epoch) · D9 idempotency 테이블 · D12 read-set 코히런스 · D14 HA 입장.
 
 ---
 

@@ -24,7 +24,13 @@ CREATE TABLE IF NOT EXISTS orbits (
   orbit_id TEXT PRIMARY KEY, task_id TEXT, agent_id TEXT,
   pathspec TEXT NOT NULL, mode TEXT NOT NULL, state TEXT NOT NULL,
   fence INTEGER, expires_at REAL, created_at REAL, released_at REAL, reason TEXT,
-  priority INTEGER DEFAULT 0
+  priority INTEGER DEFAULT 0,
+  -- 증분3(§4.1 LEASE 통합): orbit|merge_token. merge_token=repo-wide Semaphore(max=1, §D11).
+  kind TEXT NOT NULL DEFAULT 'orbit',
+  resource_key TEXT,                  -- merge_token이면 통합 레포 키(cloud_id 등)
+  merging INTEGER NOT NULL DEFAULT 0,  -- 1=connect Phase B 진행중 pin(sweep/reclaim skip, §E)
+  merge_deadline REAL,                 -- pin 유계(§E): 이 시각 넘으면 abort 대상
+  merge_started_mono REAL              -- merge_token crash-safe(§D11): dangling merge abort 판정
 );
 CREATE INDEX IF NOT EXISTS idx_orbits_state ON orbits(state);
 CREATE INDEX IF NOT EXISTS idx_orbits_task ON orbits(task_id);
@@ -33,7 +39,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_orbits_fence ON orbits(fence) WHERE fence I
 CREATE TABLE IF NOT EXISTS tasks (
   task_id TEXT PRIMARY KEY, name TEXT, writes TEXT, reads TEXT, deps TEXT,
   state TEXT NOT NULL, agent_id TEXT, priority INTEGER, created_at REAL,
-  worktree TEXT, branch TEXT
+  worktree TEXT, branch TEXT,
+  -- 증분3(§4.1, §D8): split-phase connect intent + git 진실 조정용
+  connect_fence INTEGER,        -- Phase A에서 capture한 write-orbit fence(P0-4 재검증 기준)
+  connect_intent_at REAL,       -- intent 영속 타임스탬프(복구가 CONNECTING 식별)
+  branch_tip_sha TEXT,          -- merge 직전 task 브랜치 tip(복구 trailer-probe 보조)
+  merge_sha TEXT,               -- 응결된 merge 커밋(MERGED 증거, P0-6: release 전에 기록)
+  merged_at REAL
 );
 CREATE TABLE IF NOT EXISTS agents (
   agent_id TEXT PRIMARY KEY, name TEXT, state TEXT, last_heartbeat REAL
@@ -44,6 +56,20 @@ CREATE TABLE IF NOT EXISTS flags (
 -- 단조 fence 카운터 시드(0). next_fence는 이 행을 in-statement로 +1 한다(읽고-쓰기 갭 없음).
 INSERT OR IGNORE INTO meta(key,value) VALUES('fence','0');
 """
+
+# 기존 DB(증분1·2 스키마)에도 증분3 컬럼을 멱등 추가 — fresh-DB는 위 CREATE로 이미 가짐.
+_MIGRATIONS = [
+    ("orbits", "kind", "TEXT NOT NULL DEFAULT 'orbit'"),
+    ("orbits", "resource_key", "TEXT"),
+    ("orbits", "merging", "INTEGER NOT NULL DEFAULT 0"),
+    ("orbits", "merge_deadline", "REAL"),
+    ("orbits", "merge_started_mono", "REAL"),
+    ("tasks", "connect_fence", "INTEGER"),
+    ("tasks", "connect_intent_at", "REAL"),
+    ("tasks", "branch_tip_sha", "TEXT"),
+    ("tasks", "merge_sha", "TEXT"),
+    ("tasks", "merged_at", "REAL"),
+]
 
 
 def _row(c) -> dict | None:
@@ -68,7 +94,15 @@ class Store:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(_SCHEMA)
+        self._migrate()
         self._txn_depth = 0
+
+    def _migrate(self):
+        """멱등 컬럼 추가(증분3) — 기존 DB도 안전하게 신규 컬럼을 얻는다(fresh-DB 친화)."""
+        for table, col, decl in _MIGRATIONS:
+            cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
     # --- 트랜잭션 경계(재진입 가능) ---
     @contextmanager
@@ -102,44 +136,54 @@ class Store:
 
     # --- orbits ---
     def add_orbit(self, *, task_id, agent_id, pathspec, mode, state,
-                  fence=None, expires_at=None, reason="", priority=0) -> str:
+                  fence=None, expires_at=None, reason="", priority=0,
+                  kind="orbit", resource_key=None) -> str:
         oid = "orb-" + uuid.uuid4().hex[:12]
         self.db.execute(
             "INSERT INTO orbits(orbit_id,task_id,agent_id,pathspec,mode,state,"
-            "fence,expires_at,created_at,reason,priority) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "fence,expires_at,created_at,reason,priority,kind,resource_key) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (oid, task_id, agent_id, json.dumps(pathspec), mode, state,
-             fence, expires_at, time.time(), reason, priority))
+             fence, expires_at, time.time(), reason, priority, kind, resource_key))
         return oid
 
     def get_orbit(self, oid) -> dict | None:
         return _row(self.db.execute("SELECT * FROM orbits WHERE orbit_id=?", (oid,)))
 
-    def set_orbit(self, oid, *, state, expires_at=..., released_at=..., fence=...):
-        sets, args = ["state=?"], [state]
-        if expires_at is not ...:
-            sets.append("expires_at=?"); args.append(expires_at)
-        if released_at is not ...:
-            sets.append("released_at=?"); args.append(released_at)
-        if fence is not ...:
-            sets.append("fence=?"); args.append(fence)
+    def set_orbit(self, oid, *, state=..., expires_at=..., released_at=..., fence=...,
+                  merging=..., merge_deadline=..., merge_started_mono=...):
+        sets, args = [], []
+        for col, val in (("state", state), ("expires_at", expires_at),
+                         ("released_at", released_at), ("fence", fence),
+                         ("merging", merging), ("merge_deadline", merge_deadline),
+                         ("merge_started_mono", merge_started_mono)):
+            if val is not ...:
+                sets.append(f"{col}=?"); args.append(val)
+        if not sets:
+            return
         args.append(oid)
         self.db.execute(f"UPDATE orbits SET {','.join(sets)} WHERE orbit_id=?", args)
 
     def held_orbits(self) -> list[dict]:
-        return _rows(self.db.execute("SELECT * FROM orbits WHERE state='HELD'"))
+        # 입체 검사 대상 = 일반 궤도(orbit)만. merge_token 은 경로궤도가 아니므로 제외.
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE state='HELD' AND kind='orbit'"))
 
     def pending_orbits(self) -> list[dict]:
-        # 우선순위 DESC → 같으면 FIFO(created_at ASC). 기아 방지 기본.
+        # 우선순위 DESC → 같으면 FIFO(created_at ASC). 기아 방지 기본. merge_token 제외.
         return _rows(self.db.execute(
-            "SELECT * FROM orbits WHERE state='PENDING' ORDER BY priority DESC, created_at ASC"))
+            "SELECT * FROM orbits WHERE state='PENDING' AND kind='orbit' "
+            "ORDER BY priority DESC, created_at ASC"))
 
     def orbits_for_task(self, task_id) -> list[dict]:
-        return _rows(self.db.execute("SELECT * FROM orbits WHERE task_id=?", (task_id,)))
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE task_id=? AND kind='orbit'", (task_id,)))
 
     def due_orbits(self, now) -> list[dict]:
+        # merging=1(connect Phase B pin) 궤도는 만료 sweep에서 skip(§E). merge_token 도 제외.
         return _rows(self.db.execute(
-            "SELECT * FROM orbits WHERE state='HELD' AND expires_at IS NOT NULL "
-            "AND expires_at<=?", (now,)))
+            "SELECT * FROM orbits WHERE state='HELD' AND kind='orbit' AND merging=0 "
+            "AND expires_at IS NOT NULL AND expires_at<=?", (now,)))
 
     # --- tasks ---
     def add_task(self, *, task_id, name, writes, reads, deps, state, priority):
@@ -154,10 +198,16 @@ class Store:
     def get_task(self, task_id) -> dict | None:
         return _row(self.db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)))
 
-    def set_task(self, task_id, *, state=..., agent_id=..., worktree=..., branch=...):
+    def set_task(self, task_id, *, state=..., agent_id=..., worktree=..., branch=...,
+                 connect_fence=..., connect_intent_at=..., branch_tip_sha=...,
+                 merge_sha=..., merged_at=...):
         sets, args = [], []
         for col, val in (("state", state), ("agent_id", agent_id),
-                         ("worktree", worktree), ("branch", branch)):
+                         ("worktree", worktree), ("branch", branch),
+                         ("connect_fence", connect_fence),
+                         ("connect_intent_at", connect_intent_at),
+                         ("branch_tip_sha", branch_tip_sha),
+                         ("merge_sha", merge_sha), ("merged_at", merged_at)):
             if val is not ...:
                 sets.append(f"{col}=?"); args.append(val)
         if not sets:
@@ -203,13 +253,36 @@ class Store:
 
     def orbits_held_by_agent(self, agent_id) -> list[dict]:
         return _rows(self.db.execute(
-            "SELECT * FROM orbits WHERE agent_id=? AND state='HELD'", (agent_id,)))
+            "SELECT * FROM orbits WHERE agent_id=? AND state='HELD' AND kind='orbit'",
+            (agent_id,)))
 
     def orbits_owned_by_agent(self, agent_id, states=("HELD", "PENDING")) -> list[dict]:
+        # 경로 궤도(orbit)만 — merge_token은 reclaim에서 별도 abort 경로(merge_tokens_owned_by).
         q = ",".join("?" * len(states))
         return _rows(self.db.execute(
-            f"SELECT * FROM orbits WHERE agent_id=? AND state IN ({q})",
+            f"SELECT * FROM orbits WHERE agent_id=? AND kind='orbit' AND state IN ({q})",
             (agent_id, *states)))
+
+    # --- merge_token (repo-wide Semaphore max=1, §D11) ---
+    def held_merge_token(self, resource_key) -> dict | None:
+        """현재 HELD 상태인 통합 레포 merge_token(있으면). capacity 1 → 최대 한 행."""
+        return _row(self.db.execute(
+            "SELECT * FROM orbits WHERE kind='merge_token' AND state='HELD' "
+            "AND resource_key=?", (resource_key,)))
+
+    def all_held_merge_tokens(self) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE kind='merge_token' AND state='HELD'"))
+
+    def merge_tokens_owned_by(self, agent_id, states=("HELD",)) -> list[dict]:
+        q = ",".join("?" * len(states))
+        return _rows(self.db.execute(
+            f"SELECT * FROM orbits WHERE agent_id=? AND kind='merge_token' AND state IN ({q})",
+            (agent_id, *states)))
+
+    def pinned_orbits_for_task(self, task_id) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE task_id=? AND kind='orbit' AND merging=1", (task_id,)))
 
     def tasks_for_agent(self, agent_id) -> list[dict]:
         return _rows(self.db.execute("SELECT * FROM tasks WHERE agent_id=?", (agent_id,)))

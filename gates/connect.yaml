@@ -1,0 +1,13 @@
+# Red artifact (LTDD): split-phase connect(응결)가 관측가능하게 무엇을 방출해야 하는가.
+# Phase A(connect_started: merge_token 획득) → Phase C(connect_merged: merge_sha 기록)가
+# store에 순서대로 도착해야 한다. 코드/에이전트의 "MERGED" 자기보고가 아니라 외부 store가 심판.
+cid: omd-connect-demo        # 테스트는 이 task_id(=cid)로 connect 한다
+service: omd
+expect:
+  - event: connect_started   # Phase A: merge_token 획득 + →CONNECTING + pin
+    op: "=="
+    count: 1
+  - event: connect_merged    # Phase C: merge_sha 기록 후 →MERGED + 해제
+    op: "=="
+    count: 1
+  - must_order: [connect_started, connect_merged]   # A(token획득) → C(응결) 순서
