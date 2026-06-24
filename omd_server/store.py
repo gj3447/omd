@@ -215,6 +215,15 @@ class Store:
         args.append(task_id)
         self.db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE task_id=?", args)
 
+    def all_tasks(self) -> list[dict]:
+        """모든 task — 의존 DAG 사이클 검사(P0-10)용 전역 그래프 빌드."""
+        return _rows(self.db.execute("SELECT * FROM tasks"))
+
+    def set_task_deps(self, task_id, deps):
+        """task의 deps(JSON 배열)를 교체 — depend() 가 사이클-안전 검증 후 호출(P0-10)."""
+        self.db.execute("UPDATE tasks SET deps=? WHERE task_id=?",
+                        (json.dumps(deps), task_id))
+
     def tasks_by_state(self, states) -> list[dict]:
         q = ",".join("?" * len(states))
         return _rows(self.db.execute(

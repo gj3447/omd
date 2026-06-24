@@ -30,7 +30,7 @@
 
 > **경화 SINGULON** = "(a) 모든 lease는 **유한 시간 내 회수**되고 ∧ (b) **fence가 현재값이 아니면** 어떤 lease도 구름을 변이시키지 못한다 ∧ (c) 선언된 write-set이 **파일시스템에서 실제로 강제**된다 ⇒ 응결 시 분열=0."
 
-(c)는 완전성 비평이 찾은 가장 큰 구멍이다(§2 D10): 지금은 선언만 검사하고 *실제 쓰기 영역은 검사하지 않는다*.
+(c)는 완전성 비평이 찾은 가장 큰 구멍이었다(§2 D10): 오래도록 선언만 검사하고 *실제 쓰기 영역은 검사하지 않았다*. **증분4(P0-11)에서 강제됨** — connect 게이트가 `git diff --name-only base...branch`의 모든 경로가 claimed write-set glob 에 덮이는지 감사하고, 밖이면 `writeset_violation` 으로 거부(merge 없음). 이로써 (a)·(b)·(c) 셋이 모두 성립 = P0 전부 닫힘.
 
 ### 0.2 네 프리미티브 = LEASE 한 행의 투영
 
@@ -453,8 +453,35 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
   3. P0-4 fence 가드는 **호출자가 `(agent,fence)`를 줄 때만** 엄격(ABA 차단). 무인자 `connect(task)`(기존 경로)는 write-orbit `state==HELD`만 검사(증분2까지의 동작 유지) — 즉 strict-fence는 opt-in. server/cli는 `--agent/--fence`를 노출.
 - **남은 P0 부채**: P0-7~P0-9는 증분2에서 닫힘(merge_token reclaim도 이번에 추가). 미구현 = **P0-10**(declare/depend 의존 DAG 사이클 — claim 사이클만 잡힘), **P0-11/§D10**(connect 게이트의 `git diff --name-only` vs 궤도 glob 감사 = write-set FS 강제, "최대 구멍" 여전히 미강제). D3/D4/D5(플래그·세마포어·배리어), D6 잔여(finish/commit 소유+fence, bail_epoch), D9 idempotency 테이블, D12 read-set 코히런스, D14 HA 입장도 설계만.
 
+### ✅ 증분 4 — 의존 DAG 사이클 + write-set FS 강제 (P0-10·P0-11) — DONE
+> 마지막 두 미강제 SINGULON 지점. P0-11 강제로 SINGULON 토대 **(c)** 가 성립한다 —
+> *선언상* 서로소 write-set이 *실제* write-set이 됨(궤도가 더 이상 advisory 아님).
+
+- **P0-10 — 의존 DAG 사이클 게이트 (§D7)** (`core.py`):
+  - `_find_cycle`(DFS WHITE/GRAY/BLACK 색칠 → back-edge 가 사이클, 경로 반환) + `_dep_graph`(전 task `deps` + 후보 엣지) + `_would_cycle(task_id, deps)`(후보 엣지 가상추가 후 전역 재검 — self-dep=길이1 사이클).
+  - `declare(deps=...)`: deps가 사이클을 만들면 `{ok:false, reason:'dep_cycle', cycle:[...]}` (task 생성 안 함). 정상이면 `{ok:true, ...}`(기존 호출부는 반환값 미사용 — 비파괴).
+  - **신규 동사 `depend(task, after)`** (MCP + CLI): 엣지를 추가하되 사이클을 만들면 **거부(그래프 불변)**. 이미 있는 엣지는 멱등 noop. check-then-add 가 `_cs()` 안에서 원자.
+  - `store.all_tasks()`/`set_task_deps()` 추가.
+- **P0-11 / §D10 — write-set 파일시스템 강제(저비용 pre-connect 감사, option 2)**:
+  - `disjoint.path_matches_glob`/`path_in_globs`: 구체 경로가 glob 에 **정확** 매칭하나(세그먼트 단위, `**`=0+세그먼트, 한 세그먼트 내 `*`/`?`/`[...]`는 `fnmatchcase`). **`globs_overlap` 을 그대로 안 씀** — char-class를 보수적 overlap=True 로 over-report 하므로 감사에선 "덮인다"의 false-positive(=궤도 밖 쓰기 통과)가 되어 분열을 놓친다. 정확매처는 와일드카드-free 경로에 **절대 false-positive("덮인다")를 안 냄**(soundness).
+  - `gitio.changed_paths(branch, base)`: `git diff --name-only --no-renames base...branch`(+`core.quotepath=false`) — merge-base 이후 branch가 건드린 모든 경로(통합 쪽 변경 제외). rename은 `--no-renames`로 원본+새경로 둘 다 나와 궤도 밖 이동도 잡힘. delete도 touched.
+  - `core._writeset_audit`: claimed write-set = task의 HELD `mode='write'` 궤도 pathspec 합집합. 변경 경로 중 `path_in_globs` 로 안 덮이는 것 = `offending`.
+  - **connect 게이트(Phase A)**: stale-fence 통과 직후 · merge_token 획득 **전** 감사. 위반이면 `{ok:false, reason:'writeset_violation', offending:[...]}` 반환 — **merge 안 함, 토큰 안 잡음, task 상태 불변, 통합 브랜치 불변**.
+  - `commit`도 커밋 후 **자문(advisory)** 감사(`offending` 동봉 + `commit_writeset_warning`) — 조기 경고. 권위 강제 지점은 connect.
+- 테스트(**61 passed, 1 skipped**; 신규 14):
+  - `test_d7_dep_cycle.py`(7): depend back-edge(A→B→A)·3-노드 사이클·declare(deps) 사이클·self-dep 전부 `dep_cycle` 거부+그래프 불변; 유효 DAG 수락+unblock; depend 멱등; **territory check**(게이트 우회해 store 에 직접 상호의존 심으면 next_task=None=영구 BLOCKED).
+  - `test_d10_writeset_fs.py`(7): 정확매처 soundness 단위; 궤도 밖 쓰기(a/** claim + b/foo)→`writeset_violation`+통합 불변+토큰누수0; 궤도 안만→MERGED; 다중 write-orbit 합집합 커버(a/**∪c/**)+합집합 밖(d/) 거부; 궤도 밖 rename→거부; **이빨**(감사 무력화 시 분열이 머지됨).
+- **변이검증(이빨 실증, 복원함)**:
+  ① write-set 감사 무력화(`_writeset_audit→[]`) → 궤도 밖 `b/foo.py` 가 `MERGED`(통합에 실제로 들어옴 = §D10 분열) → `test_out_of_bounds_write_is_rejected`·`test_multiple_orbits_one_path_outside_union`·`test_rename_out_of_bounds_is_rejected` **3건 RED**.
+  ② 사이클 게이트 무력화(`_would_cycle→None`) → 상호의존 엣지가 수락되고 `next_task=None`(둘 다 영구 BLOCKED) → `test_d7_dep_cycle.py` **4건 RED**. 둘 다 복원 후 61 green.
+- **deviation/한계(정직 표기)**:
+  1. **commit 감사는 자문(non-blocking)** — 커밋은 되돌리지 않고 `offending` 만 회신. 권위 거부는 connect 게이트(명세 §D10 "connect 게이트가 자연스러운 강제 지점"). sparse-checkout(option 1, 물리 격리)은 미채택 — option 2(저비용 감사) 채택(§7 결정대로).
+  2. 감사 기준 base = `integration_branch`(3-dot merge-base). 통합이 앞서 나가도(다른 task 선머지) 3-dot 가 *이 task의* 변경만 봐서 false-reject 없음(기존 sequential A→B E2E 통과로 확인).
+  3. char-class 궤도에서도 감사는 **정확**(over-report 안 함). 단 claim/next 의 *입체검사* 는 여전히 `globs_overlap`(보수적) — 거기선 over-report 가 안전(병렬도만 손해). 둘의 비대칭은 의도적(감사=soundness on "덮임", 입체=soundness on "겹침").
+- **남은 P0 부채**: **P0 전부 닫힘(P0-1~P0-11)**. 미구현 = D3/D4/D5(플래그·세마포어·배리어), D6 잔여(finish/commit 소유+fence, bail_epoch), D9 idempotency 테이블, D12 read-set 코히런스, D14 HA 입장 — 전부 설계만(P1/P2).
+
 ### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
-P0-10 의존 DAG 사이클 · P0-11/§D10 connect diff 감사(write-set FS 강제) · D3 플래그(EPHEMERAL/LATCH+wait) · D4 세마포어 · D5 배리어 · D6 잔여(finish/commit 소유+fence + bail_epoch) · D9 idempotency 테이블 · D12 read-set 코히런스 · D14 HA 입장.
+D3 플래그(EPHEMERAL/LATCH+wait) · D4 세마포어 · D5 배리어 · D6 잔여(finish/commit 소유+fence + bail_epoch) · D9 idempotency 테이블 · D12 read-set 코히런스 · D14 HA 입장. (P0-1~P0-11 = 증분1~4 에서 전부 닫힘.)
 
 ---
 

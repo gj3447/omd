@@ -60,6 +60,12 @@ def build_server(db_path: str = "omd.db"):
                            deps=deps, priority=priority)
 
     @mcp.tool()
+    def depend(task: str, after: str) -> dict:
+        """작업 의존 엣지 추가(`task` after `after`). 의존 DAG에 사이클을 만들면 거부
+        (`{ok:false, reason:'dep_cycle', cycle:[...]}`, 그래프 불변). self-dep 도 거부(P0-10)."""
+        return omd.depend(task, after)
+
+    @mcp.tool()
     def next(agent: str) -> dict | None:
         """지금 안전하게 운행 가능한 서로소(입체) 작업 추천 → READY."""
         return omd.next_task(agent)

@@ -29,6 +29,9 @@ def main(argv=None):
     d.add_argument("--writes", nargs="*", default=[]); d.add_argument("--reads", nargs="*", default=[])
     d.add_argument("--deps", nargs="*", default=[]); d.add_argument("--priority", type=int, default=0)
 
+    # depend: task가 after 다음에 오도록 의존 엣지 추가 — 사이클이면 거부(P0-10).
+    dep = sub.add_parser("depend"); dep.add_argument("task"); dep.add_argument("after")
+
     n = sub.add_parser("next"); n.add_argument("agent")
     st = sub.add_parser("start"); st.add_argument("task"); st.add_argument("agent")
     fi = sub.add_parser("finish"); fi.add_argument("task")
@@ -47,6 +50,7 @@ def main(argv=None):
         "bail": lambda: omd.bail(a.agent),
         "declare": lambda: omd.declare(a.task, name=a.name, writes=a.writes,
                                        reads=a.reads, deps=a.deps, priority=a.priority),
+        "depend": lambda: omd.depend(a.task, a.after),
         "next": lambda: omd.next_task(a.agent),
         "start": lambda: omd.start(a.task, a.agent),
         "finish": lambda: omd.finish(a.task),
