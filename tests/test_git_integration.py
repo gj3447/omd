@@ -12,6 +12,8 @@ def _git(args, cwd):
 
 
 def _init_repo(root: Path):
+    """root는 사용자 HEAD = 별도 dev 브랜치. main은 OMD 전용 통합 브랜치(§D11)로 남겨
+    전용 통합 worktree(<root>-omd-integration)만 main을 체크아웃한다 — 사용자 HEAD 불침범."""
     root.mkdir()
     _git(["init", "-b", "main"], root)
     _git(["config", "user.name", "t"], root)
@@ -19,13 +21,14 @@ def _init_repo(root: Path):
     (root / "README.md").write_text("base\n")
     _git(["add", "-A"], root)
     _git(["commit", "-m", "base"], root)
+    _git(["checkout", "-b", "dev"], root)   # 사용자 HEAD를 dev로 — main(통합)은 비워둠
 
 
 def test_end_to_end_disjoint_merge(tmp_path):
     repo = tmp_path / "repo"
     _init_repo(repo)
     omd = Coordinator(db_path=str(tmp_path / "omd.db"), repo=str(repo),
-                      worktrees_dir=str(tmp_path / "wt"))
+                      worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
 
     omd.declare("A", writes=["a/**"])
     omd.declare("B", writes=["b/**"])
@@ -48,16 +51,18 @@ def test_end_to_end_disjoint_merge(tmp_path):
     omd.commit("B", "feat: b/y")
     omd.finish("B")
 
-    # CLOUD CONNECT (응결=실제 merge) — 둘 다 무충돌
+    # CLOUD CONNECT (응결=실제 merge, split-phase) — 둘 다 무충돌
     ra = omd.connect("A")
     rb = omd.connect("B")
     assert ra["ok"] and ra["state"] == "MERGED", ra
     assert rb["ok"] and rb["state"] == "MERGED", rb
 
-    # 통합 브랜치에 두 파일 모두 존재 = 분열 0
-    assert (repo / "a" / "x.py").exists()
-    assert (repo / "b" / "y.py").exists()
-    log = subprocess.run(["git", "log", "--oneline"], cwd=str(repo),
+    # 통합 worktree(=main 체크아웃)에 두 파일 모두 존재 = 분열 0. 사용자 HEAD(repo/dev)는 불변.
+    integ = Path(omd.integration_worktree)
+    assert (integ / "a" / "x.py").exists()
+    assert (integ / "b" / "y.py").exists()
+    assert not (repo / "a").exists() and not (repo / "b").exists()   # 사용자 HEAD 불침범
+    log = subprocess.run(["git", "log", "--oneline", "main"], cwd=str(repo),
                          capture_output=True, text=True).stdout
     assert "CLOUD CONNECT A" in log and "CLOUD CONNECT B" in log
 
@@ -68,7 +73,7 @@ def test_reclaim_deletes_branch_so_restart_works(tmp_path):
     repo = tmp_path / "repo"
     _init_repo(repo)
     omd = Coordinator(db_path=str(tmp_path / "omd.db"), repo=str(repo),
-                      worktrees_dir=str(tmp_path / "wt"))
+                      worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
     omd.declare("A", writes=["a/**"])
     omd.next_task("agA")
     omd.claim("agA", ["a/**"], task_id="A")
@@ -92,7 +97,7 @@ def test_connect_stale_lease_does_not_merge(tmp_path):
     repo = tmp_path / "repo"
     _init_repo(repo)
     omd = Coordinator(db_path=str(tmp_path / "omd.db"), repo=str(repo),
-                      worktrees_dir=str(tmp_path / "wt"))
+                      worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
     omd.declare("A", writes=["a/**"])
     omd.next_task("agA")
     omd.claim("agA", ["a/**"], "write", ttl=0.05, task_id="A")
@@ -104,4 +109,5 @@ def test_connect_stale_lease_does_not_merge(tmp_path):
     time.sleep(0.08)
     res = omd.connect("A")
     assert res["ok"] is False and "stale" in res["reason"]
-    assert not (repo / "a" / "x.py").exists()  # merge 안 됨
+    # 통합 worktree에 머지 안 됨(Phase A에서 거부 — Phase B git 미실행)
+    assert not (Path(omd.integration_worktree) / "a" / "x.py").exists()

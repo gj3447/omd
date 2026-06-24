@@ -15,16 +15,14 @@ N개의 코딩 에이전트(물방울)를 **입체(서로소 write-set 궤도)**
 `사도 OMC(입체운행구름) → 군단장 OMD → 군단(병렬 에이전트 물방울들)`
 
 ## 상태
-**동작 (49 tests green, P0 11/11 닫힘).** 구현됨: 입체 glob 교집합 · SQLite lease+fence · Orbit/Task FSM · SINGULON 2지점 강제 · 실물 git worktree+CLOUD CONNECT(merge)+fencing · 좀비 회수 · 데드락 wait-for 사이클 감지 · 우선순위 promote · FastMCP 13툴 · CLI.
+**프로토타입 동작 (19 tests green).** 구현됨: 입체 glob 교집합 · SQLite lease+fence · Orbit/Task FSM · SINGULON 2지점 강제 · 실물 git worktree+CLOUD CONNECT(merge)+fencing · 좀비 회수 · 데드락 wait-for 사이클 감지 · 우선순위 promote · FastMCP 13툴 · CLI.
 
-> ✅ **동시성 P0 11/11 전부 닫힘 (2026-06-24, 49 tests green).** 증분1 P0-1 claim TOCTOU·P0-2 fence중복(D1 `BEGIN IMMEDIATE` 임계구역) / 증분2 P0-3 release 소유+fence·P0-7 `agent_ttl`=90s 회수ON·P0-8 reclaim 브랜치삭제·P0-9 CONNECTING 회수 / **증분3 P0-4 connect fence-captured(ABA)·P0-5 통합브랜치 명시 checkout(동시merge는 D1로 직렬화)·P0-6 `_recover()` 크래시복구·P0-10 의존 사이클 게이트·P0-11 write-set FS 강제(connect diff 감사)**. 전수 분석·기제·로드맵은 [`CONCURRENCY.md`](./CONCURRENCY.md) §5.1.
->
-> ⚠ **남은 frontier (P1·정직).** 프리미티브 크래시안전 — D3 플래그(EPHEMERAL/LATCH+wait)·D4 세마포어·D5 배리어·D6 잔여(finish/commit 소유+fence·bail_epoch) + 성능(split-phase connect: 긴 merge 동안 DB writer 락 점유 해소). HA/싱글톤(D14)은 범위 밖.
+> ⚠ **동시성 한계(정직한 표기).** 위는 *단일 호출자* 가정에서 green이다. 동시 호출/긴급 탈출/크래시/분단까지 견디려면 아직 11개 P0 버그가 남아있다 — claim TOCTOU·fence 중복·release 무소유체크·connect fence-blind·공유레포 동시merge·이중쓰기 무복구·`agent_ttl` 기본 None(회수 비활성)·reclaim 브랜치 미삭제·CONNECTING 무시·의존 사이클 미검출·write-set FS 미강제. 전수 분석·기제·로드맵은 [`CONCURRENCY.md`](./CONCURRENCY.md). (예: 좀비 회수는 `agent_ttl`을 켜야 동작, 기본 비활성.)
 
 ## Quickstart
 ```bash
 pip install -e .            # 코어 + transitions   (서버: -e '.[server]')
-pytest -q                   # 49 passed
+pytest -q                   # 19 passed
 
 # CLI (MCP 툴과 동일 동사)
 omd declare auth --writes 'src/auth/**'

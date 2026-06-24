@@ -86,20 +86,15 @@ def test_concurrent_disjoint_claims_unique_monotonic_fences(tmp_path):
 
 
 def test_two_coordinators_one_db_no_double_grant(tmp_path):
-    """공유 lock 없는 두 코디네이터(=멀티프로세스 모형)가 한 파일 DB에 동시 claim →
-    BEGIN IMMEDIATE(WAL)가 writer를 직렬화 → 정확히 1개만 HELD."""
+    """§D14(증분9): in-process actor 직렬화는 *프로세스당*이므로, 한 DB 에 코디네이터 둘이면
+    actor 불변식이 무효(writer 둘)·통합 머지가 무조정이 된다. 증분9 부터는 이를 BEGIN IMMEDIATE
+    의 우연한 직렬화에 기대지 않고 **리더-lease 로 명시적으로 거부**한다: 살아있는 리더가 있는
+    DB 에 둘째 코디네이터를 띄우려 하면 CoordinatorConflict(단일 인스턴스 강제). 이것이 옛
+    'BEGIN IMMEDIATE 가 어쩌다 1개만 grant' 보다 강한 보장이다."""
+    from omd_server.core import CoordinatorConflict
     db = str(tmp_path / "shared.db")
-    A = Coordinator(db_path=db)
-    B = Coordinator(db_path=db)        # 별 인스턴스 = 별 연결 + 별 RLock(공유 안 함)
-    barrier = threading.Barrier(2)
-    out: dict = {}
-
-    def w(name, co):
-        barrier.wait()
-        out[name] = co.claim(f"ag-{name}", ["x/**"], "write")
-
-    t1 = threading.Thread(target=w, args=("A", A))
-    t2 = threading.Thread(target=w, args=("B", B))
-    t1.start(); t2.start(); t1.join(); t2.join()
-    held = [r for r in out.values() if r["state"] == "HELD"]
-    assert len(held) == 1, out
+    A = Coordinator(db_path=db)        # 첫 코디네이터 = 리더
+    with pytest.raises(CoordinatorConflict):
+        Coordinator(db_path=db)        # 살아있는 리더가 있는 DB → 둘째 기동 거부
+    # 리더 A 는 정상 동작.
+    assert A.claim("ag-A", ["x/**"], "write")["state"] == "HELD"
