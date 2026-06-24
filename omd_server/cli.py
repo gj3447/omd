@@ -48,6 +48,19 @@ def main(argv=None):
     cn.add_argument("--request-id"); cn.add_argument("--bail-epoch", type=int)
     hb = sub.add_parser("heartbeat"); hb.add_argument("agent")
 
+    # D4 세마포어: permit=lease, 가용=max−count(ACTIVE), no-overtaking.
+    sd = sub.add_parser("sem-declare"); sd.add_argument("sem")
+    sd.add_argument("max_permits", type=int)
+    aq = sub.add_parser("acquire"); aq.add_argument("agent"); aq.add_argument("sem")
+    aq.add_argument("--ttl", type=float, default=300.0)
+    aq.add_argument("--no-wait", action="store_true"); aq.add_argument("--priority", type=int, default=0)
+    aq.add_argument("--request-id"); aq.add_argument("--bail-epoch", type=int)
+    ap = sub.add_parser("acquire-poll"); ap.add_argument("waiter_id")
+    sr = sub.add_parser("sem-release"); sr.add_argument("permit_id"); sr.add_argument("agent")
+    sr.add_argument("fence", type=int)
+    sr.add_argument("--request-id"); sr.add_argument("--bail-epoch", type=int)
+    ss = sub.add_parser("sem-status"); ss.add_argument("sem")
+
     # D3 플래그: EPHEMERAL(소유 신호) vs LATCH(영속·단조) + register→poll wait.
     fs = sub.add_parser("flag-set"); fs.add_argument("key"); fs.add_argument("value")
     fs.add_argument("--agent"); fs.add_argument("--type", dest="flag_type", default="LATCH")
@@ -90,6 +103,13 @@ def main(argv=None):
                                        getattr(a, "fence", None),
                                        request_id=rid(), bail_epoch=be()),
         "heartbeat": lambda: omd.heartbeat(a.agent),
+        "sem-declare": lambda: omd.sem_declare(a.sem, a.max_permits),
+        "acquire": lambda: omd.acquire(a.agent, a.sem, ttl=a.ttl, no_wait=a.no_wait,
+                                       priority=a.priority, request_id=rid(), bail_epoch=be()),
+        "acquire-poll": lambda: omd.acquire_poll(a.waiter_id),
+        "sem-release": lambda: omd.sem_release(a.permit_id, a.agent, a.fence,
+                                               request_id=rid(), bail_epoch=be()),
+        "sem-status": lambda: omd.sem_status(a.sem),
         "flag-set": lambda: omd.flag_set(a.key, a.value, getattr(a, "agent", None),
                                          flag_type=a.flag_type, ttl=a.ttl,
                                          request_id=rid(), bail_epoch=be()),

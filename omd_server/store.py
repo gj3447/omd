@@ -78,6 +78,20 @@ CREATE TABLE IF NOT EXISTS flag_waiters (
   created_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_flag_waiters_key ON flag_waiters(key, state);
+-- 증분7(§D4): 세마포어 레지스트리(lease 아님 — 설정). permit 자체는 orbits(kind='sem_permit',
+-- resource_key=sem_id)로, 가용 = max_permits − count(ACTIVE permit)(저장 정수 아님 → 누수 0).
+CREATE TABLE IF NOT EXISTS semaphores (
+  sem_id TEXT PRIMARY KEY, max_permits INTEGER NOT NULL, created_at REAL
+);
+-- 증분7(§D4): 세마포어 대기자(register→poll, 서버 비블로킹). no-overtaking(§D7): 가용 슬롯이
+-- 생겨도 자기보다 먼저 줄선(우선순위↑ 또는 enqueued_seq↓) 대기자가 있으면 양보(기아 방지).
+-- 보유자/대기자 사망 시 reclaim 이 거두므로 영구 hang 없음.
+CREATE TABLE IF NOT EXISTS sem_waiters (
+  waiter_id TEXT PRIMARY KEY, sem_id TEXT NOT NULL, agent_id TEXT,
+  ttl REAL, priority INTEGER DEFAULT 0, enqueued_seq INTEGER,
+  deadline REAL, state TEXT NOT NULL, permit_id TEXT, created_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_sem_waiters_sem ON sem_waiters(sem_id, state);
 -- 증분5(§D9): request_id 멱등 테이블. INFLIGHT(진행중)→DONE(성공종단만 캐시). DENIED/stale-fence
 -- 같은 비성공은 캐시 안 함(세상이 바뀌면 재시도 가능해야 — §3.C). at-least-once MCP 재시도가
 -- 두 번째 효과를 일으키지 않게 한다(claim 누수·이중 merge·이중 release 차단).
@@ -175,6 +189,15 @@ class Store:
     def current_fence(self) -> int:
         r = self.db.execute("SELECT value FROM meta WHERE key='fence'").fetchone()
         return int(r["value"]) if r else 0
+
+    def next_seq(self) -> int:
+        """증분7(§D7): 단조 전역 enqueue 티켓(FIFO no-overtaking 순서용). fence 와 분리 —
+        fence 는 lease 신원, seq 는 큐 도착순서. 단일문 +1(읽고-쓰기 갭 없음)."""
+        self.db.execute(
+            "INSERT INTO meta(key,value) VALUES('seq','0') ON CONFLICT(key) DO UPDATE "
+            "SET value=CAST(value AS INTEGER)+1")
+        return int(self.db.execute(
+            "SELECT value FROM meta WHERE key='seq'").fetchone()["value"])
 
     # --- orbits ---
     def add_orbit(self, *, task_id, agent_id, pathspec, mode, state,
@@ -446,6 +469,83 @@ class Store:
         return _rows(self.db.execute(
             "SELECT * FROM orbits WHERE state='HELD' AND kind='flag_ephemeral' "
             "AND expires_at IS NOT NULL AND expires_at<=?", (now,)))
+
+    # --- semaphores (D4: permit=lease, 가용 = max − count(ACTIVE)) ---
+    def add_semaphore(self, sem_id, max_permits):
+        """세마포어 레지스트리 등록(멱등). max_permits 변경은 ON CONFLICT 으로 갱신."""
+        self.db.execute(
+            "INSERT INTO semaphores(sem_id,max_permits,created_at) VALUES(?,?,?) "
+            "ON CONFLICT(sem_id) DO UPDATE SET max_permits=excluded.max_permits",
+            (sem_id, max_permits, time.time()))
+
+    def get_semaphore(self, sem_id) -> dict | None:
+        return _row(self.db.execute(
+            "SELECT * FROM semaphores WHERE sem_id=?", (sem_id,)))
+
+    def count_active_permits(self, sem_id) -> int:
+        """증분7(§D4): 가용 계산의 핵심 — 활성(HELD) permit 수. 저장 정수가 아니라 lease
+        count 라서, 보유자가 죽어 permit 이 EXPIRED/RELEASED 되면 자동으로 가용이 복구된다(누수 0)."""
+        r = self.db.execute(
+            "SELECT COUNT(*) AS n FROM orbits WHERE kind='sem_permit' AND state='HELD' "
+            "AND resource_key=?", (sem_id,)).fetchone()
+        return int(r["n"])
+
+    def active_permit_for(self, sem_id, agent_id) -> dict | None:
+        """이 agent 가 이 세마포어에 이미 쥔 ACTIVE permit(있으면) — 멱등 reuse 용(재발급 안 함)."""
+        return _row(self.db.execute(
+            "SELECT * FROM orbits WHERE kind='sem_permit' AND state='HELD' "
+            "AND resource_key=? AND agent_id=? LIMIT 1", (sem_id, agent_id)))
+
+    def active_permits(self, sem_id) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE kind='sem_permit' AND state='HELD' "
+            "AND resource_key=?", (sem_id,)))
+
+    def sem_permits_owned_by(self, agent_id, states=("HELD",)) -> list[dict]:
+        """증분7(§D4): 이 agent 가 쥔 sem_permit lease 들 — reclaim 이 거두며 슬롯 복구(누수 0)."""
+        q = ",".join("?" * len(states))
+        return _rows(self.db.execute(
+            f"SELECT * FROM orbits WHERE agent_id=? AND kind='sem_permit' "
+            f"AND state IN ({q})", (agent_id, *states)))
+
+    def due_sem_permits(self, now) -> list[dict]:
+        """증분7(§D4): TTL 만료된 sem_permit(보유자가 renew/heartbeat 안 함=GC-pause/사망) —
+        sweep 이 거둬 EXPIRED → 슬롯 복구."""
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE state='HELD' AND kind='sem_permit' "
+            "AND expires_at IS NOT NULL AND expires_at<=?", (now,)))
+
+    # --- sem_waiters (D4: register→poll, no-overtaking §D7) ---
+    def add_sem_waiter(self, sem_id, agent_id, ttl, priority, enqueued_seq, deadline) -> str:
+        wid = "sw-" + uuid.uuid4().hex[:12]
+        self.db.execute(
+            "INSERT INTO sem_waiters(waiter_id,sem_id,agent_id,ttl,priority,enqueued_seq,"
+            "deadline,state,created_at) VALUES(?,?,?,?,?,?,?, 'WAITING', ?)",
+            (wid, sem_id, agent_id, ttl, priority, enqueued_seq, deadline, time.time()))
+        return wid
+
+    def get_sem_waiter(self, waiter_id) -> dict | None:
+        return _row(self.db.execute(
+            "SELECT * FROM sem_waiters WHERE waiter_id=?", (waiter_id,)))
+
+    def set_sem_waiter(self, waiter_id, *, state, permit_id=...):
+        sets, args = ["state=?"], [state]
+        if permit_id is not ...:
+            sets.append("permit_id=?"); args.append(permit_id)
+        args.append(waiter_id)
+        self.db.execute(
+            f"UPDATE sem_waiters SET {','.join(sets)} WHERE waiter_id=?", args)
+
+    def waiting_sem_waiters(self, sem_id) -> list[dict]:
+        """우선순위 DESC → FIFO(enqueued_seq ASC). head = 다음에 부여받을 자(no-overtaking)."""
+        return _rows(self.db.execute(
+            "SELECT * FROM sem_waiters WHERE sem_id=? AND state='WAITING' "
+            "ORDER BY priority DESC, enqueued_seq ASC", (sem_id,)))
+
+    def sem_waiters_for_agent(self, agent_id, sem_id) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM sem_waiters WHERE agent_id=? AND sem_id=? AND state='WAITING'",
+            (agent_id, sem_id)))
 
     def pinned_orbits_for_task(self, task_id) -> list[dict]:
         return _rows(self.db.execute(

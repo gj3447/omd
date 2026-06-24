@@ -538,8 +538,40 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
   4. **periodic sweep 없음**(현 inline only, §7 미해결) — flag_ephemeral lease TTL 만료의 BROKEN 반영은 누군가 `flag_wait_poll`/`sweep`/`next_task`/`claim` 등 inline-sweep 동사를 호출할 때 일어난다. 대기자가 poll 하면 반드시 반영되므로(poll 이 sweep 함) 대기 측엔 영구 hang 없음. 백그라운드 tick 은 P2.
 - **남은 부채**: P0 전부 닫힘(증분1~4). 미구현 = **D4 세마포어** · **D5 배리어** · D12 read-set 코히런스 · D14 HA 입장 — 전부 설계만(P1/P2). (D3 = 증분6, D6 잔여+D9 = 증분5, P0-1~11 = 증분1~4.)
 
+### ✅ 증분 7 — D4 크래시 안전 세마포어: permit=lease, 가용 = max − count(ACTIVE) — DONE
+> 빌드 슬롯류 자원의 크래시 안전 배정. 정수 카운터의 고전 버그(보유자가 죽을 때마다 새서
+> 결국 0=영구 정지)를 "permit=lease"로 원천 차단 — 죽은 보유자의 permit 이 EXPIRED 되면
+> `가용 = max − count(ACTIVE)` 가 *구조적으로* 복구된다(누수 0). §1.2 의 세마포어 적용.
+
+- **permit = owned+TTL+fenced LEASE**(`core.py`/`store.py`, §0.2 4프리미티브 투영):
+  - `orbits.kind='sem_permit'`, `resource_key=sem_id`, fence 부여(소유+fenced). 일반 궤도(`kind='orbit'`)와
+    분리돼 입체검사/promote/sweep 의 경로궤도 쿼리에 안 섞인다(기존 `kind='orbit'` 필터가 그대로 보호).
+  - `semaphores` 레지스트리 테이블(`sem_id`,`max_permits`) — lease 아닌 설정. `sem_declare` 멱등 등록(max 증가 시 대기자 promote).
+  - `sem_waiters` 테이블(register→poll, 서버 비블로킹) + 단조 전역 `next_seq()`(meta `seq`, fence 와 분리한 FIFO 티켓).
+- **신규 동사**: `sem_declare(name,max)` · `acquire(agent,sem,ttl,no_wait,priority)` · `acquire_poll(waiter_id)` · `sem_release(permit,fence)` · `sem_status(sem)`(관측용). server/cli 동반 노출.
+- **초과배정 불가(§D4)**: `acquire` 의 check-then-grant 가 `_cs()`(D1 임계구역) 안에서 원자 —
+  두 acquirer 가 동시에 N-1 슬롯을 보고 둘 다 N+1번째를 부여하는 레이스 차단. `가용 = max − count_active_permits(sem)`.
+- **멱등 reuse(§D9)**: 이미 ACTIVE permit 을 쥔 agent 의 재acquire 는 같은 permit 반환(재발급 안 함) — MCP 재시도 누수 0. `request_id` 멱등(`_idem`, 성공만 캐시)도 병행.
+- **no-overtaking(§D7)**: `_has_earlier_waiter` — 가용 슬롯이 있어도 자기보다 먼저 줄선(우선순위 DESC → FIFO) 대기자가 있으면 양보(작은 acquire 스트림이 head 대기자를 굶기는 writer-starvation 방지). 슬롯 복구 시 `_promote_sem_waiters` 가 줄선 순서대로 부여.
+- **reclaim 단일루틴 통합(§1.1, §G)**: 죽은 보유자의 sem_permit 을 `_reclaim_agent_inline` 이 EXPIRE → 슬롯 복구(bail/좀비회수 둘 다 수렴) + 복구된 세마포어 promote. `_sweep_inline` 의 `due_sem_permits` 가 TTL 만료 permit 도 같은 복구 경로(agent_ttl 없이도). 대기 중이던 agent 가 죽으면 그 대기 등록을 CANCELLED. `heartbeat` 한 번이 자기 sem_permit 도 연장(§G — 궤도/permit 비대칭 만료가 빌드 슬롯 이중배정을 부르는 것 방지).
+- **fence/owner 거부(§D6)**: `sem_release` 는 `_check_owner`(owner∧fence) — 남의 permit 해제·재부여후 낡은 fence 해제 불가(P0-3 유형). 이미 RELEASED/EXPIRED 면 멱등 OK. `_check_alive`(bail_epoch)로 회수된 좀비의 acquire/release 차단.
+- 스키마(additive·fresh-DB 친화 + `_SCHEMA` CREATE IF NOT EXISTS — 기존 DB도 획득): `semaphores`·`sem_waiters` 테이블, meta `seq`. orbits 컬럼 재사용(`kind`/`resource_key`/`expires_at`/`fence`) — 신규 ALTER 불필요. permit 상태 ACTIVE/RELEASED/EXPIRED 는 orbit FSM(HELD/RELEASED/EXPIRED)에 그대로 투영(FSM 변경 0).
+- 테스트(**130 passed, 1 skipped**; 신규 22 = `test_d4_semaphore.py` + `gates/semaphore.yaml`):
+  정상(declare/acquire·미지 sem 거부·용량 불초과·가용=count·멱등 reuse·request_id 멱등) · **초과배정 불가**(8 동시 acquire, max=3 → 정확히 3 ACTIVE) · no-overtaking(head 우선·우선순위 정렬·**빈슬롯+대기자 territory 이빨**) · fence/owner 거부(non-owner·stale-fence·멱등 release) · **크래시/사망/오추방 실패경로**(bail→슬롯복구+대기자 기상 / 좀비회수→복구 / **permit TTL 만료→복구**(agent_ttl 없이) / heartbeat 가 permit 연장 / 회수된 좀비 acquire 차단 / 대기자 사망→CANCELLED+슬롯 다음 대기자로 / 대기 TIMEOUT) · LTDD 트레이스(`sem_acquired→sem_permit_reclaimed` 순서 도착).
+- **변이검증(이빨 4건 실증, 복원함)**:
+  ① 용량 가드 무력화(`avail>=1` 분기 항상 참) → 초과배정·큐 점프 → **7건 RED**(용량불초과·**8-동시 초과배정**·no-overtaking·우선순위·대기자기상·대기자취소·타임아웃).
+  ② 멱등 reuse 무력화(`existing` 분기 skip) → 재acquire 가 둘째 누수 permit 생성 → `test_idempotent_reuse` RED.
+  ③ sem_permit reclaim 무력화(`sem_permits_owned_by`→`[]`) → 죽은 보유자가 슬롯 영구 누수(=정수 카운터 고전 버그) → **4건 RED**(bail 슬롯복구·대기자기상·좀비회수·LTDD).
+  ④ no-overtaking 무력화(`_has_earlier_waiter`→False) → 빈슬롯+대기자 상태에서 새 acquire 가 head 를 가로챔 → `test_fresh_acquire_yields_to_queued_waiter` RED. 넷 다 복원 후 130 green.
+- **deviation/한계(정직 표기)**:
+  1. **promote 는 eager(release/sweep/declare 마다 즉시 head 부여)** — 그래서 '빈 슬롯 + 대기자' 상태가 정상 경로엔 거의 안 생기고, `_has_earlier_waiter` 가드는 *defense-in-depth*(직접 acquire 의 큐 점프 차단)다. 그 이빨은 territory 테스트(store 직접 상태 주입)로 실증. eager-promote 자체가 1차 기아 방지.
+  2. **대기 deadline = ttl**(별도 wait-timeout 인자 없음) — `acquire` 의 `ttl` 이 'permit 보유 TTL'이자 '대기 타임아웃'을 겸한다. 명세(§D4 의사코드)는 `ttl`만 받으므로 따랐다. 더 세분이 필요하면 P2(별도 `wait_timeout`).
+  3. **periodic sweep 없음**(증분6과 동일, §7 미해결) — sem_permit TTL 만료의 슬롯 복구는 누군가 inline-sweep 동사(acquire/acquire_poll/sem_status/sweep 등)를 호출할 때 일어난다. 대기자가 poll 하면 반드시 반영되므로 대기 측엔 영구 hang 없음. 백그라운드 tick 은 P2.
+  4. **permit 은 fence 를 받지만 strict-fence 재검증 동사는 release 뿐** — acquire/reuse 는 owner 기준(같은 agent). renew 전용 동사는 안 만들고 heartbeat 로 TTL 연장(§D2 의 'heartbeat 한 번이 모든 hb_bound lease 갱신' 패턴). permit 개별 renew 가 필요하면 P2.
+- **남은 부채**: P0 전부 닫힘(증분1~4). 미구현 = **D5 배리어**(세대-스탬프+BROKEN) · D12 read-set 코히런스 · D14 HA 입장 — 전부 설계만(P1/P2). (D4 = 증분7, D3 = 증분6, D6 잔여+D9 = 증분5 에서 닫힘.)
+
 ### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
-D4 세마포어(permit=lease, `가용=N−count(ACTIVE)`, no-overtaking) · D5 배리어(세대-스탬프+BROKEN) · D12 read-set 코히런스 · D14 HA 입장. (P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6 에서 닫힘.)
+D5 배리어(세대-스탬프+BROKEN) · D12 read-set 코히런스 · D14 HA 입장. (P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6, D4 = 증분7 에서 닫힘.)
 
 ---
 

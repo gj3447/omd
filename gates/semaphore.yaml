@@ -1,0 +1,15 @@
+# Red artifact (LTDD, 증분7/§D4): 세마포어 permit 보유자가 죽으면(bail) 관측가능하게
+# 무엇이 방출돼야 하는가. acquire(sem_acquired) → 보유자 사망(sem_permit_reclaimed) 이
+# 순서대로 store 에 도착해야 한다(슬롯 복구의 외부 증거 = 누수 0).
+cid: omd-sem-demo
+service: omd
+expect:
+  - event: sem_acquired
+    where: {sem: build}        # permit 부여됨(value-pinned)
+    op: ">="
+    count: 1
+  - event: sem_permit_reclaimed
+    where: {sem: build}        # 보유자 사망 → permit 회수 → 슬롯 복구
+    op: "=="
+    count: 1
+  - must_order: [sem_acquired, sem_permit_reclaimed]

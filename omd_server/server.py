@@ -135,6 +135,37 @@ def build_server(db_path: str = "omd.db"):
         return omd.flag_wait_poll(waiter_id)
 
     @mcp.tool()
+    def sem_declare(sem: str, max_permits: int) -> dict:
+        """세마포어 선언/등록(§D4, 멱등). max_permits 변경 시 갱신(슬롯 늘면 대기자 promote)."""
+        return omd.sem_declare(sem, max_permits)
+
+    @mcp.tool()
+    def acquire(agent: str, sem: str, ttl: float = 300.0, no_wait: bool = False,
+                priority: int = 0, request_id: str | None = None,
+                bail_epoch: int | None = None) -> dict:
+        """세마포어 permit 획득(§D4). 가용=max−count(ACTIVE)(누수 0). 멱등 reuse(이미 보유시
+        재발급 안 함). no_wait=False 면 WAITING(waiter_id → acquire_poll), no-overtaking(§D7)."""
+        return omd.acquire(agent, sem, ttl=ttl, no_wait=no_wait, priority=priority,
+                           request_id=request_id, bail_epoch=bail_epoch)
+
+    @mcp.tool()
+    def acquire_poll(waiter_id: str) -> dict:
+        """세마포어 대기 폴(register→poll, 비블로킹). ACQUIRED/TIMEOUT/CANCELLED/WAITING."""
+        return omd.acquire_poll(waiter_id)
+
+    @mcp.tool()
+    def sem_release(permit_id: str, agent: str, fence: int,
+                    request_id: str | None = None, bail_epoch: int | None = None) -> dict:
+        """permit 반납. 소유+fence 일치해야(이중해제·재부여후해제 방지, §D6). 슬롯 나면 대기자 promote."""
+        return omd.sem_release(permit_id, agent, fence, request_id=request_id,
+                               bail_epoch=bail_epoch)
+
+    @mcp.tool()
+    def sem_status(sem: str) -> dict:
+        """세마포어 현황(가용/활성/대기) — 관측용."""
+        return omd.sem_status(sem)
+
+    @mcp.tool()
     def heartbeat(agent: str) -> dict:
         """물방울 생존 신호. 끊기면(agent_ttl 초과) 좀비 회수로 궤도/작업 반환."""
         return omd.heartbeat(agent)
