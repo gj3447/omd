@@ -33,7 +33,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_orbits_fence ON orbits(fence) WHERE fence I
 CREATE TABLE IF NOT EXISTS tasks (
   task_id TEXT PRIMARY KEY, name TEXT, writes TEXT, reads TEXT, deps TEXT,
   state TEXT NOT NULL, agent_id TEXT, priority INTEGER, created_at REAL,
-  worktree TEXT, branch TEXT
+  worktree TEXT, branch TEXT, captured_fence INTEGER
 );
 CREATE TABLE IF NOT EXISTS agents (
   agent_id TEXT PRIMARY KEY, name TEXT, state TEXT, last_heartbeat REAL
@@ -68,6 +68,12 @@ class Store:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(_SCHEMA)
+        # 기존 DB 마이그레이션(컬럼 추가는 멱등치 않으므로 가드). 신규 DB는 _SCHEMA가 이미 포함.
+        for tbl, col, decl in [("tasks", "captured_fence", "INTEGER")]:
+            try:
+                self.db.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError:
+                pass  # 이미 존재
         self._txn_depth = 0
 
     # --- 트랜잭션 경계(재진입 가능) ---
@@ -154,16 +160,21 @@ class Store:
     def get_task(self, task_id) -> dict | None:
         return _row(self.db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)))
 
-    def set_task(self, task_id, *, state=..., agent_id=..., worktree=..., branch=...):
+    def set_task(self, task_id, *, state=..., agent_id=..., worktree=..., branch=...,
+                 captured_fence=...):
         sets, args = [], []
         for col, val in (("state", state), ("agent_id", agent_id),
-                         ("worktree", worktree), ("branch", branch)):
+                         ("worktree", worktree), ("branch", branch),
+                         ("captured_fence", captured_fence)):
             if val is not ...:
                 sets.append(f"{col}=?"); args.append(val)
         if not sets:
             return
         args.append(task_id)
         self.db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE task_id=?", args)
+
+    def all_tasks(self) -> list[dict]:
+        return _rows(self.db.execute("SELECT * FROM tasks"))
 
     def tasks_by_state(self, states) -> list[dict]:
         q = ",".join("?" * len(states))

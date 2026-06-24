@@ -1,0 +1,181 @@
+{
+ "name": "omd-longinus-bindings",
+ "purpose": "OMD(입체운행물방울) 코드↔KG Longinus 바인딩. self-contained drift audit(omd_server/longinus.py). lakatos 의존 0.",
+ "policy": "append-only SoT. sha256=def-line[:16]. line_hint=캐시(무드리프트). 매 커밋 tests/test_longinus_bindings.py 가드.",
+ "commit_baseline": "dc5b23f",
+ "kg_anchors": [
+  "omd-p0-concurrency-hardening-20260624"
+ ],
+ "bindings": [
+  {
+   "sourceId": "core.Coordinator",
+   "file": "omd_server/core.py",
+   "symbol": "Coordinator",
+   "kind": "class",
+   "line_hint": 36,
+   "sha256": "81ccdead74921b34",
+   "layer": "infrastructure",
+   "frege_sinn": "서로소 write-set lease 코디네이터(SINGULON 2지점 강제)"
+  },
+  {
+   "sourceId": "core._would_cycle",
+   "file": "omd_server/core.py",
+   "symbol": "_would_cycle",
+   "kind": "function",
+   "line_hint": 178,
+   "sha256": "be14df04fdf09023",
+   "layer": "domain-policy",
+   "frege_sinn": "task 의존 사이클 게이트(P0-10, declare에서 ValueError)"
+  },
+  {
+   "sourceId": "core._recover",
+   "file": "omd_server/core.py",
+   "symbol": "_recover",
+   "kind": "function",
+   "line_hint": 358,
+   "sha256": "8f6beda10b1321e0",
+   "layer": "domain-policy",
+   "frege_sinn": "재기동 시 CONNECTING 고착 task를 git기준 재조정(P0-6 크래시복구)"
+  },
+  {
+   "sourceId": "gitio.diff_names",
+   "file": "omd_server/gitio.py",
+   "symbol": "diff_names",
+   "kind": "function",
+   "line_hint": 66,
+   "sha256": "564b23eb45fa14ae",
+   "layer": "infrastructure",
+   "frege_sinn": "branch base...branch 변경파일 — write-set FS 감사 입력(P0-11)"
+  },
+  {
+   "sourceId": "gitio.connect_landed",
+   "file": "omd_server/gitio.py",
+   "symbol": "connect_landed",
+   "kind": "function",
+   "line_hint": 71,
+   "sha256": "faf99faf0357547f",
+   "layer": "infrastructure",
+   "frege_sinn": "통합브랜치에 CLOUD CONNECT merge 착지 여부(P0-6 복구 진실원)"
+  },
+  {
+   "sourceId": "store.all_tasks",
+   "file": "omd_server/store.py",
+   "symbol": "all_tasks",
+   "kind": "function",
+   "line_hint": 176,
+   "sha256": "55e45fa0eadad433",
+   "layer": "infrastructure",
+   "frege_sinn": "전 task 조회(의존 사이클 그래프 구성용)"
+  },
+  {
+   "sourceId": "test_d10_writeset.test_writeset_violation_rejected",
+   "file": "tests/test_d10_writeset.py",
+   "symbol": "test_writeset_violation_rejected",
+   "kind": "test",
+   "line_hint": 26,
+   "sha256": "72cd1ba9607a5ae0",
+   "layer": "tests",
+   "frege_sinn": "P0-11 차선밖 파일 commit→connect 거부"
+  },
+  {
+   "sourceId": "test_d10_writeset.test_writeset_clean_merges",
+   "file": "tests/test_d10_writeset.py",
+   "symbol": "test_writeset_clean_merges",
+   "kind": "test",
+   "line_hint": 37,
+   "sha256": "5b3d29644151dcf5",
+   "layer": "tests",
+   "frege_sinn": "P0-11 차선내만 작성→정상 merge"
+  },
+  {
+   "sourceId": "test_depcycle.test_self_dep_rejected",
+   "file": "tests/test_depcycle.py",
+   "symbol": "test_self_dep_rejected",
+   "kind": "test",
+   "line_hint": 6,
+   "sha256": "b4fa99de553f8e6b",
+   "layer": "tests",
+   "frege_sinn": "P0-10 자기의존 거부"
+  },
+  {
+   "sourceId": "test_depcycle.test_two_cycle_rejected",
+   "file": "tests/test_depcycle.py",
+   "symbol": "test_two_cycle_rejected",
+   "kind": "test",
+   "line_hint": 12,
+   "sha256": "6700bda96316b25e",
+   "layer": "tests",
+   "frege_sinn": "P0-10 2-사이클 거부"
+  },
+  {
+   "sourceId": "test_depcycle.test_three_cycle_rejected",
+   "file": "tests/test_depcycle.py",
+   "symbol": "test_three_cycle_rejected",
+   "kind": "test",
+   "line_hint": 20,
+   "sha256": "e2e0e14caf3e592f",
+   "layer": "tests",
+   "frege_sinn": "P0-10 3-사이클 거부"
+  },
+  {
+   "sourceId": "test_depcycle.test_valid_chain_ok",
+   "file": "tests/test_depcycle.py",
+   "symbol": "test_valid_chain_ok",
+   "kind": "test",
+   "line_hint": 28,
+   "sha256": "e1c23a3d6ec6f914",
+   "layer": "tests",
+   "frege_sinn": "P0-10 DAG는 허용"
+  },
+  {
+   "sourceId": "test_fence_aba.test_connect_rejects_fence_drift_aba",
+   "file": "tests/test_fence_aba.py",
+   "symbol": "test_connect_rejects_fence_drift_aba",
+   "kind": "test",
+   "line_hint": 14,
+   "sha256": "7bc1b076af2a6ac0",
+   "layer": "tests",
+   "frege_sinn": "P0-4 fence 드리프트(ABA)→connect 거부"
+  },
+  {
+   "sourceId": "test_fence_aba.test_connect_ok_when_fence_matches",
+   "file": "tests/test_fence_aba.py",
+   "symbol": "test_connect_ok_when_fence_matches",
+   "kind": "test",
+   "line_hint": 29,
+   "sha256": "e9bf56876dc32c9d",
+   "layer": "tests",
+   "frege_sinn": "P0-4 fence 일치→정상 merge"
+  },
+  {
+   "sourceId": "test_recover.test_recover_finalizes_landed_merge",
+   "file": "tests/test_recover.py",
+   "symbol": "test_recover_finalizes_landed_merge",
+   "kind": "test",
+   "line_hint": 19,
+   "sha256": "86d0b401607dcc93",
+   "layer": "tests",
+   "frege_sinn": "P0-6 merge착지+고착→재기동 finalize"
+  },
+  {
+   "sourceId": "test_recover.test_recover_requeues_unlanded",
+   "file": "tests/test_recover.py",
+   "symbol": "test_recover_requeues_unlanded",
+   "kind": "test",
+   "line_hint": 34,
+   "sha256": "7ffd01560fb96a36",
+   "layer": "tests",
+   "frege_sinn": "P0-6 미착지→requeue"
+  },
+  {
+   "sourceId": "test_merge_branch.test_merge_lands_on_integration_despite_head_drift",
+   "file": "tests/test_merge_branch.py",
+   "symbol": "test_merge_lands_on_integration_despite_head_drift",
+   "kind": "test",
+   "line_hint": 16,
+   "sha256": "d967d10dda50f4dc",
+   "layer": "tests",
+   "frege_sinn": "P0-5 root HEAD 드리프트 무관 통합브랜치 착지"
+  }
+ ]
+}

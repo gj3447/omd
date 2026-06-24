@@ -46,8 +46,13 @@ class GitRepo:
         self._git(*self._IDENT, "commit", "-m", msg, cwd=worktree)
         return self._git("rev-parse", "HEAD", cwd=worktree)
 
-    def merge(self, branch: str, msg: str) -> str:
-        """통합 브랜치(root)에 branch를 --no-ff merge. 충돌이면 abort 후 GitError."""
+    def merge(self, branch: str, msg: str, base: str | None = None) -> str:
+        """통합 브랜치에 branch를 --no-ff merge. 충돌이면 abort 후 GitError.
+        P0-5/§D11: base(통합 브랜치)로 명시 checkout 후 merge — root HEAD가 드리프트해도
+        항상 올바른 통합 브랜치에 착지(엉뚱한 브랜치 오염 방지). 크로스프로세스 동시 merge는
+        connect가 _cs()(BEGIN IMMEDIATE) 안에서 도는 D1 직렬화로 인덱스 경합이 차단된다."""
+        if base and self.current_branch() != base:
+            self._git("checkout", base)
         try:
             self._git(*self._IDENT, "merge", "--no-ff", "-m", msg, branch)
         except GitError as e:
@@ -57,6 +62,20 @@ class GitRepo:
                 pass
             raise GitError(f"merge conflict on {branch}: {e}")
         return self._git("rev-parse", "HEAD")
+
+    def diff_names(self, branch: str, base: str) -> list[str]:
+        """base...branch (merge-base 이후 branch가 실제로 바꾼 파일 목록). P0-11 감사용."""
+        out = self._git("diff", "--name-only", f"{base}...{branch}")
+        return [ln for ln in out.splitlines() if ln.strip()]
+
+    def connect_landed(self, task_id: str) -> bool:
+        """통합 브랜치(root HEAD)에 이 task의 CLOUD CONNECT merge가 실제로 착지했나 (P0-6/§D8).
+        crash 복구의 진실원 = git. 커밋 제목 정확일치로 prefix 충돌(A vs AB) 회피."""
+        try:
+            subjects = self._git("log", "--format=%s").splitlines()
+        except GitError:
+            return False
+        return f"CLOUD CONNECT {task_id}" in subjects
 
     def remove_worktree(self, path: str):
         try:
