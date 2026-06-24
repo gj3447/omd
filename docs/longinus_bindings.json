@@ -1,0 +1,201 @@
+{
+ "name": "omd-longinus-bindings",
+ "purpose": "OMD(입체운행물방울) 코드↔KG Longinus 바인딩. self-contained drift audit(omd_server/longinus.py). lakatos 의존 0.",
+ "policy": "append-only SoT. sha256=def-line[:16]. line_hint=캐시(무드리프트). 매 커밋 tests/test_longinus_bindings.py 가드. 코드 심볼 추적(test 함수 아님).",
+ "commit_baseline": "78bd168",
+ "kg_anchors": [
+  "omd-concurrency-hardening-D1-D14-20260624"
+ ],
+ "bindings": [
+  {
+   "sourceId": "core.Coordinator",
+   "file": "omd_server/core.py",
+   "symbol": "Coordinator",
+   "kind": "class",
+   "line_hint": 78,
+   "sha256": "81ccdead74921b34",
+   "layer": "infrastructure",
+   "frege_sinn": "서로소 write-set lease 코디네이터(in-process actor 직렬화=SINGULON 단일 writer)"
+  },
+  {
+   "sourceId": "core._would_cycle",
+   "file": "omd_server/core.py",
+   "symbol": "_would_cycle",
+   "kind": "function",
+   "line_hint": 311,
+   "sha256": "a6fa18c4d9f06ea2",
+   "layer": "domain-policy",
+   "frege_sinn": "task 의존 사이클 게이트(§D7/P0-10, declare 전 후보엣지로 전역 재검)"
+  },
+  {
+   "sourceId": "core._recover",
+   "file": "omd_server/core.py",
+   "symbol": "_recover",
+   "kind": "function",
+   "line_hint": 593,
+   "sha256": "8f6beda10b1321e0",
+   "layer": "domain-policy",
+   "frege_sinn": "재기동 시 git↔DB 조정 — CONNECTING task를 trailer-probe로 전진수정/rollback(P0-6/§D8 크래시복구)"
+  },
+  {
+   "sourceId": "store.all_tasks",
+   "file": "omd_server/store.py",
+   "symbol": "all_tasks",
+   "kind": "function",
+   "line_hint": 406,
+   "sha256": "55e45fa0eadad433",
+   "layer": "infrastructure",
+   "frege_sinn": "전 task 조회(의존 사이클 그래프 구성용)"
+  },
+  {
+   "sourceId": "gitio.changed_paths",
+   "file": "omd_server/gitio.py",
+   "symbol": "changed_paths",
+   "kind": "function",
+   "line_hint": 80,
+   "sha256": "bc4a4fadae964d23",
+   "layer": "infrastructure",
+   "frege_sinn": "base...branch 변경파일(--no-renames) — write-set FS 감사 입력(P0-11/§D10, main diff_names 리네임)"
+  },
+  {
+   "sourceId": "gitio.branch_in_integration",
+   "file": "omd_server/gitio.py",
+   "symbol": "branch_in_integration",
+   "kind": "function",
+   "line_hint": 114,
+   "sha256": "23b1982757f3464b",
+   "layer": "infrastructure",
+   "frege_sinn": "통합브랜치에 CLOUD CONNECT trailer-probe로 merge 착지 여부(P0-6/§D8 복구 진실원, main connect_landed 리네임)"
+  },
+  {
+   "sourceId": "core._reclaim_agent_inline",
+   "file": "omd_server/core.py",
+   "symbol": "_reclaim_agent_inline",
+   "kind": "function",
+   "line_hint": 367,
+   "sha256": "c6d87d801247f674",
+   "layer": "domain-policy",
+   "frege_sinn": "긴급탈출(bail)/좀비회수 단일 회수 루틴 — 궤도해제+requeue+worktree정리+RETIRE, 멱등(§D2)"
+  },
+  {
+   "sourceId": "core._break_ephemeral_flags_for_lease",
+   "file": "omd_server/core.py",
+   "symbol": "_break_ephemeral_flags_for_lease",
+   "kind": "function",
+   "line_hint": 1366,
+   "sha256": "bc44a4912926c98a",
+   "layer": "domain-policy",
+   "frege_sinn": "받쳐주던 flag_ephemeral lease 거둠 시 EPHEMERAL 플래그 BROKEN+epoch++대기자 기상(§D3 영구hang 차단)"
+  },
+  {
+   "sourceId": "core.acquire",
+   "file": "omd_server/core.py",
+   "symbol": "acquire",
+   "kind": "function",
+   "line_hint": 1613,
+   "sha256": "a1708c519bf11f97",
+   "layer": "domain-policy",
+   "frege_sinn": "세마포어 permit 획득 — check-then-grant 원자(초과배정 불가)+no-overtaking(§D4/§D7)"
+  },
+  {
+   "sourceId": "core.barrier_declare",
+   "file": "omd_server/core.py",
+   "symbol": "barrier_declare",
+   "kind": "function",
+   "line_hint": 1834,
+   "sha256": "0362b4ab9a263b21",
+   "layer": "domain-policy",
+   "frege_sinn": "응결 랑데부 배리어 선언/재무장 — generation 스탬프로 ABA/유령도착 차단(§D5)"
+  },
+  {
+   "sourceId": "core.barrier_arrive",
+   "file": "omd_server/core.py",
+   "symbol": "barrier_arrive",
+   "kind": "function",
+   "line_hint": 1866,
+   "sha256": "923e64ca3145eb18",
+   "layer": "domain-policy",
+   "frege_sinn": "배리어 참가자 도착 — 전원 도착 시 trip(결정적 순서 응결), 사망/타임아웃 시 BROKEN(§D5)"
+  },
+  {
+   "sourceId": "core._check_alive",
+   "file": "omd_server/core.py",
+   "symbol": "_check_alive",
+   "kind": "function",
+   "line_hint": 487,
+   "sha256": "30f8ec7a8df84dd6",
+   "layer": "domain-policy",
+   "frege_sinn": "좀비 부활 차단 — RETIRED/ZOMBIE/BAILING 또는 stale bail_epoch 변이 FENCED_OUT(§D6)"
+  },
+  {
+   "sourceId": "core._idem",
+   "file": "omd_server/core.py",
+   "symbol": "_idem",
+   "kind": "function",
+   "line_hint": 527,
+   "sha256": "002a93fd26e0f734",
+   "layer": "domain-policy",
+   "frege_sinn": "변이 동사 멱등 래퍼(임계구역 내) — DONE 캐시 replay, 비성공 clear(at-least-once→exactly-once, §D9)"
+  },
+  {
+   "sourceId": "core._ghost_reads",
+   "file": "omd_server/core.py",
+   "symbol": "_ghost_reads",
+   "kind": "function",
+   "line_hint": 728,
+   "sha256": "3160516eca3e11d3",
+   "layer": "domain-policy",
+   "frege_sinn": "read_synced_gen 이후 reads 와 겹친 응결 write-globs 검출(consumer connect 코히런스, §D12)"
+  },
+  {
+   "sourceId": "core.CoordinatorConflict",
+   "file": "omd_server/core.py",
+   "symbol": "CoordinatorConflict",
+   "kind": "class",
+   "line_hint": 59,
+   "sha256": "7924f799ed095a65",
+   "layer": "domain-policy",
+   "frege_sinn": "한 DB에 살아있는 다른 리더-lease 코디네이터 발견 시 기동 거부(단일 인스턴스 강제, §D14)"
+  },
+  {
+   "sourceId": "core._writeset_audit",
+   "file": "omd_server/core.py",
+   "symbol": "_writeset_audit",
+   "kind": "function",
+   "line_hint": 651,
+   "sha256": "f843d7757e9a15f5",
+   "layer": "domain-policy",
+   "frege_sinn": "branch 변경경로 중 claimed write-globs 밖(분열위험) 검출 — pre-connect 감사(P0-11/§D10)"
+  },
+  {
+   "sourceId": "core._connect_phase_a",
+   "file": "omd_server/core.py",
+   "symbol": "_connect_phase_a",
+   "kind": "function",
+   "line_hint": 1200,
+   "sha256": "98e3a769da0b85a9",
+   "layer": "domain-policy",
+   "frege_sinn": "split-phase Phase A(임계구역): fence 재검증+merge_token 획득+intent 영속+pin+→CONNECTING"
+  },
+  {
+   "sourceId": "core._connect_phase_b",
+   "file": "omd_server/core.py",
+   "symbol": "_connect_phase_b",
+   "kind": "function",
+   "line_hint": 1287,
+   "sha256": "48d4afceb199c99d",
+   "layer": "domain-policy",
+   "frege_sinn": "split-phase Phase B(락 밖): 전용 통합 worktree에서 merge --no-ff(타임아웃, §E/§D11)"
+  },
+  {
+   "sourceId": "core._connect_phase_c",
+   "file": "omd_server/core.py",
+   "symbol": "_connect_phase_c",
+   "kind": "function",
+   "line_hint": 1302,
+   "sha256": "cbbc8ae74c115728",
+   "layer": "domain-policy",
+   "frege_sinn": "split-phase Phase C(임계구역): Phase B 결과 원자 반영 — merge_sha 기록(P0-6)/rollback+토큰반납"
+  }
+ ]
+}
