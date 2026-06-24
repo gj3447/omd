@@ -47,6 +47,19 @@ def main(argv=None):
     cn.add_argument("--agent"); cn.add_argument("--fence", type=int)
     cn.add_argument("--request-id"); cn.add_argument("--bail-epoch", type=int)
     hb = sub.add_parser("heartbeat"); hb.add_argument("agent")
+
+    # D3 플래그: EPHEMERAL(소유 신호) vs LATCH(영속·단조) + register→poll wait.
+    fs = sub.add_parser("flag-set"); fs.add_argument("key"); fs.add_argument("value")
+    fs.add_argument("--agent"); fs.add_argument("--type", dest="flag_type", default="LATCH")
+    fs.add_argument("--ttl", type=float); fs.add_argument("--request-id")
+    fs.add_argument("--bail-epoch", type=int)
+    fc = sub.add_parser("flag-clear"); fc.add_argument("key"); fc.add_argument("--agent")
+    fc.add_argument("--request-id"); fc.add_argument("--bail-epoch", type=int)
+    fg = sub.add_parser("flag-get"); fg.add_argument("key")
+    fw = sub.add_parser("flag-wait"); fw.add_argument("key"); fw.add_argument("want")
+    fw.add_argument("timeout", type=float); fw.add_argument("--agent")
+    fp = sub.add_parser("flag-wait-poll"); fp.add_argument("waiter_id")
+
     sub.add_parser("sweep")
     sub.add_parser("status")
 
@@ -77,6 +90,15 @@ def main(argv=None):
                                        getattr(a, "fence", None),
                                        request_id=rid(), bail_epoch=be()),
         "heartbeat": lambda: omd.heartbeat(a.agent),
+        "flag-set": lambda: omd.flag_set(a.key, a.value, getattr(a, "agent", None),
+                                         flag_type=a.flag_type, ttl=a.ttl,
+                                         request_id=rid(), bail_epoch=be()),
+        "flag-clear": lambda: omd.flag_clear(a.key, getattr(a, "agent", None),
+                                             request_id=rid(), bail_epoch=be()),
+        "flag-get": lambda: omd.flag_get(a.key),
+        "flag-wait": lambda: omd.flag_wait(a.key, a.want, a.timeout,
+                                           getattr(a, "agent", None)),
+        "flag-wait-poll": lambda: omd.flag_wait_poll(a.waiter_id),
         "sweep": lambda: omd.sweep(),
         "status": lambda: omd.status(),
     }[a.cmd]()

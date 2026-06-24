@@ -57,8 +57,27 @@ CREATE TABLE IF NOT EXISTS agents (
   bail_epoch INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS flags (
-  key TEXT PRIMARY KEY, value TEXT, set_by TEXT, set_at REAL
+  key TEXT PRIMARY KEY, value TEXT, set_by TEXT, set_at REAL,
+  -- 증분6(§D3): EPHEMERAL(=lease, 소유+TTL+heartbeat, 죽으면 자동 clear/BROKEN, reclaim 대상)
+  -- vs LATCH(영속·단조 done(1)<merged(2), 소유분리, 회수 대상 아님, 하향 에러).
+  flag_type TEXT NOT NULL DEFAULT 'LATCH',
+  -- ABA/유령기상 방어: set/clear/break 마다 +1. flag_wait 가 value 가 아니라 epoch 로 재검사.
+  epoch INTEGER NOT NULL DEFAULT 0,
+  -- 단조 LATCH 랭크: done=1 < merged=2 (0=랭크 없음). 하향 set 은 거부.
+  rank INTEGER NOT NULL DEFAULT 0,
+  -- LIVE | CLEARED | BROKEN. EPHEMERAL 보유자 사망 → BROKEN(대기자 PRODUCER_DEAD 기상).
+  status TEXT NOT NULL DEFAULT 'LIVE',
+  -- EPHEMERAL 일 때만: 소유 agent + 받쳐주는 lease(orbits.kind='flag_ephemeral') id.
+  owner_agent TEXT, lease_id TEXT
 );
+-- 증분6(§D3): flag_wait register→poll(서버 비블로킹). timeout 필수. observed_epoch 로 재검사
+-- (ABA/유령기상 안전). producer 사망 시 BROKEN→poll 이 PRODUCER_DEAD 로 기상(영구 hang 없음).
+CREATE TABLE IF NOT EXISTS flag_waiters (
+  waiter_id TEXT PRIMARY KEY, agent_id TEXT, key TEXT, want_value TEXT,
+  observed_epoch INTEGER, deadline REAL, state TEXT NOT NULL, wake_reason TEXT,
+  created_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_flag_waiters_key ON flag_waiters(key, state);
 -- 증분5(§D9): request_id 멱등 테이블. INFLIGHT(진행중)→DONE(성공종단만 캐시). DENIED/stale-fence
 -- 같은 비성공은 캐시 안 함(세상이 바뀌면 재시도 가능해야 — §3.C). at-least-once MCP 재시도가
 -- 두 번째 효과를 일으키지 않게 한다(claim 누수·이중 merge·이중 release 차단).
@@ -85,6 +104,13 @@ _MIGRATIONS = [
     # 증분5(§D6/§D9)
     ("agents", "bail_epoch", "INTEGER NOT NULL DEFAULT 0"),
     ("orbits", "intent_key", "TEXT"),
+    # 증분6(§D3 flags): EPHEMERAL/LATCH 분리 + wait register→poll.
+    ("flags", "flag_type", "TEXT NOT NULL DEFAULT 'LATCH'"),
+    ("flags", "epoch", "INTEGER NOT NULL DEFAULT 0"),
+    ("flags", "rank", "INTEGER NOT NULL DEFAULT 0"),
+    ("flags", "status", "TEXT NOT NULL DEFAULT 'LIVE'"),
+    ("flags", "owner_agent", "TEXT"),
+    ("flags", "lease_id", "TEXT"),
 ]
 
 
@@ -254,8 +280,11 @@ class Store:
             f"SELECT * FROM tasks WHERE state IN ({q}) ORDER BY priority DESC, created_at",
             list(states)))
 
-    # --- flags ---
+    # --- flags (D3: LATCH 단조사실 + EPHEMERAL 소유신호) ---
     def set_flag(self, key, value, set_by=None):
+        """단순 LATCH set(하위호환 경로). 증분6 의 전체 메타(type/rank/epoch/status)는
+        get_flag_row/upsert_flag 가 다룬다. 기존 호출부(connect 의 'merged' latch 등)는
+        이 경로로도 동작 — flag_type 디폴트 LATCH, epoch 는 보존(set 마다 안 올림)."""
         self.db.execute(
             "INSERT INTO flags(key,value,set_by,set_at) VALUES(?,?,?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=?,set_by=?,set_at=?",
@@ -264,6 +293,68 @@ class Store:
     def get_flag(self, key) -> str | None:
         r = _row(self.db.execute("SELECT value FROM flags WHERE key=?", (key,)))
         return r["value"] if r else None
+
+    def get_flag_row(self, key) -> dict | None:
+        """증분6: 플래그 전체 메타(type/rank/epoch/status/owner/lease) — D3 CAS·만족판정용."""
+        return _row(self.db.execute("SELECT * FROM flags WHERE key=?", (key,)))
+
+    def upsert_flag(self, key, *, value, set_by=None, flag_type="LATCH", rank=0,
+                    status="LIVE", owner_agent=None, lease_id=None, epoch):
+        """증분6: 플래그 전체 메타를 set(epoch 명시 — set/clear/break 마다 +1 해서 넘김).
+        EPHEMERAL/LATCH 분기·단조검사·소유검사는 core 가 미리 하고 여기선 영속만 한다."""
+        self.db.execute(
+            "INSERT INTO flags(key,value,set_by,set_at,flag_type,epoch,rank,status,"
+            "owner_agent,lease_id) VALUES(?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=?,set_by=?,set_at=?,flag_type=?,"
+            "epoch=?,rank=?,status=?,owner_agent=?,lease_id=?",
+            (key, value, set_by, time.time(), flag_type, epoch, rank, status,
+             owner_agent, lease_id,
+             value, set_by, time.time(), flag_type, epoch, rank, status,
+             owner_agent, lease_id))
+
+    def set_flag_status(self, key, *, status, epoch, value=..., owner_agent=...,
+                        lease_id=...):
+        """증분6: 플래그 상태 전이(LIVE→CLEARED/BROKEN) + epoch +1. 보유자 사망 시 reclaim 이
+        EPHEMERAL 플래그를 BROKEN 으로(대기자 PRODUCER_DEAD 기상)."""
+        sets, args = ["status=?", "epoch=?"], [status, epoch]
+        for col, val in (("value", value), ("owner_agent", owner_agent),
+                         ("lease_id", lease_id)):
+            if val is not ...:
+                sets.append(f"{col}=?"); args.append(val)
+        args.append(key)
+        self.db.execute(f"UPDATE flags SET {','.join(sets)} WHERE key=?", args)
+
+    def ephemeral_flags_for_lease(self, lease_id) -> list[dict]:
+        """증분6: 주어진 lease(orbits.kind='flag_ephemeral')에 묶인 EPHEMERAL 플래그들 —
+        reclaim 이 그 lease 를 거두며 플래그를 BROKEN 으로 만든다(자동 clear)."""
+        return _rows(self.db.execute(
+            "SELECT * FROM flags WHERE flag_type='EPHEMERAL' AND lease_id=? "
+            "AND status='LIVE'", (lease_id,)))
+
+    # --- flag_waiters (D3: register→poll, 비블로킹 wait) ---
+    def add_flag_waiter(self, agent_id, key, want_value, observed_epoch, deadline) -> str:
+        wid = "fw-" + uuid.uuid4().hex[:12]
+        self.db.execute(
+            "INSERT INTO flag_waiters(waiter_id,agent_id,key,want_value,observed_epoch,"
+            "deadline,state,created_at) VALUES(?,?,?,?,?,?, 'WAITING', ?)",
+            (wid, agent_id, key, want_value, observed_epoch, deadline, time.time()))
+        return wid
+
+    def get_flag_waiter(self, waiter_id) -> dict | None:
+        return _row(self.db.execute(
+            "SELECT * FROM flag_waiters WHERE waiter_id=?", (waiter_id,)))
+
+    def set_flag_waiter(self, waiter_id, *, state, wake_reason=...):
+        sets, args = ["state=?"], [state]
+        if wake_reason is not ...:
+            sets.append("wake_reason=?"); args.append(wake_reason)
+        args.append(waiter_id)
+        self.db.execute(
+            f"UPDATE flag_waiters SET {','.join(sets)} WHERE waiter_id=?", args)
+
+    def waiters_for_key(self, key, state="WAITING") -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM flag_waiters WHERE key=? AND state=?", (key, state)))
 
     # --- idempotency (D9: at-least-once MCP exactly-once 효과) ---
     def get_idem(self, request_id) -> dict | None:
@@ -339,6 +430,22 @@ class Store:
         return _rows(self.db.execute(
             f"SELECT * FROM orbits WHERE agent_id=? AND kind='merge_token' AND state IN ({q})",
             (agent_id, *states)))
+
+    # --- flag_ephemeral lease (D3: EPHEMERAL 플래그를 받쳐주는 owned+TTL lease) ---
+    def flag_leases_owned_by(self, agent_id, states=("HELD",)) -> list[dict]:
+        """증분6(§D3): 이 agent 가 쥔 flag_ephemeral lease 들 — reclaim 이 거두며 받쳐주는
+        EPHEMERAL 플래그를 BROKEN 으로 만든다(자동 clear, 대기자 PRODUCER_DEAD 기상)."""
+        q = ",".join("?" * len(states))
+        return _rows(self.db.execute(
+            f"SELECT * FROM orbits WHERE agent_id=? AND kind='flag_ephemeral' "
+            f"AND state IN ({q})", (agent_id, *states)))
+
+    def due_flag_leases(self, now) -> list[dict]:
+        """증분6(§D3): TTL 만료된 flag_ephemeral lease(보유자가 renew/heartbeat 안 함) —
+        sweep 이 거둬 EPHEMERAL 플래그를 BROKEN 으로(보유자 GC-pause/사망 = lease 만료)."""
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE state='HELD' AND kind='flag_ephemeral' "
+            "AND expires_at IS NOT NULL AND expires_at<=?", (now,)))
 
     def pinned_orbits_for_task(self, task_id) -> list[dict]:
         return _rows(self.db.execute(
