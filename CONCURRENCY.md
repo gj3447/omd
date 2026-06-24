@@ -435,8 +435,16 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
 - **변이검증**: `_check_owner` 우회 시 비소유 agent가 남의 궤도를 RELEASED 시킴(이중부여) → 테스트가 'not owner'로 잡음.
 - 시그니처 변경: `release(orbit_id, agent, fence)` / `renew(orbit_id, agent, fence, ttl)` + `bail(agent)` (server/cli/tests 동반 갱신).
 
-### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
-P0-4 connect fence captured 비교 · P0-5/§D11 merge_token + split-phase connect · P0-6/§D8 `_recover()` · P0-10 의존 DAG 사이클 · P0-11/§D10 connect diff 감사 · D3 플래그(EPHEMERAL/LATCH+wait) · D4 세마포어 · D5 배리어 · D6 잔여(finish/commit/connect 소유+fence + bail_epoch).
+### ✅ 증분 3 — 잔여 P0 전부 닫힘 — DONE (P0-4·P0-5·P0-6·P0-10·P0-11) (2026-06-24)
+- **P0-11/§D10 write-set FS 강제** (`gitio.diff_names` + `core.connect`): merge 직전 `git diff --name-only base...branch`가 선언 write-set glob(`sets_overlap`) 안에 전부 들어오는지 감사. 밖이면 `write_set_violation` 거부(통합 브랜치 불변). "최대 구멍" 닫음. 테스트 `test_d10_writeset.py`.
+- **P0-10 의존 사이클 게이트** (`core._would_cycle`+`declare`, `store.all_tasks`): declare가 task-deps 그래프에 자신을 지나는 사이클을 만들면 `ValueError`. 상호의존 영구 BLOCKED 방지. 테스트 `test_depcycle.py`.
+- **P0-4 connect fence-captured(ABA)** (`tasks.captured_fence`+마이그레이션 / `start` 캡처 / `connect` 비교): `state==HELD ∧ fence==captured`만 통과. lease가 도중 만료→재부여되면 거부. 테스트 `test_fence_aba.py`.
+- **P0-6/§D8 `_recover()`** (`gitio.connect_landed`+`core._recover`, `__init__` 호출): 재기동 시 CONNECTING 고착 task를 git 기준 재조정 — `CLOUD CONNECT <task>` 착지=finalize(MERGED+해제+정리)/미착지=requeue. 이중쓰기 크래시 영구고착·고아 해소. 테스트 `test_recover.py`.
+- **P0-5/§D11 통합 브랜치 명시 checkout** (`gitio.merge(base=)`+`core.integration_branch`): root HEAD 드리프트 무관 정착지. 크로스프로세스 동시 merge는 connect가 `_cs()` BEGIN IMMEDIATE(D1) 안이라 SQLite writer 락으로 이미 직렬화(인덱스 경합 차단)→별도 merge_token 불요. 테스트 `test_merge_branch.py`.
+- 테스트: **49 green**(증분3 신규 11: writeset 2·depcycle 4·fence_aba 2·recover 2·merge_branch 1).
+
+### ⬜ 다음 증분 후보 (P1 — 프리미티브 크래시안전·성능, P0 아님)
+D3 플래그(EPHEMERAL/LATCH+wait) · D4 세마포어 · D5 배리어 · D6 잔여(finish/commit 소유+fence + bail_epoch) · P0-5 split-phase connect(성능: 긴 merge 동안 DB writer 락 해제) · D9 멱등 캐시 · D14 코디네이터 HA/싱글톤.
 
 ---
 

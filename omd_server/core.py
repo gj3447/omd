@@ -47,6 +47,8 @@ class Coordinator:
         if self.git:
             self.worktrees_dir = worktrees_dir or (self.git.root.rstrip("/") + "-omd-worktrees")
             os.makedirs(self.worktrees_dir, exist_ok=True)
+            self.integration_branch = self.git.current_branch()  # P0-5: merge 착지 브랜치 고정
+            self._recover()  # P0-6: 재기동 시 CONNECTING 고착 task를 git 기준 재조정
 
     # ---- 임계구역 / 이벤트 ----
     @contextmanager
@@ -173,10 +175,30 @@ class Coordinator:
         return None
 
     # ---- 공개 API (= MCP 툴 / CLI 동사) ----
+    def _would_cycle(self, task_id, deps) -> bool:
+        """task_id→deps를 더하면 task 의존그래프에 task_id를 지나는 사이클이 생기나 (P0-10).
+        생기면 상호의존 task들이 영원히 BLOCKED(어느 쪽도 deps-MERGED 못 됨)된다."""
+        graph = {t["task_id"]: json.loads(t["deps"]) for t in self.store.all_tasks()}
+        graph[task_id] = list(deps)
+
+        def dfs(n, path):
+            for m in graph.get(n, []):
+                if m == task_id:
+                    return True
+                if m not in path and dfs(m, path | {m}):
+                    return True
+            return False
+
+        return dfs(task_id, {task_id})
+
     def declare(self, task_id, *, name="", writes=None, reads=None, deps=None, priority=0):
+        deps = deps or []
         with self._cs():
+            if deps and self._would_cycle(task_id, deps):
+                self._emit("task_declare_rejected", task_id, reason="dep_cycle", deps=deps)
+                raise ValueError(f"dependency cycle: {task_id} deps {deps} would form a cycle")
             self.store.add_task(task_id=task_id, name=name, writes=writes or [],
-                                reads=reads or [], deps=deps or [], state="PENDING",
+                                reads=reads or [], deps=deps, state="PENDING",
                                 priority=priority)
         return {"task_id": task_id, "state": "PENDING"}
 
@@ -303,9 +325,15 @@ class Coordinator:
                 branch = f"omd/{task_id}"
                 worktree = os.path.join(self.worktrees_dir, task_id)
                 self.git.add_worktree(branch, worktree)
+            # P0-4: 작업 시작 시점의 lease fence를 task에 고정(captured). connect는 이 fence와
+            # 일치하는 HELD 궤도에서만 merge한다 → 도중 lease가 만료/회수/재부여(ABA)되면 거부.
+            cf = next((o["fence"] for o in self.store.orbits_for_task(task_id)
+                       if o["mode"] == "write" and o["state"] == "HELD"
+                       and o["agent_id"] == agent_id), None)
             self.store.set_task(task_id, state=s, agent_id=agent_id,
                                 worktree=worktree if self.git else ...,
-                                branch=branch if self.git else ...)
+                                branch=branch if self.git else ...,
+                                captured_fence=cf if cf is not None else ...)
             self._emit("task_started", agent_id, task=task_id, worktree=worktree)
             return {"task_id": task_id, "state": s, "worktree": worktree, "branch": branch}
 
@@ -327,6 +355,46 @@ class Coordinator:
             self._emit("task_finished", t["agent_id"], task=task_id)
             return {"task_id": task_id, "state": "DONE"}
 
+    def _recover(self):
+        """P0-6/§D8 — 재기동 시 CONNECTING에 고착된 task를 git 기준으로 재조정.
+        merge가 통합 브랜치에 실제 착지 → finalize(MERGED+궤도해제+worktree정리);
+        안 착지 → abort→requeue(PENDING)+정리=재시도 가능. 이중쓰기 크래시의 영구고착/고아 해소."""
+        if not self.git:
+            return
+        with self._cs():
+            for t in self.store.tasks_by_state(["CONNECTING"]):
+                tid = t["task_id"]
+                if self.git.connect_landed(tid):
+                    self.store.set_task(tid, state=fsm.advance("task", "CONNECTING", "merged"))
+                    for o in self.store.orbits_for_task(tid):
+                        if o["mode"] == "write" and o["state"] == "HELD":
+                            self.store.set_orbit(o["orbit_id"],
+                                                 state=fsm.advance("orbit", "HELD", "release"),
+                                                 released_at=time.time())
+                    if t.get("worktree"):
+                        self.git.remove_worktree(t["worktree"])
+                    self.store.set_flag(tid, "merged")
+                    self._emit("recovered_merged", tid, task=tid)
+                else:
+                    s = fsm.advance("task", "CONNECTING", "abort")
+                    self.store.set_task(tid, state=fsm.advance("task", s, "requeue"),
+                                        agent_id=None, worktree=None, branch=None,
+                                        captured_fence=None)
+                    for o in self.store.orbits_for_task(tid):
+                        if o["state"] == "HELD":
+                            self.store.set_orbit(o["orbit_id"],
+                                                 state=fsm.advance("orbit", "HELD", "release"),
+                                                 released_at=time.time())
+                        elif o["state"] == "PENDING":
+                            self.store.set_orbit(o["orbit_id"],
+                                                 state=fsm.advance("orbit", "PENDING", "deny"))
+                    if t.get("worktree"):
+                        self.git.remove_worktree(t["worktree"])
+                    if t.get("branch"):
+                        self.git.delete_branch(t["branch"])
+                    self._emit("recovered_requeued", tid, task=tid)
+            self._promote_pending()
+
     def connect(self, task_id):
         """CLOUD CONNECT(응결=merge). fencing: 작업 중 lease 만료/해제면 거부."""
         with self._cs():
@@ -335,12 +403,33 @@ class Coordinator:
             writes = [o for o in orbs if o["mode"] == "write"]
             if not writes:
                 return {"ok": False, "reason": "no write orbit for task"}
-            stale = [o["orbit_id"] for o in writes if o["state"] != "HELD"]
+            # P0-4: HELD 만으로 부족 — 시작 시 고정한 fence(captured)와 일치까지 요구.
+            # lease가 도중 만료→재부여(ABA)되면 state는 HELD로 돌아와도 fence가 달라 거부.
+            cf = self.store.get_task(task_id).get("captured_fence")
+            stale = [o["orbit_id"] for o in writes
+                     if o["state"] != "HELD" or (cf is not None and o["fence"] != cf)]
             if stale:
                 self._emit("connect_rejected", task_id, reason="stale_fence", stale=stale)
-                return {"ok": False, "reason": "stale fence: lease expired/released during work",
+                return {"ok": False,
+                        "reason": "stale fence: lease expired/released/regranted during work",
                         "stale": stale}
             t = self.store.get_task(task_id)
+            # P0-11/§D10 — write-set FS 강제: 브랜치가 실제로 바꾼 파일이 모두 선언
+            # write-set(궤도 glob) 안에 있는지 감사. 밖이면 '선언상 입체'가 실제로 겹쳐
+            # 분열을 낼 수 있으므로(SINGULON 토대) merge 거부 — 통합 브랜치 불변.
+            wsglobs = json.loads(t["writes"]) if t.get("writes") else []
+            if self.git and t.get("branch") and wsglobs:
+                try:
+                    changed = self.git.diff_names(t["branch"], self.git.current_branch())
+                except Exception:
+                    changed = []
+                violations = [f for f in changed if not sets_overlap([f], wsglobs)]
+                if violations:
+                    self._emit("connect_rejected", task_id, reason="write_set_violation",
+                               files=violations[:20])
+                    return {"ok": False,
+                            "reason": "write-set violation: files outside declared orbit",
+                            "violations": violations[:20], "task_id": task_id}
             s = t["state"]
             if s == "IN_ORBIT":
                 s = fsm.advance("task", s, "finish")
@@ -350,7 +439,8 @@ class Coordinator:
             if self.git:
                 from .gitio import GitError
                 try:
-                    merge_sha = self.git.merge(t["branch"], f"CLOUD CONNECT {task_id}")
+                    merge_sha = self.git.merge(t["branch"], f"CLOUD CONNECT {task_id}",
+                                               base=getattr(self, "integration_branch", None))
                 except GitError as e:
                     self.store.set_task(task_id, state=fsm.advance("task", "CONNECTING", "abort"))
                     self._emit("connect_aborted", task_id, reason=str(e))
