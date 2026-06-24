@@ -1,0 +1,59 @@
+name: ci
+
+# Build-gate for OMD. Mirrors gj3447/ooptdd's CI style (setup-python + pip install + pytest),
+# promoting the dogfooded positive-TDD/LTDD loop from "run pytest manually" to an ENFORCED gate.
+#
+# ── ooptdd (the LTDD methodology dep) is a PRIVATE sibling repo, not on PyPI ──────────────────────
+# OMD's LTDD gate tests (tests/test_ltdd_claim.py, tests/test_d2_reclaim.py) and the server tests
+# (tests/test_server.py) use pytest.importorskip(...), so WITHOUT those optional deps the suite stays
+# GREEN by skipping them. This job therefore goes green TODAY with no secret. To make the LTDD gate
+# actually RUN in CI (recommended), add a repo secret so the install below can resolve the private
+# sibling:
+#
+#   ONE-TIME SECRET SETUP (repo gj3447/omd):
+#     1. Create a fine-grained PAT (github.com → Settings → Developer settings → Fine-grained tokens)
+#        with Repository access = gj3447/ooptdd and Repository permissions → Contents: Read-only.
+#     2. In this repo: Settings → Secrets and variables → Actions → New repository secret
+#        Name:  WORKSPACE_PAT
+#        Value: <the PAT>
+#   With WORKSPACE_PAT present the LTDD tests RUN (gate enforced); absent, they SKIP (still green).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install ooptdd (private sibling, optional — best effort, never hard-fails)
+        # Only attempt when the secret is non-empty (an empty secret must not break the build).
+        # With WORKSPACE_PAT present, the LTDD methodology tests RUN (gate enforced); absent, they
+        # importorskip and the suite stays GREEN. This avoids red-until-secret.
+        env:
+          WORKSPACE_PAT: ${{ secrets.WORKSPACE_PAT }}
+        run: |
+          if [ -n "$WORKSPACE_PAT" ]; then
+            pip install "ooptdd @ git+https://x-access-token:${WORKSPACE_PAT}@github.com/gj3447/ooptdd.git@main" \
+              || echo "::notice::ooptdd install failed despite WORKSPACE_PAT — LTDD tests will skip"
+          else
+            echo "::notice::ooptdd unavailable (no WORKSPACE_PAT secret) — LTDD tests will skip"
+          fi
+      - name: Install omd + pytest
+        run: |
+          pip install -e .
+          pip install pytest
+      - name: Test
+        run: pytest -q -rs
