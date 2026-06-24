@@ -104,12 +104,35 @@ def build_server(db_path: str = "omd.db"):
 
     @mcp.tool()
     def flag_set(key: str, value: str, agent: str | None = None,
+                 flag_type: str = "LATCH", ttl: float | None = None,
                  request_id: str | None = None, bail_epoch: int | None = None) -> dict:
-        return omd.flag_set(key, value, agent, request_id=request_id, bail_epoch=bail_epoch)
+        """플래그 set(§D3). flag_type='LATCH'(영속·단조 done<merged) | 'EPHEMERAL'(소유 신호=
+        owned+TTL lease, 보유자 사망 시 자동 BROKEN). EPHEMERAL 은 agent 필수 + owner CAS."""
+        return omd.flag_set(key, value, agent, flag_type=flag_type, ttl=ttl,
+                            request_id=request_id, bail_epoch=bail_epoch)
+
+    @mcp.tool()
+    def flag_clear(key: str, agent: str | None = None,
+                   request_id: str | None = None, bail_epoch: int | None = None) -> dict:
+        """EPHEMERAL 플래그 자발 clear(작업 끝). owner 만. LATCH 는 clear 불가(단조사실 영속)."""
+        return omd.flag_clear(key, agent, request_id=request_id, bail_epoch=bail_epoch)
 
     @mcp.tool()
     def flag_get(key: str) -> dict:
         return omd.flag_get(key)
+
+    @mcp.tool()
+    def flag_wait(key: str, want: str, timeout: float, agent: str | None = None) -> dict:
+        """플래그 대기 등록(register→poll, 서버 비블로킹, §D3). timeout 필수(영구 hang 방지).
+        즉시 SATISFIED/BROKEN(producer_dead) 또는 waiter_id 발급 → flag_wait_poll 재호출.
+        의존 해제는 =done 이 아니라 =merged 에 건다(§3.H)."""
+        return omd.flag_wait(key, want, timeout, agent)
+
+    @mcp.tool()
+    def flag_wait_poll(waiter_id: str) -> dict:
+        """대기 폴(저렴·멱등). SATISFIED/TIMEOUT/BROKEN(producer_dead)/WAITING. epoch 재검사로
+        ABA/유령기상 안전. BROKEN 을 성공이나 hang 으로 오인하지 말 것."""
+        return omd.flag_wait_poll(waiter_id)
 
     @mcp.tool()
     def heartbeat(agent: str) -> dict:

@@ -509,8 +509,37 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
   4. **connect 멱등 캐시는 비원자 2-스텝**(Phase C 성공 후 별도 `_cs()`에서 begin+finish_idem) — Phase C 와 캐시 기록 사이 크래시면 캐시 미기록이나 task 는 이미 MERGED 라 재시도가 already-merged(noop) 로 안전 수렴(의미적 멱등이 백스톱). 즉 request_id 캐시는 최적화, 의미적 멱등이 정확성 보장.
 - **남은 부채**: P0 전부 닫힘(증분1~4). 미구현 = D3 플래그(EPHEMERAL/LATCH+wait+owner/epoch CAS) · D4 세마포어 · D5 배리어 · D12 read-set 코히런스 · D14 HA 입장 — 전부 설계만(P1/P2).
 
+### ✅ 증분 6 — D3 플래그: EPHEMERAL(=lease) vs LATCH(영속·단조) + flag_wait register→poll — DONE
+> 사용자 핵심 우려("작업중 플래그를 세운 놈이 죽으면 대기자 전원 영구 데드락")의 정면 해소(§1.2).
+> 플래그를 두 종류로 분리: 소유 신호는 lease 라 §1.1 단일 회수 루틴이 자동으로 거두고,
+> 단조 사실은 lease 가 아니라 producer 가 죽어도 살아남는다.
+
+- **EPHEMERAL(=소유+TTL+heartbeat lease)** (`core.py` `_flag_set_ephemeral`):
+  - `flag_set(key,value,agent,flag_type='EPHEMERAL',ttl=)` 가 받쳐주는 lease(`orbits.kind='flag_ephemeral'`, owned+TTL, `resource_key=key`)를 발급. owner 를 `upsert_agent` 로 등록(reclaim 이 찾을 수 있게).
+  - **owner CAS**(§D6 보강): LIVE EPHEMERAL 은 같은 owner 만 재set, 타 agent `not flag owner` 거부. (증분5 deviation #2 "flag_set 의 owner 가드 미룸"을 EPHEMERAL 에 대해 닫음.)
+  - **자동 clear/BROKEN(영구 hang 0)**: 보유자 사망의 **두 경로** 모두 단일 reclaim 루틴이 거둠 — (a) `bail`/좀비회수 → `_reclaim_agent_inline` 이 `flag_leases_owned_by` 를 거두며 `_break_ephemeral_flags_for_lease`(플래그 BROKEN + epoch +1 + 대기자 PRODUCER_DEAD 기상) + lease EXPIRE; (b) lease TTL 만료 → `_sweep_inline` 의 `due_flag_leases` 가 같은 break 경로. **agent_ttl 없이도 lease TTL 만으로 풀린다.**
+  - `flag_clear(key,agent)`(owner 만, 정상 종료): lease 해제 + status→CLEARED + epoch +1. LATCH 는 clear 불가.
+  - `heartbeat(agent)` 한 번이 그 agent 의 모든 flag_ephemeral lease 를 연장(§1.2 — 건강한 producer 가 renew 깜빡해 자기 신호가 BROKEN 되지 않게).
+- **LATCH(영속·단조)** (`core.py` `_flag_set_latch`): `done`(rank 1)<`merged`(rank 2). **하향 set 거부**('un-finish 불가'), 동값 재발행 멱등 no-op, 상향/신규 set. 소유 개념 없음(connect 의 `merged` latch 가 그대로 동작) · **회수 대상 아님**(producer 죽어도 사실 살아남음).
+- **flag_wait register→poll**(서버 비블로킹, `core.py`): `flag_wait(key,want,timeout,agent)` — **timeout=None 거부**(영구 hang 방지). 즉시 SATISFIED/BROKEN(producer_dead) 또는 `waiter_id` 발급. `flag_wait_poll(waiter_id)` — SATISFIED/TIMEOUT/BROKEN/WAITING. **epoch 재검사**(value 아님)로 ABA/유령기상 안전. poll 내부 `_sweep_inline` 이 lease TTL 만료를 BROKEN 으로 반영. **만족 판정 = 정확 값일치 OR 단조 랭크 도달** → `=done` 대기자는 `merged`로도 만족(merged ⊃ done).
+- **§3.H 의존 해제 = `=merged`**: `flag_wait(producer,'merged',...)` 대기자는 producer 가 `done`(finish)만 세운 단계에선 **계속 WAITING**, `merged`(응결)에서만 기상 — 이른 의존 해제가 입체 창을 재오픈하는 것을 차단. 테스트로 명시 검증.
+- 스키마(additive·fresh-DB 친화 + 멱등 `_migrate`): `flags` 에 `flag_type`/`epoch`/`rank`/`status`/`owner_agent`/`lease_id`; 신규 `flag_waiters` 테이블(`_SCHEMA` CREATE IF NOT EXISTS — 기존 DB도 획득). store: `get_flag_row`/`upsert_flag`/`set_flag_status`/`ephemeral_flags_for_lease` + `add/get/set_flag_waiter`/`waiters_for_key` + `flag_leases_owned_by`/`due_flag_leases`.
+- server/cli: `flag_set`(+`flag_type`/`ttl`)·신규 `flag_clear`/`flag_wait`/`flag_wait_poll` 노출.
+- 테스트(**108 passed, 1 skipped**; 신규 27 = `test_d3_flags.py` + `gates/flag.yaml`): LATCH 단조(set/get·상향·**하향거부**·동값멱등·producer 사망에도 영속·clear 불가); EPHEMERAL(lease 생성·owner 필수·**owner CAS**·정상 clear·non-owner clear 거부·type 혼동 거부); wait(즉시만족·set 후 만족·**timeout 필수**·timeout 발화·**§3.H merged-not-done**·done은 merged로 만족·미지 waiter·**epoch ABA 안전**); **크래시/사망/오추방 실패경로**(producer bail→BROKEN+PRODUCER_DEAD 기상+lease EXPIRE / 좀비회수→BROKEN / **lease TTL 만료→BROKEN**(agent_ttl 없이) / heartbeat 가 lease 연장 / 회수된 좀비 flag_set 차단 / request_id 멱등 누수0); LTDD 트레이스(`flag_set[EPHEMERAL]→flag_broken[producer_dead]` 순서 도착).
+- **변이검증(이빨 4건 실증, 복원함)**:
+  ① `_break_ephemeral_flags_for_lease` 무력화(early `return`) → producer 가 죽어도 플래그가 LIVE 로 잔존, 대기자가 영영 PRODUCER_DEAD 못 받음(= 사용자가 짚은 영구 데드락) → bail/좀비/TTL-만료/LTDD **4건 RED**.
+  ② 단조 하향거부 무력화 → `merged` 뒤 `done` 으로 un-finish 됨 → `test_latch_downgrade_rejected` RED.
+  ③ owner CAS 무력화 → 타 agent 가 남의 EPHEMERAL 신호를 덮어씀 → `test_ephemeral_owner_cas` RED.
+  ④ `timeout is None` 거부 무력화 → 영구 wait 등록 시도(deadline 계산이 TypeError) → `test_wait_timeout_required` RED. 넷 다 복원 후 108 green.
+- **deviation/한계(정직 표기)**:
+  1. **EPHEMERAL set 은 agent 를 자동 upsert** — 안 그러면 `bail`/좀비회수가 `agents` 행을 못 찾아 noop → 플래그 영구 잔존(바로 해소하려던 버그). 즉 flag_set(EPHEMERAL)은 owner 를 살아있는 agent 로 등록하는 부작용이 있다(의도된 계약).
+  2. **`flag_set` 의 bail_epoch CAS 는 부분** — 회수된 좀비(RETIRED/ZOMBIE/BAILING) 차단은 `_check_alive` 로 항상 ON 이지만, EPHEMERAL 의 §D6 "epoch CAS" 는 **owner CAS + lease fence 만료**로 대체 강제(별도 flag epoch 를 변이마다 caller 가 들고 오게 하진 않음 — orbit lease 가 이미 fence/owner 가드를 받으므로 이중화 불필요). LATCH 는 소유 개념 자체가 없어(§D3) owner/epoch CAS 비대상.
+  3. **CLEARED ≠ BROKEN**: 자발 clear 는 '사실이 더는 참 아님'(producer 정상 종료)이라 대기자를 PRODUCER_DEAD 로 깨우지 않는다 — want 가 다른 값이면 계속 WAITING(타임아웃까지). 오직 보유자 **사망**(reclaim/TTL)만 BROKEN/PRODUCER_DEAD. 영구 hang 은 사망 경로가 BROKEN 으로 닫으므로 없음.
+  4. **periodic sweep 없음**(현 inline only, §7 미해결) — flag_ephemeral lease TTL 만료의 BROKEN 반영은 누군가 `flag_wait_poll`/`sweep`/`next_task`/`claim` 등 inline-sweep 동사를 호출할 때 일어난다. 대기자가 poll 하면 반드시 반영되므로(poll 이 sweep 함) 대기 측엔 영구 hang 없음. 백그라운드 tick 은 P2.
+- **남은 부채**: P0 전부 닫힘(증분1~4). 미구현 = **D4 세마포어** · **D5 배리어** · D12 read-set 코히런스 · D14 HA 입장 — 전부 설계만(P1/P2). (D3 = 증분6, D6 잔여+D9 = 증분5, P0-1~11 = 증분1~4.)
+
 ### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
-D3 플래그(EPHEMERAL/LATCH+wait+owner/epoch CAS — flag_set 의 D6 owner 가드 완성 포함) · D4 세마포어 · D5 배리어 · D12 read-set 코히런스 · D14 HA 입장. (P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5 에서 닫힘.)
+D4 세마포어(permit=lease, `가용=N−count(ACTIVE)`, no-overtaking) · D5 배리어(세대-스탬프+BROKEN) · D12 read-set 코히런스 · D14 HA 입장. (P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6 에서 닫힘.)
 
 ---
 
