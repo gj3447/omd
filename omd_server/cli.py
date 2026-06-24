@@ -16,14 +16,16 @@ def main(argv=None):
     c = sub.add_parser("claim"); c.add_argument("agent"); c.add_argument("paths", nargs="+")
     c.add_argument("--mode", default="write"); c.add_argument("--ttl", type=float, default=600.0)
     c.add_argument("--task"); c.add_argument("--priority", type=int, default=0)
+    c.add_argument("--request-id"); c.add_argument("--bail-epoch", type=int)
 
     for verb in ("release", "renew"):
         s = sub.add_parser(verb)
         s.add_argument("orbit_id"); s.add_argument("agent"); s.add_argument("fence", type=int)
+        s.add_argument("--request-id"); s.add_argument("--bail-epoch", type=int)
         if verb == "renew":
             s.add_argument("--ttl", type=float, default=600.0)
 
-    bl = sub.add_parser("bail"); bl.add_argument("agent")
+    bl = sub.add_parser("bail"); bl.add_argument("agent"); bl.add_argument("--request-id")
 
     d = sub.add_parser("declare"); d.add_argument("task"); d.add_argument("--name", default="")
     d.add_argument("--writes", nargs="*", default=[]); d.add_argument("--reads", nargs="*", default=[])
@@ -34,28 +36,47 @@ def main(argv=None):
 
     n = sub.add_parser("next"); n.add_argument("agent")
     st = sub.add_parser("start"); st.add_argument("task"); st.add_argument("agent")
+    st.add_argument("--request-id"); st.add_argument("--bail-epoch", type=int)
+    cm = sub.add_parser("commit"); cm.add_argument("task"); cm.add_argument("msg")
+    cm.add_argument("--agent"); cm.add_argument("--fence", type=int)
+    cm.add_argument("--request-id"); cm.add_argument("--bail-epoch", type=int)
     fi = sub.add_parser("finish"); fi.add_argument("task")
+    fi.add_argument("--agent"); fi.add_argument("--fence", type=int)
+    fi.add_argument("--request-id"); fi.add_argument("--bail-epoch", type=int)
     cn = sub.add_parser("connect"); cn.add_argument("task")
     cn.add_argument("--agent"); cn.add_argument("--fence", type=int)
+    cn.add_argument("--request-id"); cn.add_argument("--bail-epoch", type=int)
+    hb = sub.add_parser("heartbeat"); hb.add_argument("agent")
     sub.add_parser("sweep")
     sub.add_parser("status")
 
     a = p.parse_args(argv)
     omd = Coordinator(a.db)
+    rid = lambda: getattr(a, "request_id", None)
+    be = lambda: getattr(a, "bail_epoch", None)
     out = {
         "claim": lambda: omd.claim(a.agent, a.paths, a.mode, ttl=a.ttl, task_id=a.task,
-                                   priority=a.priority),
-        "release": lambda: omd.release(a.orbit_id, a.agent, a.fence),
-        "renew": lambda: omd.renew(a.orbit_id, a.agent, a.fence, a.ttl),
-        "bail": lambda: omd.bail(a.agent),
+                                   priority=a.priority, request_id=rid(), bail_epoch=be()),
+        "release": lambda: omd.release(a.orbit_id, a.agent, a.fence,
+                                       request_id=rid(), bail_epoch=be()),
+        "renew": lambda: omd.renew(a.orbit_id, a.agent, a.fence, a.ttl,
+                                   request_id=rid(), bail_epoch=be()),
+        "bail": lambda: omd.bail(a.agent, request_id=rid()),
         "declare": lambda: omd.declare(a.task, name=a.name, writes=a.writes,
                                        reads=a.reads, deps=a.deps, priority=a.priority),
         "depend": lambda: omd.depend(a.task, a.after),
         "next": lambda: omd.next_task(a.agent),
-        "start": lambda: omd.start(a.task, a.agent),
-        "finish": lambda: omd.finish(a.task),
+        "start": lambda: omd.start(a.task, a.agent, request_id=rid(), bail_epoch=be()),
+        "commit": lambda: omd.commit(a.task, a.msg, getattr(a, "agent", None),
+                                     getattr(a, "fence", None),
+                                     request_id=rid(), bail_epoch=be()),
+        "finish": lambda: omd.finish(a.task, getattr(a, "agent", None),
+                                     getattr(a, "fence", None),
+                                     request_id=rid(), bail_epoch=be()),
         "connect": lambda: omd.connect(a.task, getattr(a, "agent", None),
-                                       getattr(a, "fence", None)),
+                                       getattr(a, "fence", None),
+                                       request_id=rid(), bail_epoch=be()),
+        "heartbeat": lambda: omd.heartbeat(a.agent),
         "sweep": lambda: omd.sweep(),
         "status": lambda: omd.status(),
     }[a.cmd]()

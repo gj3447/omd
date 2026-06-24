@@ -27,6 +27,7 @@ merge_token을 abort한다.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -43,6 +44,19 @@ from .store import Store
 # 타임아웃→abort→rollback이 완료될 시간을 준다.
 MERGE_TIMEOUT_S = 120.0
 MERGE_PIN_GRACE_S = 60.0
+
+
+class _IdemSlot:
+    """멱등 래퍼의 슬롯. hit=캐시 적중(본문 skip), value=동사 본문이 set한 응답."""
+    __slots__ = ("hit", "value")
+
+    def __init__(self):
+        self.hit = False
+        self.value = None
+
+    def set(self, value):
+        self.value = value
+        return value
 
 
 class Coordinator:
@@ -216,6 +230,9 @@ class Coordinator:
         if ag is None or ag["state"] == "RETIRED":
             return {"agent": agent_id, "noop": True}
         self.store.set_agent_state(agent_id, "BAILING" if voluntary else "ZOMBIE")
+        # §D6: bail_epoch bump — 회수 전 epoch를 든 GC-pause 좀비가 살아나도 모든 변이가
+        # stale bail_epoch로 FENCED_OUT (부활 방지). state 리셋(heartbeat)으로 못 우회.
+        self.store.bump_bail_epoch(agent_id)
         freed, requeued = [], []
         # 죽은 보유자의 merge_token: dangling merge를 abort 후 토큰 반납(§D11/§E).
         for mt in self.store.merge_tokens_owned_by(agent_id, ("HELD",)):
@@ -256,6 +273,100 @@ class Coordinator:
             return {"ok": False, "reason": "stale fence", "fenced_out": True,
                     "current": o["fence"], "yours": fence}
         return None
+
+    def _check_task_write_fence(self, task_id, agent_id, fence):
+        """finish/commit/connect의 D6 가드(opt-in): caller가 (agent,fence)를 주면
+        task.owner==agent ∧ 모든 write-orbit HELD ∧ fence==f 여야 한다. 통과면 None,
+        아니면 fenced_out 거부 dict. 작업 중 lease가 만료/재부여(ABA)됐으면 여기서 잡힌다.
+        (agent/fence 둘 다 None이면 검사 skip — 증분2까지의 무인자 호출 하위호환.)"""
+        if agent_id is None and fence is None:
+            return None
+        t = self.store.get_task(task_id)
+        if t is None:
+            return {"ok": False, "reason": "no such task"}
+        if agent_id is not None and t["agent_id"] not in (agent_id, None):
+            return {"ok": False, "reason": "not owner", "owner": t["agent_id"],
+                    "fenced_out": True}
+        writes = [o for o in self.store.orbits_for_task(task_id) if o["mode"] == "write"]
+        stale = [o["orbit_id"] for o in writes if o["state"] != "HELD"]
+        if not stale:
+            for o in writes:
+                if agent_id is not None and o["agent_id"] != agent_id:
+                    stale.append(o["orbit_id"])
+                elif fence is not None and o["fence"] != fence:
+                    stale.append(o["orbit_id"])
+        if stale:
+            return {"ok": False, "fenced_out": True,
+                    "reason": "stale fence: write lease expired/released during work",
+                    "stale": stale}
+        return None
+
+    # ---- bail_epoch 생존 가드 (§D6 잔여, 좀비 GC-pause 부활 방지) ----
+    def _check_alive(self, agent_id, bail_epoch):
+        """좀비 부활 차단(§D6). 통과면 None, 아니면 fenced_out 거부 dict.
+        (a) agent가 회수/탈출 중(RETIRED/ZOMBIE/BAILING)이면 차단 — 죽은 자는 변이 못 함.
+        (b) caller가 bail_epoch를 줬는데 현재값과 다르면 차단 — GC-pause로 멈췄던 좀비가 회수
+            (epoch bump) 뒤 깨어나 옛 epoch로 변이하려는 것. heartbeat의 state 리셋(WORKING)으로는
+            못 우회한다(epoch는 단조·보존). agent_id/bail_epoch 둘 다 None이면 검사 skip(하위호환)."""
+        if agent_id is None:
+            return None
+        ag = self.store.get_agent(agent_id)
+        if ag is None:
+            return None  # 미등록 — 다른 게이트가 처리(예: 신규 claim은 여기서 upsert).
+        if ag["state"] in ("RETIRED", "ZOMBIE", "BAILING"):
+            return {"ok": False, "reason": "agent reclaimed", "fenced_out": True,
+                    "agent_state": ag["state"]}
+        if bail_epoch is not None and ag["bail_epoch"] != bail_epoch:
+            return {"ok": False, "reason": "stale bail_epoch", "fenced_out": True,
+                    "current": ag["bail_epoch"], "yours": bail_epoch}
+        return None
+
+    # ---- 멱등성 (§D9, at-least-once MCP exactly-once 효과) ----
+    @staticmethod
+    def _arg_hash(verb, args) -> str:
+        return hashlib.sha256(
+            (verb + "|" + json.dumps(args, sort_keys=True, default=str)).encode()).hexdigest()
+
+    @staticmethod
+    def _is_success(res) -> bool:
+        """성공 종단인가 — 성공만 캐시(§3.C). 거부(ok:false)·fenced_out·deadlock·재시도(retry)는
+        캐시 금지: 세상이 바뀌면 같은 request_id 재시도가 성공할 수 있어야 한다."""
+        if not isinstance(res, dict):
+            return res is not None
+        if res.get("ok") is False:
+            return False
+        if res.get("fenced_out") or res.get("deadlock") or res.get("retry"):
+            return False
+        if res.get("state") in ("DENIED",):
+            return False
+        return True
+
+    @contextmanager
+    def _idem(self, request_id, agent_id, verb, args):
+        """변이 동사 멱등 래퍼(임계구역 안). request_id가 None이면 패스스루.
+        DONE이면 캐시 응답을 yield(본문 skip 신호=cached). 아니면 INFLIGHT 등록 후 본문 실행,
+        성공 종단만 DONE 캐시, 비성공은 clear(재시도 가능). 호출 패턴:
+            with self._idem(rid, ag, 'claim', args) as cache:
+                if cache.hit: return cache.value
+                res = <본문>; cache.set(res); return res
+        """
+        cache = _IdemSlot()
+        if request_id is None:
+            yield cache
+            return
+        prior = self.store.get_idem(request_id)
+        if prior is not None and prior["status"] == "DONE":
+            cache.hit = True
+            cache.value = json.loads(prior["response"])
+            cache.value = dict(cache.value, replayed=True) if isinstance(cache.value, dict) else cache.value
+            yield cache
+            return
+        self.store.begin_idem(request_id, agent_id, verb, self._arg_hash(verb, args))
+        yield cache
+        if cache.value is not None and self._is_success(cache.value):
+            self.store.finish_idem(request_id, cache.value)
+        else:
+            self.store.clear_idem(request_id)
 
     # ---- merge_token / 통합 worktree (§D11) ----
     def _trailer(self, task_id) -> str:
@@ -416,80 +527,138 @@ class Coordinator:
             self._emit("depend_added", task_id, after=after)
             return {"ok": True, "task_id": task_id, "after": after, "deps": new_deps}
 
+    def _intent_key(self, agent_id, pathspec, mode, task_id) -> str:
+        """claim 자연 멱등 키(§D9): hash(agent, sorted(paths), mode, task)."""
+        return self._arg_hash("claim",
+                              [agent_id, sorted(pathspec), mode, task_id])
+
     def claim(self, agent_id, pathspec, mode="write", *, ttl=600.0, task_id=None,
-              reason="", priority=0):
+              reason="", priority=0, request_id=None, bail_epoch=None):
         if isinstance(pathspec, str):
             pathspec = [pathspec]
         with self._cs():
-            self._sweep_inline()
-            self.store.upsert_agent(agent_id)
-            self._emit("orbit_requested", agent_id, mode=mode, paths=pathspec, task=task_id)
-            conf = self._conflicts(pathspec, mode)
-            if conf:
-                oid = self.store.add_orbit(task_id=task_id, agent_id=agent_id,
-                                           pathspec=pathspec, mode=mode, state="PENDING",
-                                           reason=reason, priority=priority)
-                if self._cycle_with(agent_id):  # 대기 시 데드락 사이클이면 거부
-                    self.store.set_orbit(oid, state=fsm.advance("orbit", "PENDING", "deny"))
-                    self._emit("orbit_denied", agent_id, orbit_id=oid, deadlock=True)
-                    return {"orbit_id": oid, "state": "DENIED", "deadlock": True,
-                            "conflicts": conf}
-                self._emit("orbit_pending", agent_id, orbit_id=oid, conflicts=len(conf))
-                return {"orbit_id": oid, "state": "PENDING", "conflicts": conf}
-            fence = self.store.next_fence()
-            oid = self.store.add_orbit(task_id=task_id, agent_id=agent_id, pathspec=pathspec,
-                                       mode=mode, state="HELD", fence=fence,
-                                       expires_at=time.time() + ttl, reason=reason,
-                                       priority=priority)
-            self._emit("orbit_granted", agent_id, orbit_id=oid, fence=fence, mode=mode)
-            return {"orbit_id": oid, "state": "HELD", "fence": fence, "conflicts": []}
+            args = [agent_id, sorted(pathspec), mode, task_id, ttl, priority]
+            with self._idem(request_id, agent_id, "claim", args) as cache:
+                if cache.hit:
+                    return cache.value
+                self._sweep_inline()
+                # §D6: 회수/탈출된 좀비는 새 궤도조차 못 잡음(부활 차단).
+                dead = self._check_alive(agent_id, bail_epoch)
+                if dead:
+                    return cache.set(dead)
+                self.store.upsert_agent(agent_id)
+                self._emit("orbit_requested", agent_id, mode=mode, paths=pathspec, task=task_id)
+                # §D9 의미적 멱등: dedup 우회돼도(다른 request_id·없음) 같은 의도면 기존 궤도 반환.
+                # §3.C 교차: 단 **현재 caller가 그 궤도의 소유자**여야 살아있는 HELD를 돌려준다 —
+                # 회수돼 타인에게 재부여된 lease를 우회로 넘기지 않음(fencing 무장 방지).
+                ikey = self._intent_key(agent_id, pathspec, mode, task_id)
+                dup = self.store.orbit_by_intent(ikey)
+                if dup is not None and dup["agent_id"] == agent_id:
+                    self._emit("orbit_dedup", agent_id, orbit_id=dup["orbit_id"],
+                               state=dup["state"])
+                    out = {"orbit_id": dup["orbit_id"], "state": dup["state"],
+                           "fence": dup["fence"], "conflicts": [], "dedup": True}
+                    return cache.set(out)
+                conf = self._conflicts(pathspec, mode)
+                if conf:
+                    oid = self.store.add_orbit(task_id=task_id, agent_id=agent_id,
+                                               pathspec=pathspec, mode=mode, state="PENDING",
+                                               reason=reason, priority=priority,
+                                               intent_key=ikey)
+                    if self._cycle_with(agent_id):  # 대기 시 데드락 사이클이면 거부
+                        self.store.set_orbit(oid, state=fsm.advance("orbit", "PENDING", "deny"))
+                        self._emit("orbit_denied", agent_id, orbit_id=oid, deadlock=True)
+                        # DENIED는 캐시 금지(§3.C) — 세상이 바뀌면 재시도가 성공할 수 있어야.
+                        return cache.set({"orbit_id": oid, "state": "DENIED",
+                                          "deadlock": True, "conflicts": conf})
+                    self._emit("orbit_pending", agent_id, orbit_id=oid, conflicts=len(conf))
+                    return cache.set({"orbit_id": oid, "state": "PENDING", "conflicts": conf})
+                fence = self.store.next_fence()
+                oid = self.store.add_orbit(task_id=task_id, agent_id=agent_id, pathspec=pathspec,
+                                           mode=mode, state="HELD", fence=fence,
+                                           expires_at=time.time() + ttl, reason=reason,
+                                           priority=priority, intent_key=ikey)
+                self._emit("orbit_granted", agent_id, orbit_id=oid, fence=fence, mode=mode)
+                be = self.store.get_agent(agent_id)
+                return cache.set({"orbit_id": oid, "state": "HELD", "fence": fence,
+                                  "conflicts": [],
+                                  "bail_epoch": be["bail_epoch"] if be else 0})
 
-    def renew(self, orbit_id, agent_id, fence, ttl=600.0):
+    def renew(self, orbit_id, agent_id, fence, ttl=600.0, *, request_id=None,
+              bail_epoch=None):
         """궤도 lease 갱신(keepalive). 소유+fence 일치해야 — 오추방된 좀비는 FENCED_OUT."""
         with self._cs():
-            o = self.store.get_orbit(orbit_id)
-            if not o:
-                return {"ok": False, "reason": "no such orbit"}
-            if o["state"] != "HELD":
-                return {"ok": False, "reason": f"not HELD: {o['state']}", "fenced_out": True}
-            bad = self._check_owner(o, agent_id, fence)
-            if bad:
-                return bad
-            self.store.set_orbit(orbit_id, state=fsm.advance("orbit", "HELD", "renew"),
-                                 expires_at=time.time() + ttl)
-            self._emit("orbit_renewed", agent_id, orbit_id=orbit_id)
-            return {"ok": True, "expires_in": ttl}
+            with self._idem(request_id, agent_id, "renew",
+                            [orbit_id, fence, ttl]) as cache:
+                if cache.hit:
+                    return cache.value
+                dead = self._check_alive(agent_id, bail_epoch)
+                if dead:
+                    return cache.set(dead)
+                o = self.store.get_orbit(orbit_id)
+                if not o:
+                    return cache.set({"ok": False, "reason": "no such orbit"})
+                if o["state"] != "HELD":
+                    return cache.set({"ok": False, "reason": f"not HELD: {o['state']}",
+                                      "fenced_out": True})
+                bad = self._check_owner(o, agent_id, fence)
+                if bad:
+                    return cache.set(bad)
+                self.store.set_orbit(orbit_id, state=fsm.advance("orbit", "HELD", "renew"),
+                                     expires_at=time.time() + ttl)
+                self._emit("orbit_renewed", agent_id, orbit_id=orbit_id)
+                return cache.set({"ok": True, "expires_in": ttl})
 
-    def release(self, orbit_id, agent_id, fence):
+    def release(self, orbit_id, agent_id, fence, *, request_id=None, bail_epoch=None):
         """궤도 lease 반납. 소유+fence 일치해야(P0-3) — 아무나 남의 궤도 해제 불가.
-        이미 RELEASED/EXPIRED면 멱등 OK(MCP 재시도 안전)."""
+        이미 RELEASED/EXPIRED면 멱등 OK(MCP 재시도 안전). §3.C: dedup 재생이 *재부여된* lease를
+        풀지 않게 owner/fence 가드가 감싼다(release는 소유+fence 통과 후에만 작용)."""
         with self._cs():
-            o = self.store.get_orbit(orbit_id)
-            if not o:
-                return {"ok": False, "reason": "no such orbit"}
-            if o["state"] in ("RELEASED", "EXPIRED", "DENIED"):
-                return {"ok": True, "noop": True, "state": o["state"]}
-            if o["state"] != "HELD":
-                return {"ok": False, "reason": f"not HELD: {o['state']}"}
-            bad = self._check_owner(o, agent_id, fence)
-            if bad:
-                return bad
-            self.store.set_orbit(orbit_id, state=fsm.advance("orbit", "HELD", "release"),
-                                 released_at=time.time())
-            self._emit("orbit_released", agent_id, orbit_id=orbit_id)
-            self._promote_pending()
-            return {"ok": True}
+            with self._idem(request_id, agent_id, "release",
+                            [orbit_id, fence]) as cache:
+                if cache.hit:
+                    return cache.value
+                dead = self._check_alive(agent_id, bail_epoch)
+                if dead:
+                    return cache.set(dead)
+                o = self.store.get_orbit(orbit_id)
+                if not o:
+                    return cache.set({"ok": False, "reason": "no such orbit"})
+                if o["state"] in ("RELEASED", "EXPIRED", "DENIED"):
+                    return cache.set({"ok": True, "noop": True, "state": o["state"]})
+                if o["state"] != "HELD":
+                    return cache.set({"ok": False, "reason": f"not HELD: {o['state']}"})
+                bad = self._check_owner(o, agent_id, fence)
+                if bad:
+                    return cache.set(bad)
+                self.store.set_orbit(orbit_id, state=fsm.advance("orbit", "HELD", "release"),
+                                     released_at=time.time())
+                self._emit("orbit_released", agent_id, orbit_id=orbit_id)
+                self._promote_pending()
+                return cache.set({"ok": True})
 
-    def bail(self, agent_id):
+    def bail(self, agent_id, *, request_id=None):
         """물방울 긴급 탈출(자발). 보유 궤도 전부 해제 + 작업 requeue + worktree/브랜치 정리.
-        멱등 — 비자발 좀비회수와 **단일 루틴**을 공유(둘 사이 누락/이중해제 없음)."""
+        멱등 — 비자발 좀비회수와 **단일 루틴**을 공유(둘 사이 누락/이중해제 없음). bail_epoch 검사는
+        없음: 죽으려는 자의 탈출은 항상 허용돼야(자기 회수). request_id로 응답도 멱등."""
         with self._cs():
-            return self._reclaim_agent_inline(agent_id, voluntary=True)
+            with self._idem(request_id, agent_id, "bail", [agent_id]) as cache:
+                if cache.hit:
+                    return cache.value
+                return cache.set(self._reclaim_agent_inline(agent_id, voluntary=True))
 
     def heartbeat(self, agent_id):
+        """물방울 생존 신호. §D6 표: 이미 회수(RETIRED)된 좀비에겐 `{fenced_out:true}` 회신 →
+        좀비가 다음 heartbeat에서 자기 죽음을 안다(advisory). 살아있으면 현재 bail_epoch를 회신해
+        물방울이 이후 변이에 실어 보내면 회수 후 부활을 서버가 거부할 수 있다(§D6)."""
         with self._cs():
+            ag = self.store.get_agent(agent_id)
+            if ag is not None and ag["state"] == "RETIRED":
+                # 회수된 좀비 — heartbeat로 부활시키지 않고 죽음을 통지(fence 복종 규율).
+                return {"ok": False, "fenced_out": True, "reason": "agent reclaimed",
+                        "bail_epoch": ag["bail_epoch"]}
             self.store.upsert_agent(agent_id)
-        return {"ok": True}
+            return {"ok": True, "bail_epoch": self.store.get_agent(agent_id)["bail_epoch"]}
 
     def reclaim_zombies(self):
         """heartbeat 끊긴 물방울 회수: HELD 궤도 만료 + 작업 requeue + worktree 정리."""
@@ -525,64 +694,124 @@ class Coordinator:
                 return self.store.get_task(t["task_id"])
             return None
 
-    def start(self, task_id, agent_id):
-        """READY task에 agent 배정 → IN_ORBIT. repo 바인딩 시 물방울 worktree 발사."""
+    def start(self, task_id, agent_id, *, request_id=None, bail_epoch=None):
+        """READY task에 agent 배정 → IN_ORBIT. repo 바인딩 시 물방울 worktree 발사.
+        §D9 의미적 멱등: 이미 이 agent로 시작된(IN_ORBIT/이후 + worktree 존재) task 재시도는
+        worktree를 재생성하지 않고 기존 것을 반환한다 — `worktree add -b`가 기존 브랜치에서
+        실패(GitError+중복행)하던 버그 차단."""
         with self._cs():
-            t = self.store.get_task(task_id)
-            s = t["state"]
-            if s == "READY":
-                s = fsm.advance("task", s, "claim")
-            s = fsm.advance("task", s, "start")  # CLAIMED→IN_ORBIT
-            self.store.upsert_agent(agent_id)
-            worktree = branch = None
-            if self.git:
-                branch = f"omd/{task_id}"
-                worktree = os.path.join(self.worktrees_dir, task_id)
-                self.git.add_worktree(branch, worktree)
-            self.store.set_task(task_id, state=s, agent_id=agent_id,
-                                worktree=worktree if self.git else ...,
-                                branch=branch if self.git else ...)
-            self._emit("task_started", agent_id, task=task_id, worktree=worktree)
-            return {"task_id": task_id, "state": s, "worktree": worktree, "branch": branch}
+            with self._idem(request_id, agent_id, "start", [task_id]) as cache:
+                if cache.hit:
+                    return cache.value
+                dead = self._check_alive(agent_id, bail_epoch)
+                if dead:
+                    return cache.set(dead)
+                t = self.store.get_task(task_id)
+                # 이미 시작됨(같은 agent) — worktree 재생성 금지(자연 멱등).
+                if t["state"] in ("IN_ORBIT", "DONE", "CONNECTING", "MERGED") \
+                        and t["agent_id"] == agent_id:
+                    self._emit("task_start_dedup", agent_id, task=task_id)
+                    return cache.set({"task_id": task_id, "state": t["state"],
+                                      "worktree": t["worktree"], "branch": t["branch"],
+                                      "dedup": True})
+                s = t["state"]
+                if s == "READY":
+                    s = fsm.advance("task", s, "claim")
+                s = fsm.advance("task", s, "start")  # CLAIMED→IN_ORBIT
+                self.store.upsert_agent(agent_id)
+                worktree = branch = None
+                if self.git:
+                    branch = f"omd/{task_id}"
+                    worktree = os.path.join(self.worktrees_dir, task_id)
+                    self.git.add_worktree(branch, worktree)
+                self.store.set_task(task_id, state=s, agent_id=agent_id,
+                                    worktree=worktree if self.git else ...,
+                                    branch=branch if self.git else ...)
+                self._emit("task_started", agent_id, task=task_id, worktree=worktree)
+                return cache.set({"task_id": task_id, "state": s, "worktree": worktree,
+                                  "branch": branch})
 
-    def commit(self, task_id, msg):
+    def commit(self, task_id, msg, agent_id=None, fence=None, *, request_id=None,
+               bail_epoch=None):
         """물방울 worktree의 변경을 커밋(repo 바인딩 시). 커밋 후 write-set 감사(§D10/P0-11)를
         **자문(advisory)** 으로 돌려 궤도 밖 경로를 조기 노출한다(`offending` 동봉). 단 connect
-        게이트가 *권위* 강제 지점이므로 여기선 커밋을 되돌리지 않는다 — 물방울이 일찍 알아채게."""
+        게이트가 *권위* 강제 지점이므로 여기선 커밋을 되돌리지 않는다 — 물방울이 일찍 알아채게.
+        §D6: caller가 (agent,fence)를 주면 owner∧write-orbit HELD∧fence==f 재검증(opt-in) —
+        오추방된 좀비가 남의 worktree를 커밋하지 못하게."""
         if not self.git:
             return {"ok": False, "reason": "no repo bound"}
         with self._cs():
-            t = self.store.get_task(task_id)
-            sha = self.git.commit_all(t["worktree"], msg)
-            self._emit("task_committed", t["agent_id"], task=task_id, sha=sha)
-            writes = [o for o in self.store.orbits_for_task(task_id)
-                      if o["mode"] == "write" and o["state"] == "HELD"]
-            write_globs = self._claimed_write_globs(task_id, writes)
-            offending = self._writeset_audit(task_id, t["branch"], write_globs)
-            res = {"ok": True, "sha": sha}
-            if offending:
-                # 자문 경고 — connect에서 거부될 것임. 물방울은 지금 바로잡아야 한다.
-                self._emit("commit_writeset_warning", task_id, offending=offending)
-                res["writeset_violation"] = True
-                res["offending"] = offending
-            return res
+            with self._idem(request_id, agent_id, "commit",
+                            [task_id, msg, fence]) as cache:
+                if cache.hit:
+                    return cache.value
+                dead = self._check_alive(agent_id, bail_epoch)
+                if dead:
+                    return cache.set(dead)
+                bad = self._check_task_write_fence(task_id, agent_id, fence)
+                if bad:
+                    self._emit("commit_rejected", task_id, reason=bad["reason"])
+                    return cache.set(bad)
+                t = self.store.get_task(task_id)
+                sha = self.git.commit_all(t["worktree"], msg)
+                self._emit("task_committed", t["agent_id"], task=task_id, sha=sha)
+                writes = [o for o in self.store.orbits_for_task(task_id)
+                          if o["mode"] == "write" and o["state"] == "HELD"]
+                write_globs = self._claimed_write_globs(task_id, writes)
+                offending = self._writeset_audit(task_id, t["branch"], write_globs)
+                res = {"ok": True, "sha": sha}
+                if offending:
+                    # 자문 경고 — connect에서 거부될 것임. 물방울은 지금 바로잡아야 한다.
+                    self._emit("commit_writeset_warning", task_id, offending=offending)
+                    res["writeset_violation"] = True
+                    res["offending"] = offending
+                return cache.set(res)
 
-    def finish(self, task_id):
+    def finish(self, task_id, agent_id=None, fence=None, *, request_id=None,
+               bail_epoch=None):
+        """작업 완료 표시(IN_ORBIT→DONE, `done` latch). §D6: caller가 (agent,fence)를 주면
+        owner∧write-orbit HELD∧fence==f 재검증(opt-in) — 오추방된 좀비가 남의 task를 finish해
+        분열을 부르지 못하게. 무인자 호출은 증분2까지 동작 유지(하위호환)."""
         with self._cs():
-            t = self.store.get_task(task_id)
-            self.store.set_task(task_id, state=fsm.advance("task", t["state"], "finish"))
-            self.store.set_flag(task_id, "done", set_by=t["agent_id"])
-            self._emit("task_finished", t["agent_id"], task=task_id)
-            return {"task_id": task_id, "state": "DONE"}
+            with self._idem(request_id, agent_id, "finish", [task_id, fence]) as cache:
+                if cache.hit:
+                    return cache.value
+                dead = self._check_alive(agent_id, bail_epoch)
+                if dead:
+                    return cache.set(dead)
+                bad = self._check_task_write_fence(task_id, agent_id, fence)
+                if bad:
+                    self._emit("finish_rejected", task_id, reason=bad["reason"])
+                    return cache.set(bad)
+                t = self.store.get_task(task_id)
+                # 의미적 멱등: 이미 DONE(또는 이후)이면 finish 재시도는 no-op.
+                if t["state"] in ("DONE", "CONNECTING", "MERGED"):
+                    return cache.set({"task_id": task_id, "state": t["state"], "noop": True})
+                self.store.set_task(task_id, state=fsm.advance("task", t["state"], "finish"))
+                self.store.set_flag(task_id, "done", set_by=t["agent_id"])
+                self._emit("task_finished", t["agent_id"], task=task_id)
+                return cache.set({"task_id": task_id, "state": "DONE"})
 
     # ---- CLOUD CONNECT — split-phase A–B–C (§3.B/§D8/§D11) ----
-    def connect(self, task_id, agent_id=None, fence=None):
+    def connect(self, task_id, agent_id=None, fence=None, *, request_id=None,
+                bail_epoch=None):
         """CLOUD CONNECT(응결=merge). **split-phase** — git merge가 락(_cs) **밖**에서 돈다:
           A(락): write-orbit 재검증(P0-4 HELD∧fence==captured) + merge_token 획득 + →CONNECTING
                  + 궤도 pin(merging=1) + intent 영속 + 커밋.
           B(락밖): 전용 통합 worktree에서 merge --no-ff(타임아웃, §E). 충돌/타임아웃이면 abort.
           C(락): merge_sha 먼저 기록(P0-6) → →MERGED + write-orbit 해제 + merge_token 반납 + unpin.
-        fencing: 작업 중 lease 만료/해제면 거부(stale fence). merge_token으로 동시 connect를 직렬화."""
+        fencing: 작업 중 lease 만료/해제면 거부(stale fence). merge_token으로 동시 connect를 직렬화.
+        §D9: request_id 멱등(성공만 캐시). split-phase라 _idem 트랜잭션을 Phase B에 걸칠 수 없어
+        캐시 확인/기록을 짧은 _cs() 두 곳으로 나눈다. 의미적 멱등(already-MERGED)은 fencing 위(§3.C):
+        connect는 owner/fence 통과 후에만 머지하므로 dedup 재생이 재부여 lease를 풀지 않는다."""
+        # §D9 dedup 캐시 적중(성공 종단만 저장됨) → 재머지 없이 캐시 응답.
+        if request_id is not None:
+            with self._cs():
+                prior = self.store.get_idem(request_id)
+                if prior is not None and prior["status"] == "DONE":
+                    out = json.loads(prior["response"])
+                    return dict(out, replayed=True) if isinstance(out, dict) else out
+
         # 멱등(P0-9/D9): 이미 응결된 task는 재머지 없이 즉시 MERGED 회신.
         t0 = self.store.get_task(task_id)
         if t0 and t0["state"] == "MERGED":
@@ -591,24 +820,36 @@ class Coordinator:
 
         deadline = time.time() + max(self.merge_timeout, 5.0) + 10.0
         while True:
-            a = self._connect_phase_a(task_id, agent_id, fence)
+            a = self._connect_phase_a(task_id, agent_id, fence, bail_epoch)
             if not a["ok"]:
                 if a.get("retry") and time.time() < deadline:
                     time.sleep(0.01)   # merge_token 경합 — 다른 connect 응결중. 곧 재시도.
                     continue
-                return a
+                return a               # 거부(fenced_out 등)는 캐시 안 함(§3.C)
             if a.get("noop"):          # 이미 MERGED (멱등)
                 return a
             # ----- Phase B: 락 밖(no _cs, no live tx) git merge -----
             token_id, intent = a["token_id"], a["intent"]
             merge_sha, err = self._connect_phase_b(intent)
             # ----- Phase C: 락 안 — merge_sha 먼저 기록 후 해제(P0-6) -----
-            return self._connect_phase_c(task_id, token_id, intent, merge_sha, err)
+            res = self._connect_phase_c(task_id, token_id, intent, merge_sha, err)
+            # §D9: 성공 종단만 캐시(merge conflict/timeout=retryable → 캐시 금지).
+            if request_id is not None and self._is_success(res):
+                with self._cs():
+                    self.store.begin_idem(request_id, agent_id, "connect",
+                                          self._arg_hash("connect", [task_id, fence]))
+                    self.store.finish_idem(request_id, res)
+            return res
 
-    def _connect_phase_a(self, task_id, agent_id, fence):
+    def _connect_phase_a(self, task_id, agent_id, fence, bail_epoch=None):
         """Phase A(임계구역): fence 재검증(P0-4) + merge_token 획득 + intent 영속 + pin + →CONNECTING."""
         with self._cs():
             self._sweep_inline()
+            # §D6: 회수/탈출된(또는 stale bail_epoch) 좀비의 connect는 부활 차단으로 거부.
+            dead = self._check_alive(agent_id, bail_epoch)
+            if dead:
+                self._emit("connect_rejected", task_id, reason=dead["reason"])
+                return dead
             t = self.store.get_task(task_id)
             if t is None:
                 return {"ok": False, "reason": "no such task"}
@@ -715,11 +956,20 @@ class Coordinator:
             self._promote_pending()
             return {"ok": True, "task_id": task_id, "state": "MERGED", "merge_sha": merge_sha}
 
-    def flag_set(self, key, value, agent_id=None):
+    def flag_set(self, key, value, agent_id=None, *, request_id=None, bail_epoch=None):
+        """LATCH 플래그 set(현 단순형 — D3 EPHEMERAL/owner/epoch CAS는 차기 증분). §D6: 회수된
+        좀비의 flag_set은 차단(bail_epoch). §D9: request_id 멱등(성공만 캐시)."""
         with self._cs():
-            self.store.set_flag(key, value, set_by=agent_id)
-            self._emit("flag_set", agent_id or key, key=key, value=value)
-        return {"ok": True}
+            with self._idem(request_id, agent_id, "flag_set",
+                            [key, value]) as cache:
+                if cache.hit:
+                    return cache.value
+                dead = self._check_alive(agent_id, bail_epoch)
+                if dead:
+                    return cache.set(dead)
+                self.store.set_flag(key, value, set_by=agent_id)
+                self._emit("flag_set", agent_id or key, key=key, value=value)
+                return cache.set({"ok": True})
 
     def flag_get(self, key):
         return {"key": key, "value": self.store.get_flag(key)}

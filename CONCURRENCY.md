@@ -480,8 +480,37 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
   3. char-class 궤도에서도 감사는 **정확**(over-report 안 함). 단 claim/next 의 *입체검사* 는 여전히 `globs_overlap`(보수적) — 거기선 over-report 가 안전(병렬도만 손해). 둘의 비대칭은 의도적(감사=soundness on "덮임", 입체=soundness on "겹침").
 - **남은 P0 부채**: **P0 전부 닫힘(P0-1~P0-11)**. 미구현 = D3/D4/D5(플래그·세마포어·배리어), D6 잔여(finish/commit 소유+fence, bail_epoch), D9 idempotency 테이블, D12 read-set 코히런스, D14 HA 입장 — 전부 설계만(P1/P2).
 
+### ✅ 증분 5 — D6 잔여(finish/commit/connect 소유+fence + bail_epoch) + D9 멱등 — DONE
+> 전 변이 동사 fencing 완성 + at-least-once MCP 의 exactly-once 효과. SINGULON 보존:
+> 오추방 좀비가 남의 작업을 finish/commit/connect 못 하고, 재시도가 누수 lease·이중 merge·
+> 이중 release 를 안 만든다.
+
+- **D6 잔여(§D6 표, FENCED_OUT)** (`core.py`):
+  - `_check_task_write_fence(task, agent, fence)`: caller가 `(agent,fence)`를 주면 `task.owner==agent ∧ 모든 write-orbit HELD ∧ fence==f` 재검증(opt-in, 증분3 connect 의 strict-fence 패턴과 동형). `finish`/`commit`/`connect` 전부 적용. 무인자 호출은 증분2까지 동작 유지(하위호환).
+  - **bail_epoch(좀비 GC-pause 부활방지, §D6 §1.1)**: agents `bail_epoch` 컬럼(단조). `_reclaim_agent_inline`이 회수 시 `bump_bail_epoch`. `_check_alive(agent, bail_epoch)`가 모든 변이 앞에서 — (a) agent가 RETIRED/ZOMBIE/BAILING 이면 차단(죽은 자는 변이 불가), (b) caller가 든 bail_epoch가 현재값과 다르면 차단. **heartbeat의 state 리셋(WORKING)으로 못 우회** — epoch는 보존된다. `heartbeat`는 RETIRED 좀비에게 `{fenced_out:true}` 회신(부활 거부) + 살아있으면 현재 bail_epoch 회신(물방울이 이후 변이에 실어 보냄). `claim`(HELD)도 bail_epoch 회신.
+- **D9 멱등(§D9, §3.C 교차)** (`core.py`/`store.py`):
+  - `idempotency` 테이블(`request_id` PK, INFLIGHT/DONE) + `_idem(request_id,...)` 임계구역 래퍼. **성공 종단만 캐시**(`_is_success`: ok:false·fenced_out·deadlock·retry·DENIED 는 캐시 금지 → 세상이 바뀌면 재시도 가능, §3.C). 전 변이 동사(claim/renew/release/bail/start/commit/finish/connect/flag_set)에 적용. connect는 split-phase라 `_idem` tx를 Phase B에 걸칠 수 없어 캐시 확인/기록을 짧은 `_cs()` 두 곳으로 나눔.
+  - **의미적 멱등**(dedup 캐시 우회돼도 안전): claim `intent_key=hash(agent,sorted(paths),mode,task)` → 같은 의도면 기존 HELD/PENDING 궤도 반환(`orbit_by_intent`, 누수 lease 0); start 기존 worktree 감지(이미 IN_ORBIT/이후+같은 agent면 `worktree add -b` 재호출 안 함); finish 이미 DONE 이면 noop; connect already-merged 회신(기존).
+  - **§3.C fencing 교차**: (1) 성공만 캐시(stale-fence 거부 영구 재생 차단). (2) claim 의미적 dedup은 **현재 caller가 그 궤도의 소유자일 때만** 살아있는 HELD 를 반환 — 회수돼 타인에게 재부여된 lease를 우회로 넘기지 않음(부활 무장 차단). (3) release 재생은 owner/fence 가드가 감싸 *재부여된* lease를 풀지 않음.
+- 스키마(additive·fresh-DB 친화 + 멱등 `_migrate`): agents `bail_epoch`; orbits `intent_key`(+`idx_orbits_intent`); 신규 `idempotency` 테이블(fresh-DB는 `_SCHEMA`, 기존 DB는 `CREATE IF NOT EXISTS`).
+- 시그니처: `finish`/`commit`에 `(agent_id=None, fence=None)` 추가, 전 변이 동사에 `request_id`/`bail_epoch` kwarg(전부 None 디폴트=하위호환). `commit`/`heartbeat` 를 CLI 에도 노출. server/cli 동반 갱신.
+- 테스트(**81 passed, 1 skipped**; 신규 20 = `test_d6_remaining.py` 10, `test_d9_idempotency.py` 10):
+  - D6: finish stale-fence(ABA)·non-owner 거부+task 미완료, finish owner-fence OK, 무인자 하위호환, commit stale-fence 거부, commit owner-fence OK; **크래시 실패경로** — write-orbit 보유 task agent 회수 후 connect FENCED_OUT(merge 없음); **bail_epoch 이빨** — 회수 후 옛 epoch claim/renew 차단, heartbeat 가 RETIRED 좀비에 fenced_out 회신.
+  - D9: claim 재시도 누수 0(request_id + intent_key 둘 다), DENIED/fenced_out 캐시 금지+재시도 성공, start 재시도 worktree 재생성 안 함, connect 재시도 머지커밋 1개·이미-MERGED noop, **merge conflict 캐시 금지(retryable)**, **§3.C** dedup release 가 재부여 agB lease 를 안 품.
+- **변이검증(이빨 4건 실증, 복원함)**:
+  ① `_check_alive` 무력화(`return None`) → 회수된 좀비가 옛 bail_epoch 로 claim 성공 → `test_stale_bail_epoch_blocks_resurrected_zombie` RED.
+  ② `_check_task_write_fence` 무력화 → finish/commit 가 stale-fence/non-owner 를 통과 → 3건 RED(finish stale·non-owner, commit stale).
+  ③ `_is_success`→`return True`(§3.C "성공만 캐시" 위반) → DENIED·fenced_out·merge-conflict 가 캐시돼 재시도 영구 차단 → 3건 RED.
+  ④ claim 의미적 dedup 무력화(`dup=None`) → 재시도가 두 번째 누수 궤도 생성 → `test_claim_semantic_dedup_without_request_id` RED. 넷 다 복원 후 81 green.
+- **deviation/한계(정직 표기)**:
+  1. **D6 가드는 opt-in**(증분3 connect 와 동일 철학) — `finish`/`commit`/`connect` 무인자 호출은 write-orbit `state==HELD` 만 보던 종전 동작 유지(strict owner/fence 는 caller가 `(agent,fence)` 줄 때만). 물방울 계약상 권장 = 항상 `(agent,fence,bail_epoch)` 전달. 단 **bail_epoch 의 state 가드(RETIRED 차단)는 opt-in 아님** — agent가 등록돼 있고 RETIRED/ZOMBIE 면 bail_epoch 미제공이어도 차단(좀비 부활은 항상 막음).
+  2. **flag_set 의 D6 가드는 부분** — 현 flags 테이블은 단순 LATCH(owner_agent/epoch 컬럼 없음, D3 범위). 그래서 flag_set 은 bail_epoch(좀비 차단)+request_id(멱등)만 적용하고 §D6 표의 "owner CAS·epoch CAS" 는 D3(EPHEMERAL 플래그) 증분으로 미룸. 정직: flag_set 은 아직 임의 caller가 LATCH 를 set 할 수 있다(소유 개념 자체가 D3 전엔 없음).
+  3. **idempotency 테이블 GC 없음**(P2) — request_id 행이 무한 누적. 운영 GC(오래된 DONE 정리)는 P2.
+  4. **connect 멱등 캐시는 비원자 2-스텝**(Phase C 성공 후 별도 `_cs()`에서 begin+finish_idem) — Phase C 와 캐시 기록 사이 크래시면 캐시 미기록이나 task 는 이미 MERGED 라 재시도가 already-merged(noop) 로 안전 수렴(의미적 멱등이 백스톱). 즉 request_id 캐시는 최적화, 의미적 멱등이 정확성 보장.
+- **남은 부채**: P0 전부 닫힘(증분1~4). 미구현 = D3 플래그(EPHEMERAL/LATCH+wait+owner/epoch CAS) · D4 세마포어 · D5 배리어 · D12 read-set 코히런스 · D14 HA 입장 — 전부 설계만(P1/P2).
+
 ### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
-D3 플래그(EPHEMERAL/LATCH+wait) · D4 세마포어 · D5 배리어 · D6 잔여(finish/commit 소유+fence + bail_epoch) · D9 idempotency 테이블 · D12 read-set 코히런스 · D14 HA 입장. (P0-1~P0-11 = 증분1~4 에서 전부 닫힘.)
+D3 플래그(EPHEMERAL/LATCH+wait+owner/epoch CAS — flag_set 의 D6 owner 가드 완성 포함) · D4 세마포어 · D5 배리어 · D12 read-set 코히런스 · D14 HA 입장. (P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5 에서 닫힘.)
 
 ---
 

@@ -30,10 +30,12 @@ CREATE TABLE IF NOT EXISTS orbits (
   resource_key TEXT,                  -- merge_token이면 통합 레포 키(cloud_id 등)
   merging INTEGER NOT NULL DEFAULT 0,  -- 1=connect Phase B 진행중 pin(sweep/reclaim skip, §E)
   merge_deadline REAL,                 -- pin 유계(§E): 이 시각 넘으면 abort 대상
-  merge_started_mono REAL              -- merge_token crash-safe(§D11): dangling merge abort 판정
+  merge_started_mono REAL,             -- merge_token crash-safe(§D11): dangling merge abort 판정
+  intent_key TEXT                      -- 증분5(§D9): claim 자연 멱등 — hash(agent,paths,mode,task)
 );
 CREATE INDEX IF NOT EXISTS idx_orbits_state ON orbits(state);
 CREATE INDEX IF NOT EXISTS idx_orbits_task ON orbits(task_id);
+CREATE INDEX IF NOT EXISTS idx_orbits_intent ON orbits(intent_key, state);
 -- 발급된 fence는 단조·전역 유일(P0-2). 코드 회귀로 중복을 만들면 IntegrityError로 fail-closed.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_orbits_fence ON orbits(fence) WHERE fence IS NOT NULL;
 CREATE TABLE IF NOT EXISTS tasks (
@@ -48,10 +50,21 @@ CREATE TABLE IF NOT EXISTS tasks (
   merged_at REAL
 );
 CREATE TABLE IF NOT EXISTS agents (
-  agent_id TEXT PRIMARY KEY, name TEXT, state TEXT, last_heartbeat REAL
+  agent_id TEXT PRIMARY KEY, name TEXT, state TEXT, last_heartbeat REAL,
+  -- 증분5(§D6): 좀비 GC-pause 부활 방지. reclaim 이 단조 증가시키고, 변이는 caller가 든
+  -- bail_epoch가 현재값과 일치하는지 본다. 재생성(같은 id 재upsert)해도 epoch는 보존 → 낡은
+  -- epoch를 든 좀비는 FENCED_OUT. heartbeat 의 state 리셋(WORKING)으로는 못 우회한다.
+  bail_epoch INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS flags (
   key TEXT PRIMARY KEY, value TEXT, set_by TEXT, set_at REAL
+);
+-- 증분5(§D9): request_id 멱등 테이블. INFLIGHT(진행중)→DONE(성공종단만 캐시). DENIED/stale-fence
+-- 같은 비성공은 캐시 안 함(세상이 바뀌면 재시도 가능해야 — §3.C). at-least-once MCP 재시도가
+-- 두 번째 효과를 일으키지 않게 한다(claim 누수·이중 merge·이중 release 차단).
+CREATE TABLE IF NOT EXISTS idempotency (
+  request_id TEXT PRIMARY KEY, agent_id TEXT, verb TEXT, arg_hash TEXT,
+  status TEXT NOT NULL, response TEXT, created_at REAL, completed_at REAL
 );
 -- 단조 fence 카운터 시드(0). next_fence는 이 행을 in-statement로 +1 한다(읽고-쓰기 갭 없음).
 INSERT OR IGNORE INTO meta(key,value) VALUES('fence','0');
@@ -69,6 +82,9 @@ _MIGRATIONS = [
     ("tasks", "branch_tip_sha", "TEXT"),
     ("tasks", "merge_sha", "TEXT"),
     ("tasks", "merged_at", "REAL"),
+    # 증분5(§D6/§D9)
+    ("agents", "bail_epoch", "INTEGER NOT NULL DEFAULT 0"),
+    ("orbits", "intent_key", "TEXT"),
 ]
 
 
@@ -137,15 +153,23 @@ class Store:
     # --- orbits ---
     def add_orbit(self, *, task_id, agent_id, pathspec, mode, state,
                   fence=None, expires_at=None, reason="", priority=0,
-                  kind="orbit", resource_key=None) -> str:
+                  kind="orbit", resource_key=None, intent_key=None) -> str:
         oid = "orb-" + uuid.uuid4().hex[:12]
         self.db.execute(
             "INSERT INTO orbits(orbit_id,task_id,agent_id,pathspec,mode,state,"
-            "fence,expires_at,created_at,reason,priority,kind,resource_key) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "fence,expires_at,created_at,reason,priority,kind,resource_key,intent_key) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (oid, task_id, agent_id, json.dumps(pathspec), mode, state,
-             fence, expires_at, time.time(), reason, priority, kind, resource_key))
+             fence, expires_at, time.time(), reason, priority, kind, resource_key,
+             intent_key))
         return oid
+
+    def orbit_by_intent(self, intent_key) -> dict | None:
+        """증분5(§D9): 같은 intent_key의 살아있는 궤도(HELD/PENDING) — claim 자연 멱등.
+        같은 (agent,paths,mode,task) 재시도가 새 궤도(누수 lease)를 만드는 대신 기존 것을 반환."""
+        return _row(self.db.execute(
+            "SELECT * FROM orbits WHERE intent_key=? AND state IN ('HELD','PENDING') "
+            "ORDER BY created_at ASC LIMIT 1", (intent_key,)))
 
     def get_orbit(self, oid) -> dict | None:
         return _row(self.db.execute("SELECT * FROM orbits WHERE orbit_id=?", (oid,)))
@@ -241,6 +265,28 @@ class Store:
         r = _row(self.db.execute("SELECT value FROM flags WHERE key=?", (key,)))
         return r["value"] if r else None
 
+    # --- idempotency (D9: at-least-once MCP exactly-once 효과) ---
+    def get_idem(self, request_id) -> dict | None:
+        return _row(self.db.execute(
+            "SELECT * FROM idempotency WHERE request_id=?", (request_id,)))
+
+    def begin_idem(self, request_id, agent_id, verb, arg_hash):
+        """request_id를 INFLIGHT로 등록. 이미 있으면 무시(OR IGNORE) — 호출부가 get_idem으로 분기."""
+        self.db.execute(
+            "INSERT OR IGNORE INTO idempotency(request_id,agent_id,verb,arg_hash,status,created_at)"
+            " VALUES(?,?,?,?, 'INFLIGHT', ?)",
+            (request_id, agent_id, verb, arg_hash, time.time()))
+
+    def finish_idem(self, request_id, response):
+        """성공 종단만 캐시(DONE). 비성공은 clear_idem로 지운다(재시도 가능해야 — §3.C)."""
+        self.db.execute(
+            "UPDATE idempotency SET status='DONE', response=?, completed_at=? WHERE request_id=?",
+            (json.dumps(response), time.time(), request_id))
+
+    def clear_idem(self, request_id):
+        """비성공(DENIED/stale-fence/fenced_out) — INFLIGHT 흔적 제거 → 세상이 바뀌면 재시도 가능."""
+        self.db.execute("DELETE FROM idempotency WHERE request_id=?", (request_id,))
+
     # --- agents (물방울 heartbeat / 좀비 회수) ---
     def upsert_agent(self, agent_id, name=None, state="WORKING", now=None):
         now = now if now is not None else time.time()
@@ -255,6 +301,11 @@ class Store:
 
     def set_agent_state(self, agent_id, state):
         self.db.execute("UPDATE agents SET state=? WHERE agent_id=?", (state, agent_id))
+
+    def bump_bail_epoch(self, agent_id):
+        """증분5(§D6): 좀비 회수 시 단조 증가 — 회수 전 epoch를 든 GC-pause 좀비를 부활 차단."""
+        self.db.execute(
+            "UPDATE agents SET bail_epoch=bail_epoch+1 WHERE agent_id=?", (agent_id,))
 
     def stale_agents(self, cutoff) -> list[dict]:
         return _rows(self.db.execute(
