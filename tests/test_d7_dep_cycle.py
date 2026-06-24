@@ -22,7 +22,7 @@ def _deps(omd, task_id):
 
 # ---------- 1) depend 가 사이클을 거부 (그래프 불변) ----------
 def test_depend_rejects_back_edge_cycle():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     omd.declare("A", writes=["a/**"])
     omd.declare("B", writes=["b/**"])
     # A after B (정상)
@@ -37,7 +37,7 @@ def test_depend_rejects_back_edge_cycle():
 
 def test_depend_rejects_longer_cycle():
     """A→B→C→A (3-노드 사이클)도 잡힌다."""
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     for t in ("A", "B", "C"):
         omd.declare(t, writes=[f"{t.lower()}/**"])
     assert omd.depend("A", "B")["ok"]      # A after B
@@ -49,7 +49,7 @@ def test_depend_rejects_longer_cycle():
 
 # ---------- 2) declare(deps=) 가 사이클을 거부 ----------
 def test_declare_rejects_cycle_in_deps():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     omd.declare("A", writes=["a/**"], deps=["B"])     # A after B (B 아직 없어도 엣지 등록)
     omd.declare("B", writes=["b/**"])                  # 정상
     # 이제 B 를 A 에 의존시키면 사이클: B after A + A after B.
@@ -61,7 +61,7 @@ def test_declare_rejects_cycle_in_deps():
 
 # ---------- 3) self-dep 거부 ----------
 def test_self_dependency_rejected():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     omd.declare("A", writes=["a/**"])
     r = omd.depend("A", "A")
     assert r["ok"] is False and r["reason"] == "dep_cycle", r
@@ -74,7 +74,7 @@ def test_self_dependency_rejected():
 
 # ---------- 4) 유효 DAG 수락 + unblock ----------
 def test_valid_dag_accepted_and_unblocks():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     omd.declare("base", writes=["src/base/**"])
     r = omd.declare("dependent", writes=["src/x/**"], deps=["base"])
     assert r["ok"] and r["state"] == "PENDING", r
@@ -90,7 +90,7 @@ def test_valid_dag_accepted_and_unblocks():
 
 
 def test_depend_is_idempotent_for_existing_edge():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     omd.declare("A", writes=["a/**"])
     omd.declare("B", writes=["b/**"])
     omd.depend("A", "B")
@@ -103,7 +103,7 @@ def test_mutual_deps_would_be_permanently_blocked_without_gate():
     """territory check — 사이클 게이트가 *없다고 가정*하고 상호의존을 강제로 심으면
     next_task 가 둘 다 영원히 못 고른다(둘 다 영구 BLOCKED). 게이트가 이 상태를 애초에
     못 만들게 막는 이유. (게이트를 우회해 store 에 직접 사이클을 심는다.)"""
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     omd.declare("A", writes=["a/**"])
     omd.declare("B", writes=["b/**"])
     # 게이트 우회: 직접 상호의존 사이클을 store 에 심는다(A after B, B after A).

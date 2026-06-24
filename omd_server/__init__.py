@@ -4,9 +4,10 @@
 서로소(=입체) write-set ⇒ 무충돌 응결(merge) ⇒ 분열(악)=0.
 """
 
-from .core import Coordinator
+from .core import Coordinator, CoordinatorConflict
 from .disjoint import globs_overlap, sets_overlap, glob_prefix
 from .events import Emitter
 
-__all__ = ["Coordinator", "Emitter", "globs_overlap", "sets_overlap", "glob_prefix"]
+__all__ = ["Coordinator", "CoordinatorConflict", "Emitter",
+           "globs_overlap", "sets_overlap", "glob_prefix"]
 __version__ = "0.0.1"

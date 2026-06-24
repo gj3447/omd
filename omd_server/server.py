@@ -53,6 +53,15 @@ def build_server(db_path: str = "omd.db"):
                          bail_epoch=bail_epoch)
 
     @mcp.tool()
+    def read_refresh(task: str, agent: str, fence: int,
+                     request_id: str | None = None, bail_epoch: int | None = None) -> dict:
+        """§D12: rebase/재독 후 task 의 read-set 을 현 통합 gen 으로 재앵커(유령 읽기 청산).
+        connect 가 read_stale 로 거부되면 worktree 를 통합 최신으로 rebase 한 뒤 이걸 호출.
+        소유+fence 가드(그 task 의 write-orbit 을 쥔 caller 만)."""
+        return omd.read_refresh(task, agent, fence, request_id=request_id,
+                                bail_epoch=bail_epoch)
+
+    @mcp.tool()
     def bail(agent: str, request_id: str | None = None) -> dict:
         """물방울 긴급 탈출(자발). 보유 궤도 전부 해제 + 작업 requeue + worktree/브랜치 정리(멱등)."""
         return omd.bail(agent, request_id=request_id)

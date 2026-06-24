@@ -218,7 +218,7 @@ def test_recover_connecting_already_in_integration_to_merged(tmp_path):
     repo = tmp_path / "repo"
     _init_repo(repo)
     db = str(tmp_path / "omd.db")
-    omd = Coordinator(db_path=db, repo=str(repo),
+    omd = Coordinator(db_path=db, repo=str(repo), coordinator_id="restart-sim",
                       worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
     _develop(omd, "A", "a", "x.py", "x = 1\n")
 
@@ -232,7 +232,7 @@ def test_recover_connecting_already_in_integration_to_merged(tmp_path):
     assert omd.store.all_held_merge_tokens()                     # dangling token
 
     # 재기동: 같은 DB+repo로 새 코디네이터 → _recover()가 git 진실과 조정.
-    omd2 = Coordinator(db_path=db, repo=str(repo),
+    omd2 = Coordinator(db_path=db, repo=str(repo), coordinator_id="restart-sim",
                        worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
     t = omd2.store.get_task("A")
     assert t["state"] == "MERGED", t                             # 전진수정(git=진실)
@@ -246,7 +246,7 @@ def test_recover_connecting_not_merged_rolls_back_to_done(tmp_path):
     repo = tmp_path / "repo"
     _init_repo(repo)
     db = str(tmp_path / "omd.db")
-    omd = Coordinator(db_path=db, repo=str(repo),
+    omd = Coordinator(db_path=db, repo=str(repo), coordinator_id="restart-sim",
                       worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
     _develop(omd, "A", "a", "x.py", "x = 1\n")
 
@@ -255,7 +255,7 @@ def test_recover_connecting_not_merged_rolls_back_to_done(tmp_path):
     assert a["ok"]
     assert omd.store.get_task("A")["state"] == "CONNECTING"
 
-    omd2 = Coordinator(db_path=db, repo=str(repo),
+    omd2 = Coordinator(db_path=db, repo=str(repo), coordinator_id="restart-sim",
                        worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
     t = omd2.store.get_task("A")
     assert t["state"] == "DONE", t                               # rollback(재시도가능)
@@ -273,7 +273,7 @@ def test_recover_trailer_probe_no_prefix_false_match(tmp_path):
     repo = tmp_path / "repo"
     _init_repo(repo)
     db = str(tmp_path / "omd.db")
-    omd = Coordinator(db_path=db, repo=str(repo),
+    omd = Coordinator(db_path=db, repo=str(repo), coordinator_id="restart-sim",
                       worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
     # AB는 완전 응결, A는 Phase A만(미머지)인 채로 크래시.
     _develop(omd, "AB", "ab", "z.py", "z = 0\n")
@@ -282,7 +282,7 @@ def test_recover_trailer_probe_no_prefix_false_match(tmp_path):
     a = omd._connect_phase_a("A", None, None)
     assert a["ok"] and omd.store.get_task("A")["state"] == "CONNECTING"
 
-    omd2 = Coordinator(db_path=db, repo=str(repo),
+    omd2 = Coordinator(db_path=db, repo=str(repo), coordinator_id="restart-sim",
                        worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
     # A는 통합에 없음 → rollback(DONE), MERGED 오탐 아님.
     assert omd2.store.get_task("A")["state"] == "DONE", omd2.store.get_task("A")
@@ -294,13 +294,13 @@ def test_recover_is_idempotent(tmp_path):
     repo = tmp_path / "repo"
     _init_repo(repo)
     db = str(tmp_path / "omd.db")
-    omd = Coordinator(db_path=db, repo=str(repo),
+    omd = Coordinator(db_path=db, repo=str(repo), coordinator_id="restart-sim",
                       worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
     _develop(omd, "A", "a", "x.py", "x = 1\n")
     assert omd.connect("A")["state"] == "MERGED"
     # 두 번 더 기동 — MERGED는 그대로, 새 토큰/롤백 없음.
     for _ in range(2):
-        omd = Coordinator(db_path=db, repo=str(repo),
+        omd = Coordinator(db_path=db, repo=str(repo), coordinator_id="restart-sim",
                           worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
         assert omd.store.get_task("A")["state"] == "MERGED"
         assert omd.store.all_held_merge_tokens() == []

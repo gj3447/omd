@@ -278,7 +278,7 @@ def _recover():
 - **두 입체(서로소) task가 동시에 connect**하면 둘 다 fence 통과 후 **같은 `.git/index`/HEAD를 경합** → `index.lock` 실패 또는 한쪽의 `merge --abort`가 다른쪽 진행중 머지를 파괴 → 부분 트리가 MERGED로 기록 = **좀비 없는 분열**. "병렬 개발"이 응결 단계에서 직렬로 붕괴.
 - 기제: **repo-wide `merge_token`(Semaphore max=1, 그 자체가 lease)** + **전용 통합 worktree**(사용자 HEAD 안 건드림) + merge는 항상 명시적 `checkout integration_branch` 후. 토큰은 crash-safe(`merge_started_mono` 저장, 복구가 RETIRED 소유 토큰의 dangling `MERGE_HEAD`를 abort).
 
-### D12 — read-set 코히런스/유령 읽기  `[GAP]`
+### D12 — read-set 코히런스/유령 읽기  `[FIXED 증분9]`
 
 - `reads`는 저장되나 `_conflicts`/`next_task`/`connect` 어디서도 사용 안 됨. consumer가 `src/api/**`를 read claim하고 작업하는데 producer가 `src/api/new.py`(읽을 때 없던 유령)를 응결하면, consumer는 옛 base에서 분기했으므로 **조용히 낡은 뷰 위에 빌드**(자기 머지는 성공하지만 *로직*이 틀림). SINGULON은 write-disjointness만 보장.
 - 기제: 통합 브랜치 generation 추적; 응결이 live read-궤도와 겹치는 경로를 추가/변경하면 그 consumer의 read-lease를 **stale 표시** → consumer는 자기 connect 전 rebase/재독 강제. stale 신호는 D3 플래그/이벤트로.
@@ -288,7 +288,7 @@ def _recover():
 - worktree 디스크풀: 물방울 N개 = 전체 체크아웃 N개. `add_worktree`/`commit_all` 실패(`GitError`)를 `start`/`commit`이 안 잡음 → 반쯤 만든 브랜치가 재시도를 막음. 백그라운드 `git gc`/외부 `git worktree prune`가 live worktree를 경합/고아화. `remove_worktree`가 에러를 삼켜(`gitio.py:62-65`) 이를 가림.
 - 기제: `GitError`를 **transient/disk/fatal로 분류**(`gitio.py:13`는 단일 타입); worktree 생성 전 quota preflight; 관리 레포 auto-gc 비활성; ENOSPC 별도 처리. D9의 재시도 분류와 연동.
 
-### D14 — 코디네이터 singleton / HA 입장  `[GAP]`
+### D14 — 코디네이터 singleton / HA 입장  `[FIXED 증분9 — 단일 인스턴스 강제]`
 
 - D1의 in-process actor 직렬화는 **프로세스당**이다. 운영자가 HA로 FastMCP 2개를 한 DB에 띄우면 actor 불변식이 조용히 무효(actor 둘=writer 둘), 통합 머지(락 밖)는 한 레포에 두 writer가 무조정.
 - 기제: **DB 리더-lease**(둘째 코디네이터를 fence) 또는 기동 시 다른 live 코디네이터 heartbeat 감지하면 **거부**. "단일 인스턴스 전용"을 *명시적으로 강제*. (`:memory:` 디폴트도 금지 — 재기동마다 fence가 0으로 리셋되어 낡은 토큰과 충돌. 영속 DB 필수.)
@@ -647,9 +647,69 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
 - **남은 부채**: P0 전부 닫힘(증분1~4). 미구현 = D12 read-set 코히런스 · D14 HA 입장 · §3.D 배리어
   재기동 단위복구 — 전부 설계만(P1/P2). (D5 = 증분8, D4 = 증분7, D3 = 증분6, D6 잔여+D9 = 증분5 에서 닫힘.)
 
+### ✅ inc9 — D12 read-set 코히런스 + D14 코디네이터 singleton/HA 입장 (증분9)
+
+**구현(D12 — 유령 읽기 차단).**
+- **통합 generation 추적**: `meta.integration_gen` 응결 1건마다 +1(단일문, 읽고-쓰기 갭 없음).
+  새 `merge_log(gen→write-globs, task)` 테이블에 그 gen 에 통합으로 들어간 write-globs 를 기록.
+- **task 차원 read 동기화**: read claim 은 그 task 의 `read_synced_gen`(현 gen)을 박는다. **궤도
+  생명과 분리** — read↔write 는 배타적이라 producer 가 그 영역을 쓰려면 consumer 가 read 궤도를
+  release 해야 하는데, 그래도 `read_synced_gen` 이 task 에 남아 코히런스를 추적한다.
+- **connect 게이트(`_ghost_reads`)**: consumer 의 connect Phase A 가 `read_synced_gen` *이후* 의
+  merge_log 중 자기 선언 reads 와 `sets_overlap` 하는 게 있으면 = 옛 base 위에 조용히 빌드(머지는
+  성공하되 로직 틀림) → `read_stale` 로 거부(merge_token 잡기 *전*). live read 궤도가 있으면
+  `_mark_stale_reads` 가 `stale=1` + D3 `LATCH read_stale:<orbit>` 플래그/이벤트로도 신호.
+- **회복(`read_refresh(task, agent, fence)`)**: rebase/재독 후 task 의 read-set 을 현 gen 으로
+  재앵커(+살아있는 read 궤도 stale 해제·신호 CLEARED). connect 와 동일한 소유+fence 가드(그 task
+  의 write-orbit 을 쥔 caller 만). MCP 툴 + CLI `read-refresh` 노출, `request_id` 멱등.
+
+**구현(D14 — 단일 인스턴스 강제).**
+- **DB 리더-lease**(`meta.leader_lease` JSON: coordinator_id/epoch/last_heartbeat/ttl). 기동 시
+  `_acquire_leadership()` 가 `_cs`(BEGIN IMMEDIATE) 안에서 CAS 획득. 살아있는 다른 리더(heartbeat 가
+  **incumbent 가 선언한 TTL** 안)면 `CoordinatorConflict` 거부 = actor 둘(=writer 둘) 차단.
+- **죽은 리더 takeover**: heartbeat TTL 초과 시 epoch +1 로 fence 하며 takeover. `coordinator_heartbeat()`
+  keepalive(권장 ttl/3), `resign()` graceful(즉시 takeover 허용).
+- **leader-fence**: `_cs()` 가 트랜잭션 연 직후 `_assert_leader()` — takeover 된 좀비 리더(epoch/id
+  불일치)의 *모든* 변이를 `CoordinatorConflict` 로 차단(획득 중에는 skip).
+- **`:memory:` 디폴트 금지**: 영속 DB 필수(재기동마다 fence/leader_epoch 0 리셋→낡은 토큰 충돌).
+  단위테스트만 `allow_memory_db=True` 명시 opt-in. 기존 in-memory 단위테스트(test_omd/test_d7)는
+  그 플래그로 전환, 멀티프로세스 테스트(test_concurrency)는 D14 거부 계약으로 갱신.
+
+**테스트(신규 19 — 정상+크래시/사망/오추방+fence/owner+변이검증).**
+- `test_d12_read_coherence.py`(10): gen 앵커 · 유령읽기→connect 차단 · read_refresh→통과 ·
+  비겹침 무차단 · read 없는 task 무관 · D3 플래그 신호 · **사망 consumer 자동 회수+부활차단** ·
+  fence/owner 거부 · 멱등 · 변이검증.
+- `test_d14_ha_admission.py`(9): `:memory:` 금지 · 첫 리더 획득 · **둘째 live 거부** ·
+  **죽은 리더 takeover** · **takeover 된 좀비 리더 변이 차단** · heartbeat 유지 · resign 즉시 takeover ·
+  좀비 heartbeat fence · 변이검증.
+
+**변이검증(직접 수행, 복원 확인).**
+- D12 connect ghost-read 가드(`_ghost_reads`/`stale_orbits`)를 `[]` 로 무력화 → 유령 읽기인데도
+  consumer 가 MERGED 됨 → D12 테스트 5 RED(변이검증 테스트 포함). 복원 후 green.
+- D14 admission(`alive=False` 강제, incumbent 항상 죽은 것처럼) → 둘째 코디네이터가 기동 성공
+  (writer 둘) → D14 테스트 3 RED. 복원 후 green.
+- D14 leader-fence(`_assert_leader` no-op) → takeover 된 좀비 리더가 변이/heartbeat 성공 → 3 RED.
+  복원 후 green.
+- 전체: inc8 까지 153 passed → **172 passed, 1 skipped**(신규 19 전부 포함, 기존 0 회귀).
+
+**잔여(정직히).**
+1. **D12 신호는 task 차원 게이트가 주(主), live read-궤도 stale 표시는 보조**다. read↔write 배타성
+   때문에 *연속 점유* 중 live read 궤도가 producer 응결과 겹치는 일은 드물어, `_mark_stale_reads` 가
+   실제로 fire 하는 주 경로는 `release_read=False`(읽기 궤도 유지) 케이스다. 정상 물방울 흐름(읽고
+   release)은 `read_synced_gen` 기반 merge_log 검사가 잡는다.
+2. **무효화 정책은 "전 consumer 강제 rebase"**(§7 미해결 중 강한 쪽)를 택했다 — connect 를 막아
+   강제한다. "알림만"(soft) 옵션은 미구현.
+3. **D14 는 단일 인스턴스 강제(거부)** 만 — 리더-lease **페일오버**(통합 머지 조정까지)는 §7 대로
+   범위 밖. takeover 는 "죽은 리더 자리를 새 리더가 인계" 까지(진행중 작업의 무중단 인계 아님).
+4. **leader heartbeat 자동 주기 미구현** — `coordinator_heartbeat()` 동사만 노출. 운영 시 서버가
+   ttl/3 주기로 호출해야(현 server.py 는 호출 루프 없음 — 단일 프로세스 데모는 takeover 없어 무해,
+   장수 HA 운영엔 주기 호출 추가 필요). 정직히 P1.
+5. `_ghost_reads` 의 글로브 overlap 은 `sets_overlap`(보수적 — 거짓-양성 가능, soundness 우선).
+   거짓-양성이면 불필요한 rebase 1회를 강제할 뿐 분열은 절대 안 남(안전측 실패).
+
 ### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
-D12 read-set 코히런스 · D14 HA 입장 · §3.D 배리어 재기동 단위복구. (P0-1~P0-11 = 증분1~4, D6 잔여+D9 =
-증분5, D3 = 증분6, D4 = 증분7, D5 = 증분8 에서 닫힘.)
+§3.D 배리어 재기동 단위복구 · D13 git/FS 장애 분류 · D14 leader heartbeat 자동주기/페일오버.
+(P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6, D4 = 증분7, D5 = 증분8, D12+D14 = 증분9 에서 닫힘.)
 
 ---
 
