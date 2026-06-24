@@ -77,6 +77,19 @@ class GitRepo:
         except GitError:
             return None
 
+    def changed_paths(self, branch: str, base: str) -> list[str]:
+        """`base`(통합 브랜치) 대비 `branch`(물방울 브랜치)가 **건드린 모든 파일 경로**
+        (P0-11/§D10 write-set FS 감사용). `git diff --name-only base...branch` =
+        merge-base 이후 branch가 바꾼 것만(통합 쪽 변경은 제외) → 이 task가 실제로 쓴 영역.
+
+        rename/delete 도 '건드린 경로'로 센다: rename 은 `R` 상태이지만 `--name-only`는
+        **삭제된 원본과 새 경로 둘 다** (renames 비탐지 모드, `--no-renames`)를 내므로
+        둘 다 감사 대상에 들어간다(궤도 밖으로 옮기면 잡힘). 경로는 정규화(따옴표/escape 없이)."""
+        # core.quotepath=false: 비ASCII 경로를 octal-escape 하지 않고 그대로 — 감사 정확성.
+        out = self._git("-c", "core.quotepath=false", "diff", "--name-only",
+                        "--no-renames", f"{base}...{branch}")
+        return [ln for ln in out.splitlines() if ln.strip()]
+
     def merge_into(self, integration_worktree: str, integration_branch: str,
                    branch: str, msg: str, *, timeout: float | None = None) -> str:
         """전용 통합 worktree에서 integration_branch에 branch를 --no-ff merge(§D11).

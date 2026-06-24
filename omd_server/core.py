@@ -34,7 +34,7 @@ import time
 from contextlib import contextmanager
 
 from . import fsm
-from .disjoint import sets_overlap
+from .disjoint import path_in_globs, sets_overlap
 from .events import NOOP
 from .gitio import GitError, GitRepo, GitTimeout
 from .store import Store
@@ -132,6 +132,58 @@ class Coordinator:
             return False
 
         return dfs(node, {node})
+
+    # ---- task 의존 DAG 사이클 게이트 (§D7, P0-10) ----
+    def _dep_graph(self, extra_edges=None) -> dict:
+        """task→deps 의존 그래프(엣지 t→d = 'd가 t보다 먼저'). DB의 모든 task `deps` +
+        선택적 `extra_edges`(예: 추가하려는 후보 엣지)를 합친다. 임계구역 안에서만 호출."""
+        g: dict = {}
+        for t in self.store.all_tasks():
+            g.setdefault(t["task_id"], set())
+            for d in json.loads(t["deps"] or "[]"):
+                g.setdefault(t["task_id"], set()).add(d)
+        for (src, dst) in (extra_edges or []):
+            g.setdefault(src, set()).add(dst)
+        return g
+
+    def _find_cycle(self, graph) -> list[str] | None:
+        """방향 그래프에 사이클이 있으면 그 사이클 경로(노드 리스트)를, 없으면 None.
+        DFS 색칠(WHITE/GRAY/BLACK) — GRAY 노드로 되돌아가는 back-edge가 사이클."""
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {n: WHITE for n in graph}
+        stack: list[str] = []
+
+        def visit(n):
+            color[n] = GRAY
+            stack.append(n)
+            for m in graph.get(n, ()):
+                c = color.get(m, WHITE)
+                if c == GRAY:
+                    # back-edge → 사이클. stack[m..] + m 닫힘.
+                    return stack[stack.index(m):] + [m]
+                if c == WHITE:
+                    cyc = visit(m)
+                    if cyc:
+                        return cyc
+            color[n] = BLACK
+            stack.pop()
+            return None
+
+        for n in list(graph):
+            if color.get(n, WHITE) == WHITE:
+                cyc = visit(n)
+                if cyc:
+                    return cyc
+        return None
+
+    def _would_cycle(self, task_id, deps) -> list[str] | None:
+        """task_id 가 `deps`(after-목록)를 가질 때 의존 그래프에 사이클이 생기면 그 경로,
+        아니면 None. self-dep(task_id ∈ deps)는 길이-1 사이클로 잡힌다. 후보 task가 아직
+        DB에 없어도(declare 직전) 후보 엣지로 가상 추가해 전역 재검(Kahn/DFS 동치)."""
+        extra = [(task_id, d) for d in (deps or [])]
+        g = self._dep_graph(extra_edges=extra)
+        g.setdefault(task_id, set())
+        return self._find_cycle(g)
 
     def _sweep_inline(self):
         """임계구역 안에서 도는 sweep 본체(만료 회수 + 좀비 회수 + promote). tx 자기관리 안 함."""
@@ -293,6 +345,30 @@ class Coordinator:
                            orbit_id=mt["orbit_id"], reason="recover")
             self._promote_pending()
 
+    # ---- write-set 파일시스템 감사 (§D10, P0-11 = "최대 구멍") ----
+    def _claimed_write_globs(self, task_id, writes) -> list[str]:
+        """task의 HELD write-orbit pathspec들의 합집합(claimed write-set). `writes`는 Phase A가
+        이미 모은 write-orbit row 리스트 — 거기서 glob을 펼친다."""
+        globs: list[str] = []
+        for o in writes:
+            for g in json.loads(o["pathspec"]):
+                globs.append(g)
+        return globs
+
+    def _writeset_audit(self, task_id, branch, write_globs) -> list[str]:
+        """branch가 통합 base 대비 건드린 파일 중 **claimed write-set 밖** 경로들(있으면 위반).
+        §D10 option 2(저비용 pre-connect 감사): `git diff --name-only base...branch`의 모든
+        경로가 claimed write-globs 에 정확히 덮여야 한다. 안 덮인 경로 = 분열 위험 = 거부 대상.
+        repo 미바인딩이거나 branch 없으면 감사 불가 → 빈 리스트(감사 skip, 보수적으로 통과)."""
+        if not self.git or not branch:
+            return []
+        try:
+            changed = self.git.changed_paths(branch, self.integration_branch)
+        except GitError:
+            return []   # diff 실패(브랜치 없음 등) — 다른 게이트가 처리. 감사 위반은 아님.
+        # path_in_globs = 정확매칭(soundness: 덮인다를 절대 거짓-양성으로 안 냄). 안 덮이면 위반.
+        return [p for p in changed if not path_in_globs(p, write_globs)]
+
     def _release_task_write_orbits(self, task_id):
         """task의 HELD write-orbit 전부 해제 + unpin(merge_sha 기록 *후* 호출 — P0-6 순서)."""
         for o in self.store.orbits_for_task(task_id):
@@ -304,10 +380,41 @@ class Coordinator:
     # ---- 공개 API (= MCP 툴 / CLI 동사) ----
     def declare(self, task_id, *, name="", writes=None, reads=None, deps=None, priority=0):
         with self._cs():
+            # P0-10/§D7: deps가 의존 DAG에 사이클을 만들면 거부(그래프 불변) — 안 그러면
+            # 상호의존(A after B, B after A)이 둘 다 영구 BLOCKED. self-dep 도 잡힌다.
+            if deps:
+                cyc = self._would_cycle(task_id, deps)
+                if cyc:
+                    self._emit("declare_rejected", task_id, reason="dep_cycle", cycle=cyc)
+                    return {"ok": False, "reason": "dep_cycle", "cycle": cyc,
+                            "task_id": task_id}
             self.store.add_task(task_id=task_id, name=name, writes=writes or [],
                                 reads=reads or [], deps=deps or [], state="PENDING",
                                 priority=priority)
-        return {"task_id": task_id, "state": "PENDING"}
+        return {"ok": True, "task_id": task_id, "state": "PENDING"}
+
+    def depend(self, task_id, after):
+        """task_id 에 의존 엣지(`task_id` after `after`)를 추가 — 단, 사이클을 만들면 **거부**
+        (그래프 불변, P0-10/§D7). self-dep 도 거부. check-then-add 가 임계구역 안에서 원자."""
+        with self._cs():
+            t = self.store.get_task(task_id)
+            if t is None:
+                return {"ok": False, "reason": "no such task", "task_id": task_id}
+            existing = json.loads(t["deps"] or "[]")
+            if after in existing:
+                return {"ok": True, "noop": True, "task_id": task_id, "after": after,
+                        "deps": existing}
+            cyc = self._would_cycle(task_id, existing + [after])
+            if cyc:
+                # 그래프 변경 없음 — 거부만.
+                self._emit("depend_rejected", task_id, after=after, reason="dep_cycle",
+                           cycle=cyc)
+                return {"ok": False, "reason": "dep_cycle", "cycle": cyc,
+                        "task_id": task_id, "after": after}
+            new_deps = existing + [after]
+            self.store.set_task_deps(task_id, new_deps)
+            self._emit("depend_added", task_id, after=after)
+            return {"ok": True, "task_id": task_id, "after": after, "deps": new_deps}
 
     def claim(self, agent_id, pathspec, mode="write", *, ttl=600.0, task_id=None,
               reason="", priority=0):
@@ -439,14 +546,26 @@ class Coordinator:
             return {"task_id": task_id, "state": s, "worktree": worktree, "branch": branch}
 
     def commit(self, task_id, msg):
-        """물방울 worktree의 변경을 커밋(repo 바인딩 시)."""
+        """물방울 worktree의 변경을 커밋(repo 바인딩 시). 커밋 후 write-set 감사(§D10/P0-11)를
+        **자문(advisory)** 으로 돌려 궤도 밖 경로를 조기 노출한다(`offending` 동봉). 단 connect
+        게이트가 *권위* 강제 지점이므로 여기선 커밋을 되돌리지 않는다 — 물방울이 일찍 알아채게."""
         if not self.git:
             return {"ok": False, "reason": "no repo bound"}
         with self._cs():
             t = self.store.get_task(task_id)
             sha = self.git.commit_all(t["worktree"], msg)
             self._emit("task_committed", t["agent_id"], task=task_id, sha=sha)
-            return {"ok": True, "sha": sha}
+            writes = [o for o in self.store.orbits_for_task(task_id)
+                      if o["mode"] == "write" and o["state"] == "HELD"]
+            write_globs = self._claimed_write_globs(task_id, writes)
+            offending = self._writeset_audit(task_id, t["branch"], write_globs)
+            res = {"ok": True, "sha": sha}
+            if offending:
+                # 자문 경고 — connect에서 거부될 것임. 물방울은 지금 바로잡아야 한다.
+                self._emit("commit_writeset_warning", task_id, offending=offending)
+                res["writeset_violation"] = True
+                res["offending"] = offending
+            return res
 
     def finish(self, task_id):
         with self._cs():
@@ -513,6 +632,16 @@ class Coordinator:
                 return {"ok": False, "fenced_out": True,
                         "reason": "stale fence: lease expired/released during work",
                         "stale": stale}
+            # P0-11/§D10 — write-set 파일시스템 강제("최대 구멍"). 브랜치가 claimed write-set
+            # **밖**의 파일을 건드렸으면 거부(merge 안 함, 토큰 안 잡음, 상태 불변). 이것으로
+            # SINGULON 토대 (c)가 성립: 선언상 서로소 write-set이 *실제* write-set이 된다.
+            write_globs = self._claimed_write_globs(task_id, writes)
+            offending = self._writeset_audit(task_id, t["branch"], write_globs)
+            if offending:
+                self._emit("connect_rejected", task_id, reason="writeset_violation",
+                           offending=offending)
+                return {"ok": False, "reason": "writeset_violation", "offending": offending,
+                        "claimed": write_globs, "task_id": task_id}
             # merge_token(repo-wide Semaphore max=1) — 가용 아니면 retry(다른 connect 응결중).
             owner = agent_id or t["agent_id"] or f"connect:{task_id}"
             token_id = self._acquire_merge_token_locked(owner)
