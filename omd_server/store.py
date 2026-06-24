@@ -31,7 +31,12 @@ CREATE TABLE IF NOT EXISTS orbits (
   merging INTEGER NOT NULL DEFAULT 0,  -- 1=connect Phase B 진행중 pin(sweep/reclaim skip, §E)
   merge_deadline REAL,                 -- pin 유계(§E): 이 시각 넘으면 abort 대상
   merge_started_mono REAL,             -- merge_token crash-safe(§D11): dangling merge abort 판정
-  intent_key TEXT                      -- 증분5(§D9): claim 자연 멱등 — hash(agent,paths,mode,task)
+  intent_key TEXT,                     -- 증분5(§D9): claim 자연 멱등 — hash(agent,paths,mode,task)
+  -- 증분9(§D12 read-set 코히런스): read-orbit 이 어느 통합 generation 위에서 분기했는지(read 시점
+  -- integration_gen). 응결이 이 read-궤도와 겹치는 경로를 통합에 추가/변경하면(read_gen < 현 gen
+  -- 이면서 겹침) consumer 는 옛 base 위에 빌드 중 → stale=1 로 표시 → connect 전 rebase/재독 강제.
+  read_gen INTEGER,
+  stale INTEGER NOT NULL DEFAULT 0     -- 1=read-궤도가 낡음(겹치는 응결이 일어남). connect 차단.
 );
 CREATE INDEX IF NOT EXISTS idx_orbits_state ON orbits(state);
 CREATE INDEX IF NOT EXISTS idx_orbits_task ON orbits(task_id);
@@ -47,7 +52,17 @@ CREATE TABLE IF NOT EXISTS tasks (
   connect_intent_at REAL,       -- intent 영속 타임스탬프(복구가 CONNECTING 식별)
   branch_tip_sha TEXT,          -- merge 직전 task 브랜치 tip(복구 trailer-probe 보조)
   merge_sha TEXT,               -- 응결된 merge 커밋(MERGED 증거, P0-6: release 전에 기록)
-  merged_at REAL
+  merged_at REAL,
+  -- 증분9(§D12): consumer 가 자기 read-set 을 마지막으로 통합과 동기화한 generation. claim(read)
+  -- /read_refresh 시 현 integration_gen 으로 박힌다. connect 때 이 gen 이후의 merge 가 이 task 의
+  -- 선언 reads 와 겹치면 = 유령 읽기(옛 base 위 빌드) → connect 거부. read-궤도 release 후에도
+  -- 유지되므로(궤도 생명과 분리) read↔write 배타성을 안 깨고 코히런스를 추적한다.
+  read_synced_gen INTEGER
+);
+-- 증분9(§D12): 응결 로그 — gen 마다 통합에 추가/변경된 write-globs. consumer connect 가
+-- read_synced_gen 이후 merge 들 중 자기 reads 와 겹치는 게 있는지 본다(유령 읽기 판정).
+CREATE TABLE IF NOT EXISTS merge_log (
+  gen INTEGER PRIMARY KEY, task_id TEXT, globs TEXT NOT NULL, merged_at REAL
 );
 CREATE TABLE IF NOT EXISTS agents (
   agent_id TEXT PRIMARY KEY, name TEXT, state TEXT, last_heartbeat REAL,
@@ -142,6 +157,11 @@ _MIGRATIONS = [
     ("flags", "status", "TEXT NOT NULL DEFAULT 'LIVE'"),
     ("flags", "owner_agent", "TEXT"),
     ("flags", "lease_id", "TEXT"),
+    # 증분9(§D12): read-set 코히런스. read-orbit 의 분기 generation + stale 플래그 +
+    # task 의 read-set 동기화 gen(궤도 생명과 분리된 코히런스 추적).
+    ("orbits", "read_gen", "INTEGER"),
+    ("orbits", "stale", "INTEGER NOT NULL DEFAULT 0"),
+    ("tasks", "read_synced_gen", "INTEGER"),
 ]
 
 
@@ -216,18 +236,93 @@ class Store:
         return int(self.db.execute(
             "SELECT value FROM meta WHERE key='seq'").fetchone()["value"])
 
+    # --- meta (일반 KV: 증분9 D12 integration_gen / D14 leader_lease) ---
+    def get_meta(self, key, default=None):
+        r = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else default
+
+    def set_meta(self, key, value):
+        self.db.execute(
+            "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE "
+            "SET value=excluded.value", (key, str(value)))
+
+    def integration_gen(self) -> int:
+        """현 통합 generation(§D12). 응결 1건마다 +1. read-orbit 은 분기 시점 이 값을 박는다."""
+        r = self.db.execute("SELECT value FROM meta WHERE key='integration_gen'").fetchone()
+        return int(r["value"]) if r else 0
+
+    def bump_integration_gen(self) -> int:
+        """응결(merge)이 통합 브랜치를 전진시킬 때 +1(단일문, 읽고-쓰기 갭 없음). §D12."""
+        self.db.execute(
+            "INSERT INTO meta(key,value) VALUES('integration_gen','1') ON CONFLICT(key) "
+            "DO UPDATE SET value=CAST(value AS INTEGER)+1")
+        return self.integration_gen()
+
+    def append_merge_log(self, gen, task_id, globs) -> None:
+        """gen 에 응결된 통합 write-globs 를 기록(§D12). consumer connect 가 read_synced_gen
+        이후 이 로그를 훑어 자기 reads 와 겹치는 응결을 찾는다(궤도 생명과 분리된 코히런스)."""
+        self.db.execute(
+            "INSERT INTO merge_log(gen,task_id,globs,merged_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(gen) DO UPDATE SET task_id=excluded.task_id,globs=excluded.globs",
+            (gen, task_id, json.dumps(globs), time.time()))
+
+    def merges_since(self, gen) -> list[dict]:
+        """gen *초과*(>gen) 의 모든 응결 로그(오름차순). consumer 가 자기 read_synced_gen 이후
+        통합에 무엇이 들어왔는지 본다."""
+        return _rows(self.db.execute(
+            "SELECT * FROM merge_log WHERE gen>? ORDER BY gen ASC", (gen,)))
+
+    # --- D14 leader-lease (코디네이터 singleton/HA 입장) ---
+    def get_leader(self) -> dict | None:
+        """현 리더 lease(JSON: coordinator_id/epoch/last_heartbeat/started_at) 또는 None."""
+        raw = self.get_meta("leader_lease")
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def cas_leader(self, expect_epoch, new_lease) -> bool:
+        """leader_lease 를 CAS 로 교체(현 epoch == expect_epoch 일 때만). _cs(BEGIN IMMEDIATE)
+        안에서 호출되므로 단일 writer 직렬화 + 멀티프로세스간 row-lock 양쪽으로 원자.
+        expect_epoch=None 은 '리더 부재(또는 행 없음)' 를 기대. 반환=교체 성공 여부."""
+        cur = self.get_leader()
+        cur_epoch = cur["epoch"] if cur else None
+        if cur_epoch != expect_epoch:
+            return False
+        self.set_meta("leader_lease", json.dumps(new_lease))
+        return True
+
+    def write_leader(self, lease) -> None:
+        """리더 lease 무조건 기록(heartbeat 갱신 등 — 이미 소유 검증된 경로에서만)."""
+        self.set_meta("leader_lease", json.dumps(lease))
+
+    def live_read_orbits(self) -> list[dict]:
+        """살아있는(HELD) read-궤도 — §D12 stale 표시 대상. merge_token/permit 등 제외(kind='orbit')."""
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE state='HELD' AND kind='orbit' AND mode='read'"))
+
+    def stale_read_orbits_for_task(self, task_id) -> list[dict]:
+        """task 의 HELD read-궤도 중 stale 로 표시된 것(§D12) — connect 차단 판정용."""
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE task_id=? AND kind='orbit' AND mode='read' "
+            "AND state='HELD' AND stale=1", (task_id,)))
+
     # --- orbits ---
     def add_orbit(self, *, task_id, agent_id, pathspec, mode, state,
                   fence=None, expires_at=None, reason="", priority=0,
-                  kind="orbit", resource_key=None, intent_key=None) -> str:
+                  kind="orbit", resource_key=None, intent_key=None,
+                  read_gen=None) -> str:
         oid = "orb-" + uuid.uuid4().hex[:12]
         self.db.execute(
             "INSERT INTO orbits(orbit_id,task_id,agent_id,pathspec,mode,state,"
-            "fence,expires_at,created_at,reason,priority,kind,resource_key,intent_key) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "fence,expires_at,created_at,reason,priority,kind,resource_key,intent_key,"
+            "read_gen) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (oid, task_id, agent_id, json.dumps(pathspec), mode, state,
              fence, expires_at, time.time(), reason, priority, kind, resource_key,
-             intent_key))
+             intent_key, read_gen))
         return oid
 
     def orbit_by_intent(self, intent_key) -> dict | None:
@@ -241,12 +336,14 @@ class Store:
         return _row(self.db.execute("SELECT * FROM orbits WHERE orbit_id=?", (oid,)))
 
     def set_orbit(self, oid, *, state=..., expires_at=..., released_at=..., fence=...,
-                  merging=..., merge_deadline=..., merge_started_mono=...):
+                  merging=..., merge_deadline=..., merge_started_mono=...,
+                  read_gen=..., stale=...):
         sets, args = [], []
         for col, val in (("state", state), ("expires_at", expires_at),
                          ("released_at", released_at), ("fence", fence),
                          ("merging", merging), ("merge_deadline", merge_deadline),
-                         ("merge_started_mono", merge_started_mono)):
+                         ("merge_started_mono", merge_started_mono),
+                         ("read_gen", read_gen), ("stale", stale)):
             if val is not ...:
                 sets.append(f"{col}=?"); args.append(val)
         if not sets:
@@ -290,14 +387,15 @@ class Store:
 
     def set_task(self, task_id, *, state=..., agent_id=..., worktree=..., branch=...,
                  connect_fence=..., connect_intent_at=..., branch_tip_sha=...,
-                 merge_sha=..., merged_at=...):
+                 merge_sha=..., merged_at=..., read_synced_gen=...):
         sets, args = [], []
         for col, val in (("state", state), ("agent_id", agent_id),
                          ("worktree", worktree), ("branch", branch),
                          ("connect_fence", connect_fence),
                          ("connect_intent_at", connect_intent_at),
                          ("branch_tip_sha", branch_tip_sha),
-                         ("merge_sha", merge_sha), ("merged_at", merged_at)):
+                         ("merge_sha", merge_sha), ("merged_at", merged_at),
+                         ("read_synced_gen", read_synced_gen)):
             if val is not ...:
                 sets.append(f"{col}=?"); args.append(val)
         if not sets:

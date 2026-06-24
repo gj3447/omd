@@ -32,6 +32,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 
 from . import fsm
@@ -48,6 +49,17 @@ MERGE_PIN_GRACE_S = 60.0
 # D3 단조 LATCH 랭크(§D3): done(1) < merged(2). 하향 set 은 거부, 동값 재발행은 멱등 no-op.
 # 0 = 랭크 없는 일반 LATCH(임의 값, 단조검사 안 함). 의존 해제는 =merged 에 건다(§3.H).
 LATCH_RANK = {"done": 1, "merged": 2}
+
+# D14 리더-lease(코디네이터 singleton). 기동 시 리더 lease 를 획득(또는 살아있는 리더 감지 시
+# 거부). last_heartbeat 가 이 TTL 을 넘으면 죽은 리더로 보고 takeover 가능(fence=epoch +1 로
+# 옛 리더의 잔여 변이는 stale leader_epoch 로 차단). 권장: leader heartbeat 주기 = TTL/3.
+LEADER_TTL_S = 30.0
+
+
+class CoordinatorConflict(RuntimeError):
+    """D14: 같은 DB 에 살아있는 다른 코디네이터(리더 lease 보유)가 있어 기동을 거부한다.
+    in-process actor 직렬화는 프로세스당이라, 한 DB 에 코디네이터 둘 = writer 둘 = SINGULON
+    무효. 단일 인스턴스 전용을 *명시적으로 강제*(§D14)."""
 
 
 class _IdemSlot:
@@ -67,13 +79,30 @@ class Coordinator:
     def __init__(self, db_path: str = ":memory:", repo: str | None = None,
                  worktrees_dir: str | None = None, agent_ttl: float | None = 90.0,
                  events=None, integration_branch: str | None = None,
-                 merge_timeout: float | None = None):
+                 merge_timeout: float | None = None, *,
+                 coordinator_id: str | None = None, leader_ttl: float = LEADER_TTL_S,
+                 allow_memory_db: bool = False):
+        # §D14: `:memory:` 디폴트 금지 — 재기동마다 모든 fence/leader_epoch 가 0 으로 리셋되어
+        # 낡은 토큰/잔여 merge 와 충돌(고스트 writer). 영속 DB 필수. 단위테스트는 allow_memory_db=
+        # True 로 명시 opt-in(프로세스 1개, 재기동 없음 — fence 리셋 위험 없음).
+        if db_path == ":memory:" and not allow_memory_db:
+            raise ValueError(
+                "OMD requires a persistent DB path (got ':memory:'). An in-memory DB "
+                "resets fence/leader epoch to 0 on every restart, colliding with stale "
+                "tokens. Pass a file path, or allow_memory_db=True for single-process tests.")
         self.store = Store(db_path)
+        self.coordinator_id = coordinator_id or f"coord-{uuid.uuid4().hex[:12]}"
+        self.leader_ttl = leader_ttl
+        self.leader_epoch = None  # 리더 lease 획득 후 채워짐(현 리더 세대)
         # heartbeat 만료 시 좀비 회수. 기본 ON(P0-7) — None=비활성. 끄면 죽은 물방울의
         # 궤도/작업이 영구 고아가 된다(사용자 핵심 우려). 권장 90s, renew는 TTL/3 주기.
         self.agent_ttl = agent_ttl
         self.events = events or NOOP
         self._lock = threading.RLock()  # 프로세스내 단일 writer(actor 대용) — D1
+        # §D14: 리더 lease 획득 — 살아있는 다른 코디네이터가 있으면 CoordinatorConflict 거부.
+        # 이 호출 *전*엔 어떤 변이도(특히 _recover 의 git↔DB 조정) 하면 안 된다(writer 둘 방지).
+        # _lock/events/store 가 필요하므로 그것들 뒤에 둔다.
+        self._acquire_leadership()
         self.merge_timeout = merge_timeout if merge_timeout is not None else MERGE_TIMEOUT_S
         self.git = GitRepo(repo) if repo else None
         self.integration_branch = integration_branch
@@ -92,14 +121,97 @@ class Coordinator:
 
     # ---- 임계구역 / 이벤트 ----
     @contextmanager
-    def _cs(self):
-        """단일 writer 직렬화(RLock) + 원자 트랜잭션(BEGIN IMMEDIATE). 재진입 안전."""
+    def _cs(self, *, leader_guard=True):
+        """단일 writer 직렬화(RLock) + 원자 트랜잭션(BEGIN IMMEDIATE). 재진입 안전.
+        §D14: 트랜잭션을 연 직후 leader-fence 검사 — 다른 코디네이터가 takeover 했으면(우리가
+        좀비 리더) CoordinatorConflict 로 거부해 writer 둘이 한 DB 를 변이하는 것을 막는다.
+        leader_guard=False 는 리더십 *획득 중*(아직 epoch 미설정)에만 쓴다."""
         with self._lock:
             with self.store.tx():
+                if leader_guard and self.leader_epoch is not None:
+                    self._assert_leader()
                 yield
 
     def _emit(self, event, cid, **attrs):
         self.events.emit(event, cid, **attrs)
+
+    # ---- D14 코디네이터 singleton / HA 입장 (§D14) ----
+    def _acquire_leadership(self):
+        """기동 시 리더 lease 획득. 살아있는 다른 코디네이터(heartbeat 가 TTL 안)가 있으면
+        CoordinatorConflict 로 거부 — 한 DB 에 코디네이터 둘(=writer 둘)을 막는다.
+        죽은(=heartbeat 가 TTL 초과한) 리더는 takeover(epoch +1 로 fence — 옛 리더가 GC-pause
+        뒤 깨어나 변이하려 해도 stale leader_epoch 로 차단). CAS 는 _cs(BEGIN IMMEDIATE) 안에서
+        돌아 동시 기동 둘 중 하나만 성공한다(멀티프로세스 row-lock + 단일 writer)."""
+        with self._cs():
+            now = time.time()
+            cur = self.store.get_leader()
+            if cur is not None:
+                # liveness 는 **incumbent 가 선언한 TTL** 로 판정(레코드에 저장된 ttl) — 신규자
+                # 자기 TTL 로 보면 안 됨. 레코드에 ttl 없으면(구버전) 신규자 TTL 로 폴백.
+                inc_ttl = cur.get("ttl", self.leader_ttl)
+                alive = (now - cur.get("last_heartbeat", 0)) <= inc_ttl
+                if alive and cur.get("coordinator_id") != self.coordinator_id:
+                    # 살아있는 다른 리더 — 거부(단일 인스턴스 강제).
+                    self._emit("leader_conflict", self.coordinator_id,
+                               incumbent=cur.get("coordinator_id"),
+                               last_heartbeat=cur.get("last_heartbeat"))
+                    raise CoordinatorConflict(
+                        f"another live coordinator holds the leader lease "
+                        f"(incumbent={cur.get('coordinator_id')}, "
+                        f"epoch={cur.get('epoch')}); refusing to start a second "
+                        f"coordinator on the same DB (§D14 single-instance).")
+            prev_epoch = cur["epoch"] if cur else None
+            new_epoch = (cur["epoch"] + 1) if cur else 1
+            lease = {"coordinator_id": self.coordinator_id, "epoch": new_epoch,
+                     "started_at": now, "last_heartbeat": now, "ttl": self.leader_ttl}
+            if not self.store.cas_leader(prev_epoch, lease):
+                # 다른 코디네이터가 우리 검사~CAS 사이에 끼어들어 lease 를 가져감 — 거부.
+                raise CoordinatorConflict(
+                    "leader lease was taken concurrently during startup (§D14).")
+            self.leader_epoch = new_epoch
+            self._emit("leader_acquired", self.coordinator_id, epoch=new_epoch,
+                       took_over_from=(cur.get("coordinator_id") if cur else None),
+                       took_over=(cur is not None))
+
+    def _assert_leader(self):
+        """현 프로세스가 여전히 리더인지 확인(다른 코디네이터가 takeover 했으면 fence-out).
+        리더 lease 가 우리 epoch/id 가 아니면 우리는 좀비 리더 — 어떤 변이도 하면 안 된다.
+        _cs() 안에서 변이 직전 호출(write-fence)."""
+        cur = self.store.get_leader()
+        if (cur is None or cur.get("coordinator_id") != self.coordinator_id
+                or cur.get("epoch") != self.leader_epoch):
+            self._emit("leader_fenced_out", self.coordinator_id,
+                       my_epoch=self.leader_epoch,
+                       current=(cur.get("epoch") if cur else None))
+            raise CoordinatorConflict(
+                f"coordinator {self.coordinator_id} (epoch={self.leader_epoch}) is no "
+                f"longer leader — another coordinator took over. Refusing to mutate.")
+
+    def coordinator_heartbeat(self) -> dict:
+        """리더 lease keepalive(권장 주기 = leader_ttl/3). 먼저 우리가 여전히 리더인지 확인
+        (takeover 됐으면 거부) → last_heartbeat 갱신. 이걸 멈추면(프로세스 사망/hang) TTL 후
+        다른 코디네이터가 takeover 할 수 있다(영구 점유 불가)."""
+        with self._cs():
+            self._assert_leader()
+            cur = self.store.get_leader()
+            cur["last_heartbeat"] = time.time()
+            self.store.write_leader(cur)
+            return {"ok": True, "coordinator_id": self.coordinator_id,
+                    "epoch": self.leader_epoch}
+
+    def resign(self) -> dict:
+        """자발적 리더십 반납(graceful shutdown). lease 를 비워(epoch 유지) 다음 코디네이터가
+        TTL 대기 없이 즉시 takeover. 우리가 리더가 아니면 no-op."""
+        with self._cs():
+            cur = self.store.get_leader()
+            if cur is None or cur.get("coordinator_id") != self.coordinator_id:
+                return {"ok": True, "noop": True}
+            # last_heartbeat=0 으로 만들어 즉시 만료 처리(epoch 는 보존 → 다음 리더가 +1).
+            cur["last_heartbeat"] = 0
+            self.store.write_leader(cur)
+            self.leader_epoch = None
+            self._emit("leader_resigned", self.coordinator_id)
+            return {"ok": True, "coordinator_id": self.coordinator_id}
 
     # ---- 내부 (모두 임계구역 안에서 호출됨) ----
     def _conflicts(self, pathspec, mode) -> list[str]:
@@ -116,10 +228,12 @@ class Coordinator:
         for o in self.store.pending_orbits():  # 우선순위 DESC → FIFO
             if not self._conflicts(json.loads(o["pathspec"]), o["mode"]):
                 fence = self.store.next_fence()
+                # §D12: PENDING read-궤도가 뒤늦게 grant 될 때도 현 통합 gen 을 박는다.
+                rg = self.store.integration_gen() if o["mode"] == "read" else ...
                 self.store.set_orbit(
                     o["orbit_id"],
                     state=fsm.advance("orbit", "PENDING", "grant"),
-                    expires_at=time.time() + 600, fence=fence)
+                    expires_at=time.time() + 600, fence=fence, read_gen=rg)
                 self._emit("orbit_granted", o["agent_id"], orbit_id=o["orbit_id"],
                            fence=fence, mode=o["mode"], promoted=True)
 
@@ -298,6 +412,10 @@ class Coordinator:
             # merging pin은 회수와 함께 해제(§E pin은 유계 — 보유자 사망도 한 경계).
             self.store.set_orbit(o["orbit_id"], state=fsm.advance("orbit", o["state"], trig),
                                  merging=0)
+            # §D12: 회수되는 read-궤도의 stale 신호 플래그도 청산(LIVE 누수 방지). 보유자가
+            # 죽었으므로 connect 차단은 어차피 부활차단(bail_epoch)이 맡는다.
+            if o["mode"] == "read":
+                self._clear_read_stale_signal(o["orbit_id"])
             freed.append(o["orbit_id"])
             self._emit("orbit_released", agent_id, orbit_id=o["orbit_id"],
                        reason="bail" if voluntary else "reclaim")
@@ -552,6 +670,147 @@ class Coordinator:
                                      state=fsm.advance("orbit", "HELD", "release"),
                                      released_at=time.time(), merging=0, merge_deadline=None)
 
+    # ---- D12 read-set 코히런스 (§D12, 유령 읽기) ----
+    def _merged_write_globs(self, task_id) -> list[str]:
+        """방금 응결된 task 가 통합 브랜치에 추가/변경한 경로 글로브. 권위 소스는 그 task 의
+        claimed write-set(이미 P0-11 감사로 *실제* write-set == 선언 write-set 이 강제됨).
+        repo 가 있으면 실제 changed_paths(구체 경로)도 합쳐 더 정밀히 — 둘 다 overlap 판정에 쓴다."""
+        globs = []
+        t = self.store.get_task(task_id)
+        if t:
+            try:
+                globs.extend(json.loads(t["writes"] or "[]"))
+            except (TypeError, ValueError):
+                pass
+        # write-orbit pathspec(해제 직전에 부르므로 아직 잡을 수 있을 때 합집합) 도 포함.
+        for o in self.store.orbits_for_task(task_id):
+            if o["mode"] == "write":
+                globs.extend(json.loads(o["pathspec"]))
+        return list(dict.fromkeys(globs))  # 중복 제거(순서 보존)
+
+    def _mark_stale_reads(self, merged_task_id, new_gen, merged_globs=None):
+        """응결(merge)이 통합을 new_gen 으로 전진시켰다. 이 응결이 추가/변경한 경로와 **겹치는**
+        live HELD read-궤도(자기보다 옛 gen 에서 분기) 를 stale=1 로 표시 → 그 consumer 는
+        connect 전 rebase/재독 강제(§D12). 신호는 D3 EPHEMERAL 플래그/이벤트로(consumer 가 안다).
+        주: read↔write 배타성 때문에 *live* read-궤도가 겹치는 일은 드물다(연속점유 시) — 주된
+        코히런스 게이트는 connect 의 merge_log 검사다. 이건 그 보조(즉시 신호)다."""
+        if merged_globs is None:
+            merged_globs = self._merged_write_globs(merged_task_id)
+        if not merged_globs:
+            return []
+        affected = []
+        for r in self.store.live_read_orbits():
+            if r["task_id"] == merged_task_id:
+                continue  # 자기 자신의 read 는 무관
+            if r["stale"]:
+                continue  # 이미 표시됨(멱등)
+            # read 가 분기한 gen 이 이번 응결 *이전*이어야 유령(이후면 이미 본 것). None=보수적 표시.
+            rg = r["read_gen"]
+            if rg is not None and rg >= new_gen:
+                continue
+            if sets_overlap(json.loads(r["pathspec"]), merged_globs):
+                self.store.set_orbit(r["orbit_id"], stale=1)
+                self._emit("read_stale", r["agent_id"], orbit_id=r["orbit_id"],
+                           task=r["task_id"], by_task=merged_task_id, gen=new_gen)
+                # D3 이벤트/플래그 신호: consumer 가 자기 read-coherence 키로 flag_wait 관측 가능.
+                # epoch 는 보존·증가(이전 refresh 가 CLEARED 로 만든 뒤 재-stale 도 단조 전진) →
+                # 옛 epoch 로 register 한 대기자가 깨어난다(§D3 register→poll).
+                key = self._read_stale_key(r["orbit_id"])
+                prev = self.store.get_flag_row(key)
+                epoch = (prev["epoch"] + 1) if prev else 0
+                self.store.upsert_flag(
+                    key, value=str(new_gen), set_by=merged_task_id,
+                    flag_type="LATCH", rank=0, status="LIVE", epoch=epoch)
+                self._wake_flag_waiters(key)
+                affected.append(r["orbit_id"])
+        return affected
+
+    def _ghost_reads(self, task) -> list[str]:
+        """task 의 선언 reads 와 겹치는, read_synced_gen *이후*의 응결 write-globs(유령 읽기).
+        read 를 한 적 없는(read_synced_gen=None) task 는 코히런스 대상 아님 → 빈 리스트.
+        궤도를 release 해도 read_synced_gen 이 task 에 남으므로 read↔write 배타성을 안 깨고
+        consumer connect 시점에 정확히 판정한다(§D12)."""
+        if task is None:
+            return []
+        synced = task["read_synced_gen"]
+        if synced is None:
+            return []  # 이 task 는 read claim 을 한 적 없음 — 코히런스 무관
+        try:
+            reads = json.loads(task["reads"] or "[]")
+        except (TypeError, ValueError):
+            reads = []
+        if not reads:
+            return []
+        ghost = []
+        for m in self.store.merges_since(synced):
+            if m["task_id"] == task["task_id"]:
+                continue  # 자기 자신의 응결은 무관
+            try:
+                mglobs = json.loads(m["globs"])
+            except (TypeError, ValueError):
+                mglobs = []
+            if sets_overlap(reads, mglobs):
+                # 겹치는 응결의 globs 중 reads 와 실제로 교차하는 것만 보고(진단성).
+                ghost.extend(g for g in mglobs if sets_overlap(reads, [g]))
+        return list(dict.fromkeys(ghost))  # 중복 제거(순서 보존)
+
+    @staticmethod
+    def _read_stale_key(orbit_id) -> str:
+        """consumer 가 자기 read-궤도의 stale 신호를 flag_wait 로 관측하는 D3 플래그 키(§D12)."""
+        return f"read_stale:{orbit_id}"
+
+    def _clear_read_stale_signal(self, orbit_id):
+        """read-궤도가 refresh/회수되면 그 stale 신호 플래그를 CLEARED + epoch +1(대기자 기상).
+        flag 가 LIVE 로 영구 잔존(누수)하지 않게 한다."""
+        key = self._read_stale_key(orbit_id)
+        f = self.store.get_flag_row(key)
+        if f is not None and f["status"] == "LIVE":
+            self.store.set_flag_status(key, status="CLEARED", epoch=f["epoch"] + 1)
+            self._wake_flag_waiters(key)
+
+    def read_refresh(self, task_id, agent_id, fence, *, request_id=None, bail_epoch=None):
+        """consumer 가 rebase/재독을 마쳤다고 선언 → task 의 read-set 동기화 gen 을 현 통합 gen
+        으로 재앵커(+ 살아있는 read-궤도가 있으면 stale 해제·재앵커) (§D12). **task 중심**: read 를
+        읽고 release 한 뒤(read↔write 배타라 producer 가 그 영역을 쓰려면 read 가 비어야 함)에도
+        코히런스가 task 에 남으므로, 이 동사가 그 task 차원 동기화를 갱신한다.
+        소유+fence 가드 — connect 와 동일하게 caller 가 그 task 의 write-orbit (agent,fence)를
+        쥐고 있어야(남의 task 를 못 재앵커). 물방울 계약: connect 가 read_stale 로 거부되면
+        worktree 를 통합 최신으로 rebase 한 뒤 이 동사로 청산하고 다시 connect 한다."""
+        with self._cs():
+            with self._idem(request_id, agent_id, "read_refresh",
+                            [task_id, fence]) as cache:
+                if cache.hit:
+                    return cache.value
+                dead = self._check_alive(agent_id, bail_epoch)
+                if dead:
+                    return cache.set(dead)
+                t = self.store.get_task(task_id)
+                if t is None:
+                    return cache.set({"ok": False, "reason": "no such task"})
+                # 소유+fence: caller 가 이 task 의 HELD write-orbit 을 (agent,fence)로 쥐어야.
+                writes = [o for o in self.store.orbits_for_task(task_id)
+                          if o["mode"] == "write"]
+                live = [o for o in writes if o["state"] == "HELD"]
+                if not live:
+                    return cache.set({"ok": False, "reason": "no held write orbit for task",
+                                      "fenced_out": True})
+                if agent_id is not None and any(o["agent_id"] != agent_id for o in live):
+                    return cache.set({"ok": False, "reason": "not owner",
+                                      "fenced_out": True})
+                if fence is not None and all(o["fence"] != fence for o in live):
+                    return cache.set({"ok": False, "reason": "stale fence",
+                                      "fenced_out": True})
+                gen = self.store.integration_gen()
+                self.store.set_task(task_id, read_synced_gen=gen)
+                # 살아있는 read-궤도가 있으면(release_read=False 경로) 그것도 재앵커+stale 해제.
+                for o in self.store.orbits_for_task(task_id):
+                    if o["mode"] == "read" and o["state"] == "HELD":
+                        self.store.set_orbit(o["orbit_id"], read_gen=gen, stale=0)
+                        self._clear_read_stale_signal(o["orbit_id"])
+                self._emit("read_refreshed", agent_id, task=task_id, gen=gen)
+                return cache.set({"ok": True, "task_id": task_id, "read_gen": gen,
+                                  "stale": False})
+
     # ---- 공개 API (= MCP 툴 / CLI 동사) ----
     def declare(self, task_id, *, name="", writes=None, reads=None, deps=None, priority=0):
         with self._cs():
@@ -638,10 +897,23 @@ class Coordinator:
                     self._emit("orbit_pending", agent_id, orbit_id=oid, conflicts=len(conf))
                     return cache.set({"orbit_id": oid, "state": "PENDING", "conflicts": conf})
                 fence = self.store.next_fence()
+                # §D12: read-궤도는 분기한 통합 generation 을 박는다 — 이후 겹치는 응결이
+                # 이보다 새 gen 을 만들면 stale 로 표시돼 consumer 가 옛 base 위에 빌드하는 것을 막는다.
+                read_gen = self.store.integration_gen() if mode == "read" else None
                 oid = self.store.add_orbit(task_id=task_id, agent_id=agent_id, pathspec=pathspec,
                                            mode=mode, state="HELD", fence=fence,
                                            expires_at=time.time() + ttl, reason=reason,
-                                           priority=priority, intent_key=ikey)
+                                           priority=priority, intent_key=ikey,
+                                           read_gen=read_gen)
+                # §D12: read claim 은 그 task 의 read-set 동기화 gen 을 박는다(궤도 생명과 분리 —
+                # 궤도를 release 한 뒤에도 consumer 의 connect 가 코히런스를 검사하도록). 여러 read
+                # 를 claim 하면 가장 옛 gen(보수적)로 고정한다.
+                if mode == "read" and task_id is not None:
+                    t = self.store.get_task(task_id)
+                    if t is not None:
+                        prev = t["read_synced_gen"]
+                        if prev is None or read_gen < prev:
+                            self.store.set_task(task_id, read_synced_gen=read_gen)
                 self._emit("orbit_granted", agent_id, orbit_id=oid, fence=fence, mode=mode)
                 be = self.store.get_agent(agent_id)
                 return cache.set({"orbit_id": oid, "state": "HELD", "fence": fence,
@@ -967,6 +1239,21 @@ class Coordinator:
                            offending=offending)
                 return {"ok": False, "reason": "writeset_violation", "offending": offending,
                         "claimed": write_globs, "task_id": task_id}
+            # §D12 read-set 코히런스 — 유령 읽기 차단. consumer 가 자기 read-set 을 동기화한
+            # gen(read_synced_gen) *이후* 통합에 들어온 응결 중 자기 선언 reads 와 겹치는 게
+            # 있으면 = 옛 base 위에 *조용히* 빌드(머지는 성공하되 로직이 틀림) → connect 거부.
+            # 토큰 잡기 **전**에 검사(거부 시 토큰 쥐었다 반납하는 낭비/경합 회피).
+            # 물방울 계약: rebase/재독 → read_refresh() 로 청산 후 재시도.
+            ghost = self._ghost_reads(t)
+            stale_orbits = [o["orbit_id"] for o in
+                            self.store.stale_read_orbits_for_task(task_id)]
+            if ghost or stale_orbits:
+                self._emit("connect_rejected", task_id, reason="read_stale",
+                           ghost_globs=ghost, stale_reads=stale_orbits)
+                return {"ok": False, "reason": "read_stale", "task_id": task_id,
+                        "ghost_globs": ghost, "stale_reads": stale_orbits,
+                        "hint": "rebase onto integration tip, then read_refresh() your "
+                                "read orbit(s) before retrying connect"}
             # merge_token(repo-wide Semaphore max=1) — 가용 아니면 retry(다른 connect 응결중).
             owner = agent_id or t["agent_id"] or f"connect:{task_id}"
             token_id = self._acquire_merge_token_locked(owner)
@@ -1031,14 +1318,24 @@ class Coordinator:
             # 성공: P0-6 순서 — merge_sha 먼저 기록 → MERGED → write-orbit 해제(+unpin).
             self.store.set_task(task_id, merge_sha=merge_sha, merged_at=time.time())
             self.store.set_task(task_id, state=fsm.advance("task", "CONNECTING", "merged"))
+            # §D12: 통합 generation 전진 + 겹치는 live read-궤도 stale 표시(write-orbit 해제
+            # **전** — pathspec 이 아직 잡힐 때 글로브를 모은다).
+            new_gen = self.store.bump_integration_gen()
+            merged_globs = self._merged_write_globs(task_id)
+            # merge_log: 이 gen 에 통합으로 들어간 write-globs 기록 — consumer 가 release 한 뒤에도
+            # connect 에서 자기 read-set 코히런스를 검사할 수 있게(궤도 생명과 분리, §D12).
+            self.store.append_merge_log(new_gen, task_id, merged_globs)
+            stale_reads = self._mark_stale_reads(task_id, new_gen, merged_globs)
             self._release_task_write_orbits(task_id)
             self._release_merge_token_locked(token_id)
             if self.git and intent.get("worktree"):
                 self.git.remove_worktree(intent["worktree"])
             self.store.set_flag(task_id, "merged")
-            self._emit("connect_merged", task_id, merge_sha=merge_sha)
+            self._emit("connect_merged", task_id, merge_sha=merge_sha,
+                       gen=new_gen, stale_reads=len(stale_reads))
             self._promote_pending()
-            return {"ok": True, "task_id": task_id, "state": "MERGED", "merge_sha": merge_sha}
+            return {"ok": True, "task_id": task_id, "state": "MERGED", "merge_sha": merge_sha,
+                    "gen": new_gen, "stale_reads": stale_reads}
 
     # ---- D3 플래그: EPHEMERAL(=lease) vs LATCH(영속·단조) (§D3, §1.2, §3.H) ----
     def _flag_satisfied(self, frow, want) -> bool:
