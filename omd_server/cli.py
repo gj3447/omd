@@ -73,6 +73,17 @@ def main(argv=None):
     fw.add_argument("timeout", type=float); fw.add_argument("--agent")
     fp = sub.add_parser("flag-wait-poll"); fp.add_argument("waiter_id")
 
+    # D5 배리어: 세대-스탬프 응결 랑데부. 멤버십=task 집합, 사망/타임아웃→BROKEN.
+    bd = sub.add_parser("barrier-declare"); bd.add_argument("name")
+    bd.add_argument("task_ids", nargs="+"); bd.add_argument("--kind", default="connect")
+    bd.add_argument("--policy", default="break"); bd.add_argument("--timeout", type=float)
+    ba = sub.add_parser("barrier-arrive"); ba.add_argument("name"); ba.add_argument("agent")
+    ba.add_argument("task"); ba.add_argument("--fence", type=int)
+    ba.add_argument("--request-id"); ba.add_argument("--bail-epoch", type=int)
+    bab = sub.add_parser("barrier-abort"); bab.add_argument("name"); bab.add_argument("--agent")
+    bab.add_argument("--request-id"); bab.add_argument("--bail-epoch", type=int)
+    bs = sub.add_parser("barrier-status"); bs.add_argument("name")
+
     sub.add_parser("sweep")
     sub.add_parser("status")
 
@@ -119,6 +130,14 @@ def main(argv=None):
         "flag-wait": lambda: omd.flag_wait(a.key, a.want, a.timeout,
                                            getattr(a, "agent", None)),
         "flag-wait-poll": lambda: omd.flag_wait_poll(a.waiter_id),
+        "barrier-declare": lambda: omd.barrier_declare(a.name, a.task_ids, kind=a.kind,
+                                                       policy=a.policy, timeout=a.timeout),
+        "barrier-arrive": lambda: omd.barrier_arrive(a.name, a.agent, a.task,
+                                                     fence=getattr(a, "fence", None),
+                                                     request_id=rid(), bail_epoch=be()),
+        "barrier-abort": lambda: omd.barrier_abort(a.name, getattr(a, "agent", None),
+                                                   request_id=rid(), bail_epoch=be()),
+        "barrier-status": lambda: omd.barrier_status(a.name),
         "sweep": lambda: omd.sweep(),
         "status": lambda: omd.status(),
     }[a.cmd]()

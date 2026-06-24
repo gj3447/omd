@@ -38,6 +38,19 @@ TASK_TRANSITIONS = [
 ]
 
 
+# 증분8(§D5): 응결 랑데부 배리어. 세대-스탬프 + BROKEN 종단.
+#   ARMED → TRIPPING → TRIPPED → CONSUMED  ⊕  (any non-terminal) → BROKEN
+# 참가자 사망(도착 전/후)·타임아웃 → break → 도착해 있던 전원이 BROKEN 으로 기상(영구 hang 0).
+BARRIER_STATES = ["ARMED", "TRIPPING", "TRIPPED", "CONSUMED", "BROKEN"]
+BARRIER_TRANSITIONS = [
+    {"trigger": "fill", "source": "ARMED", "dest": "TRIPPING"},      # 전원 도착 → 응결 시작
+    {"trigger": "trip", "source": "TRIPPING", "dest": "TRIPPED"},    # 응결 완료(전 task MERGED)
+    {"trigger": "consume", "source": "TRIPPED", "dest": "CONSUMED"}, # 결과 수거
+    # BROKEN: 비종단 어디서든(사망/타임아웃/abort). 한 번 깨지면 전원 BROKEN 으로 기상.
+    {"trigger": "break_", "source": ["ARMED", "TRIPPING"], "dest": "BROKEN"},
+]
+
+
 class _M:
     """state 속성만 갖는 빈 모델."""
 
@@ -51,9 +64,17 @@ def _machine(states, transitions, state):
     return m
 
 
+def _spec(kind):
+    if kind == "orbit":
+        return ORBIT_STATES, ORBIT_TRANSITIONS
+    if kind == "barrier":
+        return BARRIER_STATES, BARRIER_TRANSITIONS
+    return TASK_STATES, TASK_TRANSITIONS
+
+
 def advance(kind: str, state: str, trigger: str) -> str:
     """(kind, 현재 state)에서 trigger 적용 → 새 state. 불법 전이면 MachineError."""
-    states, trans = (ORBIT_STATES, ORBIT_TRANSITIONS) if kind == "orbit" else (TASK_STATES, TASK_TRANSITIONS)
+    states, trans = _spec(kind)
     m = _machine(states, trans, state)
     getattr(m, trigger)()
     return m.state

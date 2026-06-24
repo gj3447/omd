@@ -570,8 +570,86 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
   4. **permit 은 fence 를 받지만 strict-fence 재검증 동사는 release 뿐** — acquire/reuse 는 owner 기준(같은 agent). renew 전용 동사는 안 만들고 heartbeat 로 TTL 연장(§D2 의 'heartbeat 한 번이 모든 hb_bound lease 갱신' 패턴). permit 개별 renew 가 필요하면 P2.
 - **남은 부채**: P0 전부 닫힘(증분1~4). 미구현 = **D5 배리어**(세대-스탬프+BROKEN) · D12 read-set 코히런스 · D14 HA 입장 — 전부 설계만(P1/P2). (D4 = 증분7, D3 = 증분6, D6 잔여+D9 = 증분5 에서 닫힘.)
 
+### ✅ 증분 8 — D5 크래시 안전 배리어: 세대-스탬프 응결 랑데부 + BROKEN 종단 — DONE
+> 응결 랑데부(여러 task 가 한꺼번에 응결해야 하는 경우)의 크래시 안전 동기화. 좌석은 lease,
+> 참가자가 도착 전(또는 도착 후) 죽으면 배리어가 **BROKEN** 되어 도착해 있던 전원이 에러로
+> 기상한다(Java BrokenBarrierException / Python Barrier.abort 시맨틱). **영구 hang 불가**(§1.2/§D5).
+
+- **배리어 = 세대-스탬프 FSM**(`fsm.py` BARRIER_STATES/TRANSITIONS): `ARMED → TRIPPING → TRIPPED
+  → CONSUMED ⊕ (ARMED|TRIPPING) → BROKEN`. `advance("barrier", …)` 로 합법성 검증(orbit/task 와 동형).
+- **멤버십 = task 집합(요구된 수정)**(`core.py`): agent 수가 아니라 task 집합. reclaim 으로 task 가
+  requeue 되거나 write-lease 가 거둬지면(=참가자 사망) N 재계산/break/shrink. 참가자 생존 =
+  write-orbit(lease) 생존(§0 모델). `_party_alive` = (a) task 없음/ABORTED, (b) HELD write-orbit 없음
+  (lease 만료/해제), (c) 도착 후 fence 가 도착 시점과 달라짐(ABA) 중 하나면 사망.
+- **신규 동사**: `barrier_declare(name,task_ids,kind,policy,timeout)` · `barrier_arrive(name,agent,task,fence)` ·
+  `barrier_abort(name,agent)` · `barrier_status(name)`. server/cli 동반 노출.
+- **응결은 내부 `_barrier_connect_one(task, expected_fence)` 로 trip — 공개 `connect()` 재호출 금지(§D5
+  검증기 적발)**: 공개 connect 의 Phase A 는 `_sweep_inline` 을 부르는데, 그 sweep 가 방금 배리어가
+  검증한(만료 임박) 궤도를 트립 직전 재진입 만료시켜 fenced_out 으로 깰 수 있다. 그래서 트립은
+  **sweep 없는 Phase A'**(`_barrier_connect_phase_a`: write-orbit HELD ∧ fence==expected_fence 재검증 +
+  write-set 감사 + merge_token 획득 + pin) + **공유 Phase B**(락밖 merge) + **Phase C**(merge_sha 기록 →
+  MERGED → 해제 → 토큰반납) 를 직접 돈다. merge 는 락 밖(§3.B 한 계약 재사용).
+- **break/shrink(policy)**: `break`(기본) = 참가자 사망/타임아웃 시 전원 깸. `shrink` = 죽은 멤버를
+  빼고 N 재계산 후 진행 — **단 그 멤버에 의존하는 task 가 없을 때만**(`_task_dependents`); 의존자가
+  있으면 shrink 금지 → break(의존자가 미응결 base 위에 빌드하는 것 차단).
+- **trip 구동(§3.B 분할)**: `barrier_arrive` Phase A(락) = 도착 기록 + `_barrier_eval(can_trip=True)` →
+  전원 도착이면 fill(ARMED→TRIPPING) + 트립 plan(결정적 task_id 순서) 반환. 그 후 `_barrier_trip`
+  (락 밖)이 plan 의 각 task 를 `_barrier_connect_one` 으로 응결 → 전부 성공이면 TRIPPED, 하나라도
+  실패면 BROKEN. **sweep/reclaim/status 의 eval 은 `can_trip=False`**(break/shrink 만; fill 하면 TRIPPING
+  이 driver 없이 고아) — 그들은 사망/타임아웃 반영 전용.
+- **reclaim 단일루틴 통합(§1.1/§3.D)**: `_reclaim_agent_inline` 이 회수하는 agent 의 **모든** task 가 든
+  활성 배리어를 모아 재평가 — write-lease 가 이미 해제됐으므로 task 가 requeue 되든(IN_ORBIT) 안 되든
+  (이미 DONE) 참가자 사망이다 → break/shrink. bail/좀비회수 둘 다 수렴.
+- **타임아웃(영구 hang 방지)**: declare 의 `timeout` → deadline. deadline 지났는데 미도착 있으면
+  `_barrier_eval` 이 break('timeout'). 누군가 sweep(poll/status/arrive)하면 반영되므로 대기 측 hang 0.
+- **세대 재무장**: 같은 이름을 다시 declare 하면 다음 generation 으로 재무장(이전 세대가 종단일 때).
+  활성(ARMED/TRIPPING) 인스턴스는 재declare 거부(이중 무장 방지). generation 스탬프가 옛 세대의 유령
+  도착을 막는다(`barrier_parties` PK = (barrier_id, generation, task_id)).
+- **fence/owner 거부(§D6)**: `barrier_arrive` 는 `_check_alive`(회수된 좀비 차단) + arrive 시점
+  write-orbit fence capture; caller 가 `fence` 를 주면 `fence==cap` 재검증(stale=fenced_out, 도착 표시 안 함).
+- 스키마(신규 테이블 — fresh-DB·기존 DB 모두 `CREATE IF NOT EXISTS` 로 획득, ALTER 불필요): `barriers`
+  (name,generation,state,policy,deadline_at, UNIQUE(name,generation)) · `barrier_parties`(arrived,arrive_fence).
+  store: `add/get/set_barrier`·`barrier_by_name`·`add/get/set/del_barrier_party`·`barrier_parties`·
+  `barriers_with_task`·`all_barriers`.
+- 테스트(**153 passed, 1 skipped**; 신규 23 = `test_d5_barrier.py` + `gates/barrier.yaml`):
+  정상(declare/arm·미지 배리어·비멤버 거부·부분도착 대기·전원도착→trip→MERGED(DB-only **및** git 백엔드:
+  통합에 양쪽 파일+clean index+토큰누수0)·request_id 멱등) · fence/owner 거부(stale-fence·lease 거둬짐→break·
+  회수된 좀비 arrive 차단) · **크래시/사망/오추방 실패경로**(참가자 도착 **전** 사망→BROKEN+전원 기상 /
+  도착 **후** 사망→BROKEN / **좀비회수**(heartbeat 끊김)→BROKEN / **타임아웃**→BROKEN / abort→BROKEN+늦은
+  도착도 BROKEN) · policy(shrink 죽은멤버 제거(의존자 없을때)·shrink 의존자 있으면 break) · 세대 재무장
+  (BROKEN 후 gen+1·활성 재declare 거부) · **§D5 핵심**(트립 중 `_sweep_inline` 0회 — 검증한 궤도 재진입
+  만료 방지) · LTDD 트레이스(`barrier_declared→barrier_broken[participant_dead]` 순서 도착).
+- **변이검증(이빨 5건 실증, 복원함)**:
+  ① `_party_alive`→항상 True(사망 미검출) → 도착전/후 사망·좀비회수·shrink·LTDD **7건 RED**(영구 hang).
+  ② 타임아웃 break 가드 무력화 → deadline 지나도 ARMED 유지 → `test_timeout_breaks_barrier` RED.
+  ③ 트립을 공개 `connect()` 로 회귀(Phase A 가 `_sweep_inline` 부름) → `test_trip_phase_a_does_not_sweep` RED.
+  ④ shrink 의존자 가드 무력화(의존자 있어도 shrink) → `test_shrink_blocked_by_dependent_breaks` RED.
+  ⑤ arrive 의 `fence==cap` 거부 무력화 → stale-fence 도착이 통과 → `test_arrive_stale_fence_rejected` RED.
+  다섯 다 복원 후 153 green.
+- **deviation/한계(정직 표기)**:
+  1. **트립 plan 의 merge 는 결정적이되 sequential**(task_id 순서로 한 번에 한 task 응결). 각 응결은
+     merge_token(repo-wide max=1)으로 직렬화되므로 동시 트립이 통합 index 를 오염시키지 않는다(§D11 재사용).
+     trip 도중 하나가 실패(fence stale/merge 충돌)하면 이미 응결된 것은 그대로 두고(전진) 배리어를 BROKEN
+     으로 — 부분 트립 시 §3.D 처럼 생존자 rollback 까진 안 한다(이미 MERGED 는 단조 사실이라 되돌릴 수 없음;
+     배리어 BROKEN 신호로 호출자에게 반쪽 적용을 알린다). 정직: "전부-아니면-전무" 원자 트립은 아니다 —
+     merge 의 비가역성 때문(D8 도 개별 task 단위로 git 진실과 조정). 응결 순서 결정성 + merge_token 으로
+     index 오염은 막지만, k번째에서 깨지면 1..k-1 은 응결됨.
+  2. **periodic sweep 없음**(증분6/7 과 동일, §7 미해결) — 타임아웃/사망의 BROKEN 반영은 누군가
+     inline-sweep 동사(barrier_arrive/barrier_status/sweep/next_task 등)를 호출할 때 일어난다. 대기 참가자가
+     status/arrive 하면 반드시 반영되므로 영구 hang 없음. 백그라운드 tick 은 P2.
+  3. **CONSUMED 전이는 정의만**(FSM 에 trip→consume 있음) — 결과 수거 동사는 미구현(현재 TRIPPED 가
+     사실상 종단; barrier_status 로 관측). 필요해지면 P2.
+  4. **§3.D 재기동 복구의 배리어-bound CONNECTING 단위 처리는 미구현** — `_recover()` 는 여전히 task 를
+     개별로 git 진실과 조정한다(증분3). TRIPPING 중 크래시한 배리어를 *단위* 로(반쪽 트립→BROKEN+생존자
+     rollback) 복구하는 §3.D 의 수정은 이 증분 범위 밖(트립은 단일 프로세스에 묶여 재기동을 가로지르기
+     어렵고, 개별 task 복구가 안전 수렴은 함 — 단 BROKEN 신호 없이 반쪽 MERGED 가 될 수 있다는 §3.D 의
+     함정은 정직히 미해결로 남긴다). P1/P2.
+- **남은 부채**: P0 전부 닫힘(증분1~4). 미구현 = D12 read-set 코히런스 · D14 HA 입장 · §3.D 배리어
+  재기동 단위복구 — 전부 설계만(P1/P2). (D5 = 증분8, D4 = 증분7, D3 = 증분6, D6 잔여+D9 = 증분5 에서 닫힘.)
+
 ### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
-D5 배리어(세대-스탬프+BROKEN) · D12 read-set 코히런스 · D14 HA 입장. (P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6, D4 = 증분7 에서 닫힘.)
+D12 read-set 코히런스 · D14 HA 입장 · §3.D 배리어 재기동 단위복구. (P0-1~P0-11 = 증분1~4, D6 잔여+D9 =
+증분5, D3 = 증분6, D4 = 증분7, D5 = 증분8 에서 닫힘.)
 
 ---
 
