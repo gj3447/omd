@@ -99,6 +99,23 @@ CREATE TABLE IF NOT EXISTS idempotency (
   request_id TEXT PRIMARY KEY, agent_id TEXT, verb TEXT, arg_hash TEXT,
   status TEXT NOT NULL, response TEXT, created_at REAL, completed_at REAL
 );
+-- 증분8(§D5): 응결 랑데부 배리어. 세대(generation) 스탬프 + BROKEN 종단. 멤버십은 agent 수가
+-- 아니라 **task 집합**(reclaim 으로 task 가 requeue 되면 N 재계산). 참가자 사망(도착 전/후)·
+-- 타임아웃 → break → 도착해 있던 전원이 BROKEN 으로 기상(영구 hang 0).
+CREATE TABLE IF NOT EXISTS barriers (
+  barrier_id TEXT PRIMARY KEY, name TEXT, kind TEXT, parties INTEGER,
+  generation INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, break_reason TEXT,
+  policy TEXT NOT NULL DEFAULT 'break', deadline_at REAL, created_at REAL,
+  UNIQUE(name, generation)
+);
+-- 각 (배리어,세대)의 참가 task. arrived=도착 여부, arrive_fence=도착 시점 write-orbit fence
+-- (응결 trip 직전 재검증 기준 — ABA 차단). owner stale=참가자 사망 판정.
+CREATE TABLE IF NOT EXISTS barrier_parties (
+  barrier_id TEXT, generation INTEGER, task_id TEXT, agent_id TEXT,
+  arrived INTEGER NOT NULL DEFAULT 0, arrive_fence INTEGER,
+  PRIMARY KEY(barrier_id, generation, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_barrier_parties_task ON barrier_parties(task_id);
 -- 단조 fence 카운터 시드(0). next_fence는 이 행을 in-statement로 +1 한다(읽고-쓰기 갭 없음).
 INSERT OR IGNORE INTO meta(key,value) VALUES('fence','0');
 """
@@ -546,6 +563,88 @@ class Store:
         return _rows(self.db.execute(
             "SELECT * FROM sem_waiters WHERE agent_id=? AND sem_id=? AND state='WAITING'",
             (agent_id, sem_id)))
+
+    # --- barriers (D5: 세대-스탬프 응결 랑데부, 멤버십=task 집합) ---
+    def add_barrier(self, *, barrier_id, name, kind, parties, generation, state,
+                    policy, deadline_at) -> None:
+        self.db.execute(
+            "INSERT INTO barriers(barrier_id,name,kind,parties,generation,state,policy,"
+            "deadline_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (barrier_id, name, kind, parties, generation, state, policy, deadline_at,
+             time.time()))
+
+    def get_barrier(self, barrier_id) -> dict | None:
+        return _row(self.db.execute(
+            "SELECT * FROM barriers WHERE barrier_id=?", (barrier_id,)))
+
+    def barrier_by_name(self, name) -> dict | None:
+        """이름으로 최신 세대 배리어 — arrive/abort 가 이름으로 찾는다. 한 이름은 세대마다
+        한 행(UNIQUE(name,generation)); 최신 세대가 활성 인스턴스."""
+        return _row(self.db.execute(
+            "SELECT * FROM barriers WHERE name=? ORDER BY generation DESC LIMIT 1", (name,)))
+
+    def set_barrier(self, barrier_id, *, state=..., break_reason=..., parties=...,
+                    deadline_at=...):
+        sets, args = [], []
+        for col, val in (("state", state), ("break_reason", break_reason),
+                         ("parties", parties), ("deadline_at", deadline_at)):
+            if val is not ...:
+                sets.append(f"{col}=?"); args.append(val)
+        if not sets:
+            return
+        args.append(barrier_id)
+        self.db.execute(f"UPDATE barriers SET {','.join(sets)} WHERE barrier_id=?", args)
+
+    def add_barrier_party(self, barrier_id, generation, task_id, agent_id=None):
+        self.db.execute(
+            "INSERT OR IGNORE INTO barrier_parties(barrier_id,generation,task_id,agent_id,"
+            "arrived,arrive_fence) VALUES(?,?,?,?,0,NULL)",
+            (barrier_id, generation, task_id, agent_id))
+
+    def barrier_parties(self, barrier_id, generation) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM barrier_parties WHERE barrier_id=? AND generation=? "
+            "ORDER BY task_id", (barrier_id, generation)))
+
+    def get_barrier_party(self, barrier_id, generation, task_id) -> dict | None:
+        return _row(self.db.execute(
+            "SELECT * FROM barrier_parties WHERE barrier_id=? AND generation=? AND task_id=?",
+            (barrier_id, generation, task_id)))
+
+    def set_barrier_party(self, barrier_id, generation, task_id, *, arrived=...,
+                          arrive_fence=..., agent_id=...):
+        sets, args = [], []
+        for col, val in (("arrived", arrived), ("arrive_fence", arrive_fence),
+                         ("agent_id", agent_id)):
+            if val is not ...:
+                sets.append(f"{col}=?"); args.append(val)
+        if not sets:
+            return
+        args.extend([barrier_id, generation, task_id])
+        self.db.execute(
+            f"UPDATE barrier_parties SET {','.join(sets)} WHERE barrier_id=? "
+            f"AND generation=? AND task_id=?", args)
+
+    def del_barrier_party(self, barrier_id, generation, task_id):
+        self.db.execute(
+            "DELETE FROM barrier_parties WHERE barrier_id=? AND generation=? AND task_id=?",
+            (barrier_id, generation, task_id))
+
+    def barriers_with_task(self, task_id, generation_match=True) -> list[dict]:
+        """이 task 를 (현재 세대) 멤버로 가진 비종단 배리어들 — reclaim 이 task 를 requeue 할 때
+        영향받는 배리어를 찾는다(멤버십=task 집합, N 재계산/break/shrink)."""
+        rows = _rows(self.db.execute(
+            "SELECT DISTINCT b.* FROM barriers b JOIN barrier_parties p "
+            "ON b.barrier_id=p.barrier_id AND b.generation=p.generation "
+            "WHERE p.task_id=? AND b.state IN ('ARMED','TRIPPING')", (task_id,)))
+        return rows
+
+    def all_barriers(self, states=None) -> list[dict]:
+        if states:
+            q = ",".join("?" * len(states))
+            return _rows(self.db.execute(
+                f"SELECT * FROM barriers WHERE state IN ({q})", list(states)))
+        return _rows(self.db.execute("SELECT * FROM barriers"))
 
     def pinned_orbits_for_task(self, task_id) -> list[dict]:
         return _rows(self.db.execute(

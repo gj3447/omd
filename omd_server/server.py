@@ -166,6 +166,33 @@ def build_server(db_path: str = "omd.db"):
         return omd.sem_status(sem)
 
     @mcp.tool()
+    def barrier_declare(name: str, task_ids: list[str], kind: str = "connect",
+                        policy: str = "break", timeout: float | None = None) -> dict:
+        """응결 랑데부 배리어 선언/재무장(§D5). 멤버십=task 집합(reclaim 으로 requeue 되면 N 재계산).
+        전원 도착 → 결정적 순서로 응결(merge) → TRIPPED. 참가자 사망/타임아웃 → BROKEN(전원 기상).
+        policy='break'(전원 깸) | 'shrink'(죽은 멤버 빼고 진행, 의존자 없을 때만)."""
+        return omd.barrier_declare(name, task_ids, kind=kind, policy=policy, timeout=timeout)
+
+    @mcp.tool()
+    def barrier_arrive(name: str, agent: str, task: str, fence: int | None = None,
+                       request_id: str | None = None, bail_epoch: int | None = None) -> dict:
+        """참가자 도착(§D5). task 가 응결 준비됨(write-orbit HELD)을 표시. 전원 도착하면 trip
+        (전 task 응결 후 TRIPPED). 사망/타임아웃이면 BROKEN. fence 를 주면 arrive 시점 재검증."""
+        return omd.barrier_arrive(name, agent, task, fence=fence, request_id=request_id,
+                                  bail_epoch=bail_epoch)
+
+    @mcp.tool()
+    def barrier_abort(name: str, agent: str | None = None,
+                      request_id: str | None = None, bail_epoch: int | None = None) -> dict:
+        """배리어 강제 break(§D5, Barrier.abort 시맨틱) — 도착해 있던 전원 BROKEN 기상(영구 hang 방지)."""
+        return omd.barrier_abort(name, agent, request_id=request_id, bail_epoch=bail_epoch)
+
+    @mcp.tool()
+    def barrier_status(name: str) -> dict:
+        """배리어 현황(상태/세대/도착/참가) — 관측용. 내부 sweep 으로 사망/타임아웃 반영."""
+        return omd.barrier_status(name)
+
+    @mcp.tool()
     def heartbeat(agent: str) -> dict:
         """물방울 생존 신호. 끊기면(agent_ttl 초과) 좀비 회수로 궤도/작업 반환."""
         return omd.heartbeat(agent)
