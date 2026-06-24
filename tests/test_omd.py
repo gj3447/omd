@@ -45,7 +45,7 @@ def test_overlap_charclass_conservative():
 
 # ---- claim: 입체면 둘 다 HELD, 겹치면 두번째 PENDING ----
 def test_disjoint_claims_both_held():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     a = omd.claim("agentA", ["src/a/**"], "write")
     b = omd.claim("agentB", ["src/b/**"], "write")
     assert a["state"] == "HELD" and b["state"] == "HELD"
@@ -53,7 +53,7 @@ def test_disjoint_claims_both_held():
 
 
 def test_overlapping_write_claim_waits():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     omd.claim("agentA", ["src/a/**"], "write")
     c = omd.claim("agentC", ["src/a/login.py"], "write")
     assert c["state"] == "PENDING"
@@ -61,7 +61,7 @@ def test_overlapping_write_claim_waits():
 
 
 def test_read_read_coexists_but_write_blocks_read():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     omd.claim("r1", ["src/a/**"], "read")
     assert omd.claim("r2", ["src/a/**"], "read")["state"] == "HELD"
     assert omd.claim("w1", ["src/a/x.py"], "write")["state"] == "PENDING"
@@ -69,7 +69,7 @@ def test_read_read_coexists_but_write_blocks_read():
 
 # ---- TTL 만료 → 자동 회수 → 대기중 promote ----
 def test_expire_reclaims_and_promotes():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     held = omd.claim("agentA", ["src/a/**"], "write", ttl=0.05)
     waiting = omd.claim("agentC", ["src/a/**"], "write")
     assert waiting["state"] == "PENDING"
@@ -81,7 +81,7 @@ def test_expire_reclaims_and_promotes():
 
 # ---- fencing: 작업 중 lease 만료되면 connect 거부 ----
 def test_connect_rejects_stale_lease():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     omd.declare("T", writes=["src/a/**"])
     omd.next_task("agentA")
     omd.claim("agentA", ["src/a/**"], "write", ttl=0.05, task_id="T")
@@ -93,7 +93,7 @@ def test_connect_rejects_stale_lease():
 
 
 def test_connect_succeeds_when_lease_valid():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     omd.declare("T", writes=["src/a/**"])
     omd.next_task("agentA")
     omd.claim("agentA", ["src/a/**"], "write", ttl=600, task_id="T")
@@ -106,7 +106,7 @@ def test_connect_succeeds_when_lease_valid():
 
 # ---- next_task: 활성 궤도와 겹치는 작업은 건너뛰고 서로소만 ----
 def test_next_task_skips_overlapping():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     omd.declare("T1", writes=["src/a/**"])
     omd.declare("T2", writes=["src/a/util.py"])   # T1과 겹침
     omd.declare("T3", writes=["src/b/**"])         # 서로소
@@ -116,7 +116,7 @@ def test_next_task_skips_overlapping():
 
 
 def test_deadlock_denied():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     omd.claim("A", ["a/**"], "write")          # A가 a 점유
     omd.claim("B", ["b/**"], "write")          # B가 b 점유
     r1 = omd.claim("A", ["b/**"], "write")     # A는 B를 대기
@@ -126,7 +126,7 @@ def test_deadlock_denied():
 
 
 def test_promote_priority_order():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     h = omd.claim("H", ["a/**"], "write")
     lo = omd.claim("LO", ["a/**"], "write", priority=1)
     hi = omd.claim("HI", ["a/**"], "write", priority=5)
@@ -137,7 +137,7 @@ def test_promote_priority_order():
 
 
 def test_zombie_reclaim_requeues():
-    omd = Coordinator(agent_ttl=0.05)
+    omd = Coordinator(agent_ttl=0.05, allow_memory_db=True)
     omd.declare("T", writes=["a/**"])
     omd.next_task("agA")
     omd.claim("agA", ["a/**"], task_id="T")
@@ -152,7 +152,7 @@ def test_zombie_reclaim_requeues():
 
 
 def test_next_task_respects_deps():
-    omd = Coordinator()
+    omd = Coordinator(allow_memory_db=True)
     omd.declare("base", writes=["src/base/**"])
     omd.declare("dependent", writes=["src/x/**"], deps=["base"])
     # base 미완 → dependent 건너뜀, base 반환
