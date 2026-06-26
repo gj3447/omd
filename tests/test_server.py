@@ -3,7 +3,6 @@
 import sys
 from datetime import timedelta
 
-import anyio
 import pytest
 
 
@@ -17,6 +16,7 @@ def test_server_builds(tmp_path):
 def test_server_stdio_initializes_and_lists_tools(tmp_path):
     pytest.importorskip("fastmcp")
     pytest.importorskip("mcp")
+    anyio = pytest.importorskip("anyio")
 
     from mcp.client.session import ClientSession
     from mcp.client.stdio import StdioServerParameters, stdio_client
