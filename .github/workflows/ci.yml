@@ -54,6 +54,22 @@ jobs:
       - name: Install omd + pytest
         run: |
           pip install -e .
-          pip install pytest
+          pip install pytest hypothesis
       - name: Test
         run: pytest -q -rs
+
+  tla:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Cache TLA+ tools
+        uses: actions/cache@v4
+        with:
+          path: .tla-tools
+          key: tla2tools-latest
+      - name: Model check TLA+ specs
+        run: scripts/run_tlc.sh
