@@ -219,4 +219,7 @@ def build_server(db_path: str = "omd.db"):
 
 if __name__ == "__main__":
     import sys
-    build_server(sys.argv[1] if len(sys.argv) > 1 else "omd.db").run()
+    build_server(sys.argv[1] if len(sys.argv) > 1 else "omd.db").run(
+        show_banner=False,
+        log_level="WARNING",
+    )
