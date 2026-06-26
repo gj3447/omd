@@ -1169,10 +1169,11 @@ class Coordinator:
                     return dict(out, replayed=True) if isinstance(out, dict) else out
 
         # 멱등(P0-9/D9): 이미 응결된 task는 재머지 없이 즉시 MERGED 회신.
-        t0 = self.store.get_task(task_id)
-        if t0 and t0["state"] == "MERGED":
-            return {"ok": True, "task_id": task_id, "state": "MERGED",
-                    "merge_sha": t0["merge_sha"], "noop": True}
+        with self._cs():
+            t0 = self.store.get_task(task_id)
+            if t0 and t0["state"] == "MERGED":
+                return {"ok": True, "task_id": task_id, "state": "MERGED",
+                        "merge_sha": t0["merge_sha"], "noop": True}
 
         deadline = time.time() + max(self.merge_timeout, 5.0) + 10.0
         while True:
