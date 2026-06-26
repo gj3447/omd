@@ -15,14 +15,14 @@ N개의 코딩 에이전트(물방울)를 **입체(서로소 write-set 궤도)**
 `사도 OMC(입체운행구름) → 군단장 OMD → 군단(병렬 에이전트 물방울들)`
 
 ## 상태
-**프로토타입 동작 (19 tests green).** 구현됨: 입체 glob 교집합 · SQLite lease+fence · Orbit/Task FSM · SINGULON 2지점 강제 · 실물 git worktree+CLOUD CONNECT(merge)+fencing · 좀비 회수 · 데드락 wait-for 사이클 감지 · 우선순위 promote · FastMCP 13툴 · CLI.
+**프로토타입 동작 — 3겹 검증(green).** ① **`pytest`** (171 passed, 9 skipped — 선택적 deps 부재 시 server/LTDD 테스트는 skip) · ② **TLA+ 모델 체크** (`spec/*.tla` 3종 — leader·lease·connect — CI `tla` 잡에서 TLC) · ③ **Hypothesis stateful** (lease/fence 코어를 무작위 연산열로 흔드는 2종 — in-memory + 영속 SQLite/WAL 재시작 내구성). 구현됨: 입체 glob 교집합 · SQLite lease+fence · Orbit/Task FSM · SINGULON 2지점 강제 · 실물 git worktree+CLOUD CONNECT(merge)+fencing · 좀비 회수 · 데드락 wait-for 사이클 감지 · 우선순위 promote · FastMCP 13툴 · CLI · **P0 동시성 11/11 + D1–D14 하드닝**.
 
-> ⚠ **동시성 한계(정직한 표기).** 위는 *단일 호출자* 가정에서 green이다. 동시 호출/긴급 탈출/크래시/분단까지 견디려면 아직 11개 P0 버그가 남아있다 — claim TOCTOU·fence 중복·release 무소유체크·connect fence-blind·공유레포 동시merge·이중쓰기 무복구·`agent_ttl` 기본 None(회수 비활성)·reclaim 브랜치 미삭제·CONNECTING 무시·의존 사이클 미검출·write-set FS 미강제. 전수 분석·기제·로드맵은 [`CONCURRENCY.md`](./CONCURRENCY.md). (예: 좀비 회수는 `agent_ttl`을 켜야 동작, 기본 비활성.)
+> ⚠ **검증 범위(정직한 표기).** TLA+ 모델은 **bounded·abstract** 다 — 작은 상수 공간(예: `Tasks = {t1, t2}`)에서만 망라 탐색하고, git split-phase·실시간·크래시 타이밍을 추상화한다. Hypothesis stateful 은 **단일 프로세스 in-proc** 모델(실제 멀티프로세스/멀티노드 레이스 그 자체가 아니라 코어 불변식의 모델). 즉 "model check + stateful + pytest green" 은 *설계 수준* 보증이지 분산 배포의 전수 보증은 아니다. 동시성·실패모드 전수 분석과 로드맵은 [`CONCURRENCY.md`](./CONCURRENCY.md). (예: 좀비 회수는 `agent_ttl` 을 켜야 동작, 기본 비활성.)
 
 ## Quickstart
 ```bash
 pip install -e .            # 코어 + transitions   (서버: -e '.[server]')
-pytest -q                   # 19 passed
+pytest -q                   # 171 passed, 9 skipped (server/LTDD 선택 deps 부재 시 skip)
 
 # CLI (MCP 툴과 동일 동사)
 omd declare auth --writes 'src/auth/**'
