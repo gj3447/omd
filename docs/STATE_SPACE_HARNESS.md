@@ -46,6 +46,26 @@ The checked configs are intentionally small, CI-sized models. Increase those
 constants only for local deep runs after the small models are green; state
 explosion is expected.
 
+## Nightly deep models
+
+`spec/deep/*.cfg` contains larger but still bounded configs for scheduled and
+manual runs. They are intentionally kept out of PR CI.
+
+Run all deep configs locally:
+
+```bash
+scripts/run_tlc_deep.sh
+```
+
+Run one deep config:
+
+```bash
+scripts/run_tlc_deep.sh omd_leader
+```
+
+GitHub Actions runs the same command from the `tla-deep` workflow on a nightly
+schedule and through `workflow_dispatch`.
+
 ## Python implementation harness
 
 `tests/test_stateful_harness.py` uses Hypothesis rule-based state machines
