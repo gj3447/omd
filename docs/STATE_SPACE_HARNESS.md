@@ -27,28 +27,24 @@ ignore implementation detail where doing so keeps the checked state space small.
 - a live DB has at most one leader
 - takeover increments epoch
 - a stale coordinator may wake up, but cannot mutate unless its local epoch
-  still matches the DB leader epoch; the model records `lastWriter` to make
-  this a direct invariant
+  still matches the DB leader epoch; the model checks that stale mutation is not
+  an enabled transition
 
 Run with TLC:
 
 ```bash
-cd spec
-tlc2 omd_lease.tla
-tlc2 omd_connect.tla
-tlc2 omd_leader.tla
+scripts/run_tlc.sh
 ```
 
-Or with a local TLA+ tools jar:
+Or with an already-downloaded TLA+ tools jar:
 
 ```bash
-cd spec
-java -cp /path/to/tla2tools.jar tlc2.TLC omd_lease.tla
+TLA2TOOLS_JAR=/path/to/tla2tools.jar scripts/run_tlc.sh
 ```
 
-The finite configs use three coordinators/agents/tasks and a small resource set.
-Increase those constants only after the small models are green; state explosion
-is expected.
+The checked configs are intentionally small, CI-sized models. Increase those
+constants only for local deep runs after the small models are green; state
+explosion is expected.
 
 ## Python implementation harness
 

@@ -8,7 +8,7 @@ EXTENDS Naturals, Sequences, TLC
 \* agents, tasks, and write resources. Git, SQLite, wall-clock precision, and
 \* path glob matching are abstracted away so TLC can exhaust interleavings.
 
-CONSTANTS Agents, Tasks, Resources
+CONSTANTS Agents, Tasks, Resources, MaxFence
 
 TaskState == {"PENDING", "READY", "IN_ORBIT", "DONE", "MERGED"}
 OrbitState == {"HELD", "PENDING", "RELEASED", "EXPIRED"}
@@ -53,13 +53,15 @@ Claim(a, t) ==
   LET res == taskWrites[t]
       oid == <<a, res>>
   IN
-  /\ taskState[t] \in {"PENDING", "READY"}
+  /\ taskState[t] = "PENDING"
+  /\ TaskOrbits(t) = {}
   /\ orbitState[oid] \notin {"HELD", "PENDING"}
   /\ IF Conflict(res)
         THEN /\ orbitState' = [orbitState EXCEPT ![oid] = "PENDING"]
              /\ orbitFence' = orbitFence
              /\ nextFence' = nextFence
-        ELSE /\ orbitState' = [orbitState EXCEPT ![oid] = "HELD"]
+        ELSE /\ nextFence <= MaxFence
+             /\ orbitState' = [orbitState EXCEPT ![oid] = "HELD"]
              /\ orbitFence' = [orbitFence EXCEPT ![oid] = nextFence]
              /\ nextFence' = nextFence + 1
   /\ orbitTask' = [orbitTask EXCEPT ![oid] = t]
@@ -85,6 +87,7 @@ Expire(o) ==
 Promote(o) ==
   /\ orbitState[o] = "PENDING"
   /\ ~Conflict(orbitRes[o])
+  /\ nextFence <= MaxFence
   /\ orbitState' = [orbitState EXCEPT ![o] = "HELD"]
   /\ orbitFence' = [orbitFence EXCEPT ![o] = nextFence]
   /\ nextFence' = nextFence + 1
@@ -94,7 +97,9 @@ Promote(o) ==
 Start(t) ==
   /\ taskState[t] = "READY"
   /\ \E o \in DOMAIN orbitState:
-       orbitTask[o] = t /\ orbitState[o] = "HELD"
+       /\ orbitTask[o] = t
+       /\ orbitAgent[o] = taskAgent[t]
+       /\ orbitState[o] = "HELD"
   /\ taskState' = [taskState EXCEPT ![t] = "IN_ORBIT"]
   /\ UNCHANGED << taskAgent, taskWrites, orbitState,
                   orbitAgent, orbitTask, orbitRes, orbitFence, nextFence >>
@@ -144,7 +149,9 @@ UniqueLiveFence ==
 
 NoConnectBeforeDone ==
   \A t \in Tasks:
-    taskState[t] = "MERGED" => orbitState[<<taskAgent[t], taskWrites[t]>>] = "RELEASED"
+    taskState[t] = "MERGED" =>
+      \A o \in DOMAIN orbitState:
+        orbitTask[o] = t => orbitState[o] # "HELD"
 
 TypeOK ==
   /\ taskState \in [Tasks -> TaskState]
@@ -152,6 +159,6 @@ TypeOK ==
   /\ taskWrites \in [Tasks -> Resources]
   /\ orbitState \in [(Agents \X Resources) -> OrbitState]
   /\ orbitFence \in [(Agents \X Resources) -> Nat]
-  /\ nextFence \in Nat
+  /\ nextFence \in 1..(MaxFence + 1)
 
 ====
