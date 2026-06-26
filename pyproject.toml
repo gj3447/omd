@@ -9,7 +9,7 @@ dependencies = ["transitions>=0.9"]
 server = ["fastmcp>=2.0"]
 # ooptdd(LTDD): 동사별 구조화 이벤트를 store에서 도착-검증하는 게이트. 이 워크스페이스에선
 # `uv pip install -e ../ooptdd` 로 editable 설치한다(자매 레포).
-dev = ["pytest>=8", "ooptdd>=0.4"]
+dev = ["pytest>=8", "hypothesis>=6.100", "ooptdd>=0.4"]
 
 [project.scripts]
 omd = "omd_server.cli:main"

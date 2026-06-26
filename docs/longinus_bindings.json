@@ -4,7 +4,8 @@
  "policy": "append-only SoT. sha256=def-line[:16]. line_hint=캐시(무드리프트). 매 커밋 tests/test_longinus_bindings.py 가드. 코드 심볼 추적(test 함수 아님).",
  "commit_baseline": "78bd168",
  "kg_anchors": [
-  "omd-concurrency-hardening-D1-D14-20260624"
+  "omd-concurrency-hardening-D1-D14-20260624",
+  "omd-state-space-harness-20260626"
  ],
  "bindings": [
   {
