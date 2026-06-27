@@ -1,0 +1,103 @@
+# OOPTDD spec — OMD 동시성 보장을 LTDD(구조 이벤트 도착) + Longinus(소스 바인딩)로 instrument.
+#
+# 각 requirement = OMD 가 방출하는 *실제* 구조 이벤트(gate, cid 상관)로 도착-검증되고, Longinus 로
+# 그 이벤트를 방출하는 *실제* core.py 심볼에 바인딩된다(AST 가 must_emit 리터럴 존재 확인).
+# 드라이버: omd_server/ooptdd_scenarios.py:run(backend, cid) — 실 Coordinator 를 cid 상관키로 구동.
+#
+# 자매 PROM 하네스: lakatotree LakatosTree_OmdParallel_20260627 (같은 보장을 라카토스 problemshift 로 채점).
+# R12(log-free zone): micro_race 보장은 non_log_oracle(TLA 모델체크 + PROM revert-proof 가드)을 선언.
+name: omd-concurrency-ooptdd
+
+methodology:
+  name: OOPTDD_methodology_v1
+  enforce: true
+
+target:
+  mode: in_process
+  callable: omd_server.ooptdd_scenarios:run
+  backend: memory
+  root: <WORKSPACE>/PROJECT/PI/omd
+
+contracts:
+  - id: MC-ORBIT-GRANT
+    kind: message_contract
+    description: Coordinator grants a disjoint write-set orbit to an Agent (SINGULON 상호배제 프로토콜)
+    role: Coordinator
+    sender: Coordinator
+    receiver: Agent
+    message: orbit_granted
+    status: accepted
+    source_req: REQ-ORBIT-GRANT
+    integration_backstop: REQ-ORBIT-GRANT
+    is_domain_message: true
+
+requirements:
+  - id: REQ-ORBIT-GRANT
+    kind: guiding
+    description: >
+      서로소 write-set claim 은 요청된 뒤 부여된다(상호배제 happy path):
+      agent cid 아래 orbit_requested 가 orbit_granted 에 선행한다.
+    covers: [MC-ORBIT-GRANT]
+    gate:
+      - {event: orbit_requested, op: "==", count: 1}
+      - {event: orbit_granted, op: ">=", count: 1}
+      - {must_order: [orbit_requested, orbit_granted]}
+    longinus:
+      kg_anchor: ref_site:omd:core:claim
+      source: omd_server/core.py
+      symbol: claim
+      must_emit: orbit_granted
+
+  - id: REQ-FLAG-LATCH
+    kind: feature
+    description: 내구 LATCH 플래그(done)가 set 되어 관측가능(D3 내구 사실 — producer 사망에도 생존).
+    gate:
+      - {event: flag_set, op: ">=", count: 1}
+    longinus:
+      kg_anchor: ref_site:omd:core:flag_set_latch
+      source: omd_server/core.py
+      symbol: _flag_set_latch
+      must_emit: flag_set
+
+  - id: REQ-DEADLOCK-REJECT
+    kind: feature
+    description: >
+      사이클을 닫을 의존 엣지는 거부된다(D7/P0-10 교착자유): depend_rejected 가 방출되고
+      의존 그래프는 비순환 불변.
+    gate:
+      - {event: depend_rejected, op: ">=", count: 1}
+    longinus:
+      kg_anchor: ref_site:omd:core:depend
+      source: omd_server/core.py
+      symbol: depend
+      must_emit: depend_rejected
+
+  - id: REQ-BARRIER-DECLARE
+    kind: feature
+    description: 응결 랑데부 배리어가 선언된다(D5 crash-safe rendezvous 진입).
+    gate:
+      - {event: barrier_declared, op: ">=", count: 1}
+    longinus:
+      kg_anchor: ref_site:omd:core:barrier_declare
+      source: omd_server/core.py
+      symbol: barrier_declare
+      must_emit: barrier_declared
+
+  - id: REQ-FENCE-MONOTONE
+    kind: micro_race
+    description: >
+      첫 grant 의 fence=1 — fencing-token 단조성이 stale-lease 쓰기를 봉쇄(D6, Kleppmann).
+      LTDD 는 grant 경로 실행을 증명하나, 마이크로-레이스의 진짜 오라클은 *non-log* 이다
+      (model-checked TLA 불변식 + LakatoTree PROM revert-proof 가드).
+    gate:
+      - {event: orbit_granted, where: {fence: 1}, op: ">=", count: 1}
+    longinus:
+      kg_anchor: ref_site:omd:core:claim:fence
+      source: omd_server/core.py
+      symbol: claim
+      must_emit: orbit_granted
+    # _extras() 는 미지 top-level 키를 extras 로 흡수한다 — non_log_oracle 을 top-level 로 둔다(R12).
+    non_log_oracle: >
+      spec/omd_lease.tla UniqueLiveFence (TLC model-checked, omd_lease.cfg INVARIANTS) +
+      lakatotree tests/test_omd_parallel_fencing.py (revert-proof defect oracle).
+      로그/트레이스로는 fence 단조성(마이크로-레이스)을 증명할 수 없으므로 구조적 오라클을 선언한다.
