@@ -1,0 +1,89 @@
+# OOPTDD spec — *전체 병렬-dev 라이프사이클*을 LTDD(구조 이벤트 도착)로 연구한다.
+# 단일 작업의 풀 루프(claim→start→commit→finish→connect=실 git merge)를 cid 상관키로 구동(드라이버:
+# omd_server/ooptdd_devloop_scenario.py), 각 단계를 실 OMD 이벤트로 도착-검증 + Longinus 로 실 core.py 심볼에 바인딩.
+# 라이브 멀티에이전트 세션(scripts/multiagent_parallel_session.py)이 같은 보장을 4-에이전트 실 머지로 실증.
+name: omd-devloop-ooptdd
+
+methodology:
+  name: OOPTDD_methodology_v1
+  enforce: true
+
+target:
+  mode: in_process
+  callable: omd_server.ooptdd_devloop_scenario:run
+  backend: memory
+  root: /data/kjra/PROJECT/PI/omd
+
+contracts:
+  - id: MC-DEVLOOP
+    kind: message_contract
+    description: 물방울(Agent)이 자기 worktree 의 변경을 코디네이터에 커밋한다(병렬-dev 핸드오프)
+    role: Droplet
+    sender: Droplet
+    receiver: Coordinator
+    message: task_committed
+    status: accepted
+    source_req: REQ-WORKTREE-DEV
+    integration_backstop: REQ-WORKTREE-DEV
+    is_domain_message: true
+
+requirements:
+  - id: REQ-ORBIT-GRANTED
+    kind: feature
+    description: 서로소 write-set claim 이 궤도로 부여된다(상호배제 진입).
+    gate:
+      - {event: orbit_granted, op: ">=", count: 1}
+    longinus:
+      kg_anchor: ref_site:omd:core:claim:devloop
+      source: omd_server/core.py
+      symbol: claim
+      must_emit: orbit_granted
+
+  - id: REQ-WORKTREE-DEV
+    kind: guiding
+    description: >
+      물방울이 자기 worktree(자존자 격리)에서 개발 — task_started 후 task_committed 후 task_finished 가
+      순서대로 도착한다(실 git 커밋).
+    covers: [MC-DEVLOOP]
+    gate:
+      - {event: task_started, op: ">=", count: 1}
+      - {event: task_committed, op: ">=", count: 1}
+      - {event: task_finished, op: ">=", count: 1}
+      - {must_order: [task_started, task_committed, task_finished]}
+    longinus:
+      kg_anchor: ref_site:omd:core:commit
+      source: omd_server/core.py
+      symbol: commit
+      must_emit: task_committed
+
+  - id: REQ-CLOUD-CONNECT
+    kind: feature
+    description: >
+      CLOUD CONNECT(응결=실 git merge) — connect_started 후 connect_merged 가 순서대로 도착
+      (split-phase 2PC, merge_sha 기록).
+    gate:
+      - {event: connect_started, op: ">=", count: 1}
+      - {event: connect_merged, op: ">=", count: 1}
+      - {must_order: [connect_started, connect_merged]}
+    longinus:
+      kg_anchor: ref_site:omd:core:connect_phase_c
+      source: omd_server/core.py
+      symbol: _connect_phase_c
+      must_emit: connect_merged
+
+  - id: REQ-MERGE-MUTEX
+    kind: micro_race
+    description: >
+      동시 connect 의 merge_token 상호배제 — 실 git index 오염(P0-5) 방지. LTDD 는 머지 경로 실행을
+      증명하나, 동시-머지 상호배제(마이크로-레이스)의 진짜 오라클은 non-log 이다.
+    gate:
+      - {event: connect_merged, op: ">=", count: 1}
+    longinus:
+      kg_anchor: ref_site:omd:core:connect_phase_c:mutex
+      source: omd_server/core.py
+      symbol: _connect_phase_c
+      must_emit: connect_merged
+    non_log_oracle: >
+      tests/test_d8_connect_splitphase.py::test_merge_token_serializes_concurrent_connect
+      (max merge_token held == 1) + tests/test_multiagent_session.py (4-에이전트 동시 connect,
+      merge_token_max_held==1, 통합 worktree clean). 동시 머지 상호배제는 로그가 아니라 구조 불변식으로 증명.
