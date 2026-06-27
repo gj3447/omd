@@ -19,16 +19,39 @@ from __future__ import annotations
 from .core import Coordinator
 
 try:
+    import anyio
     from fastmcp import FastMCP
+    from fastmcp.server.lifespan import lifespan
 except ImportError:  # 서버 extra 미설치
     FastMCP = None
+
+
+async def _leader_heartbeat_loop(omd: Coordinator) -> None:
+    interval = max(1.0, omd.leader_ttl / 3.0)
+    while True:
+        await anyio.sleep(interval)
+        omd.coordinator_heartbeat()
+
+
+def _coordinator_lifespan(omd: Coordinator):
+    @lifespan
+    async def coordinator_lifespan(server):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_leader_heartbeat_loop, omd)
+            try:
+                yield {"omd": omd}
+            finally:
+                tg.cancel_scope.cancel()
+                omd.resign()
+
+    return coordinator_lifespan
 
 
 def build_server(db_path: str = "omd.db"):
     if FastMCP is None:
         raise RuntimeError("fastmcp 미설치: pip install -e .[server]")
-    mcp = FastMCP("omd")
     omd = Coordinator(db_path)
+    mcp = FastMCP("omd", lifespan=_coordinator_lifespan(omd))
 
     @mcp.tool()
     def claim(agent: str, paths: list[str], mode: str = "write", ttl: float = 600.0,

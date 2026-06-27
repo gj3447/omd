@@ -1,6 +1,8 @@
 """FastMCP 서버 빌드 스모크 — fastmcp 설치 시 툴 스키마가 유효하게 구성되는지."""
 
 import sys
+import sqlite3
+import json
 from datetime import timedelta
 
 import pytest
@@ -40,3 +42,36 @@ def test_server_stdio_initializes_and_lists_tools(tmp_path):
                 assert {"claim", "release", "status"} <= names
 
     anyio.run(run_smoke)
+
+
+def test_server_stdio_resigns_leader_on_shutdown(tmp_path):
+    pytest.importorskip("fastmcp")
+    pytest.importorskip("mcp")
+    anyio = pytest.importorskip("anyio")
+
+    from mcp.client.session import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    db = tmp_path / "s.db"
+
+    async def run_smoke():
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "omd_server.server", str(db)],
+            cwd=str(tmp_path),
+        )
+        async with stdio_client(params) as (read_stream, write_stream):
+            async with ClientSession(
+                read_stream,
+                write_stream,
+                read_timeout_seconds=timedelta(seconds=5),
+            ) as session:
+                init = await session.initialize()
+                assert init.serverInfo.name == "omd"
+
+    anyio.run(run_smoke)
+
+    con = sqlite3.connect(db)
+    raw = con.execute("SELECT value FROM meta WHERE key='leader_lease'").fetchone()[0]
+    leader = json.loads(raw)
+    assert leader["last_heartbeat"] == 0
