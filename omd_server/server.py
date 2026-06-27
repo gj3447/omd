@@ -16,6 +16,9 @@ fastmcp 미설치 시 import만 가드 (core/cli/tests는 fastmcp 없이 동작)
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+
 from .core import Coordinator
 
 try:
@@ -36,13 +39,14 @@ async def _leader_heartbeat_loop(omd: Coordinator) -> None:
 def _coordinator_lifespan(omd: Coordinator):
     @lifespan
     async def coordinator_lifespan(server):
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(_leader_heartbeat_loop, omd)
-            try:
-                yield {"omd": omd}
-            finally:
-                tg.cancel_scope.cancel()
-                omd.resign()
+        heartbeat_task = asyncio.create_task(_leader_heartbeat_loop(omd))
+        try:
+            yield {"omd": omd}
+        finally:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+            omd.resign()
 
     return coordinator_lifespan
 
@@ -50,7 +54,10 @@ def _coordinator_lifespan(omd: Coordinator):
 def build_server(db_path: str = "omd.db"):
     if FastMCP is None:
         raise RuntimeError("fastmcp 미설치: pip install -e .[server]")
-    omd = Coordinator(db_path)
+    # Codex starts stdio MCP servers per client/session. A process-wide singleton
+    # leader lease makes concurrent MCP clients fail before initialize; SQLite
+    # BEGIN IMMEDIATE still serializes cross-process mutations for this surface.
+    omd = Coordinator(db_path, enforce_single_coordinator=False)
     mcp = FastMCP("omd", lifespan=_coordinator_lifespan(omd))
 
     @mcp.tool()

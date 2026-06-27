@@ -81,7 +81,8 @@ class Coordinator:
                  events=None, integration_branch: str | None = None,
                  merge_timeout: float | None = None, *,
                  coordinator_id: str | None = None, leader_ttl: float = LEADER_TTL_S,
-                 allow_memory_db: bool = False):
+                 allow_memory_db: bool = False,
+                 enforce_single_coordinator: bool = True):
         # §D14: `:memory:` 디폴트 금지 — 재기동마다 모든 fence/leader_epoch 가 0 으로 리셋되어
         # 낡은 토큰/잔여 merge 와 충돌(고스트 writer). 영속 DB 필수. 단위테스트는 allow_memory_db=
         # True 로 명시 opt-in(프로세스 1개, 재기동 없음 — fence 리셋 위험 없음).
@@ -93,6 +94,7 @@ class Coordinator:
         self.store = Store(db_path)
         self.coordinator_id = coordinator_id or f"coord-{uuid.uuid4().hex[:12]}"
         self.leader_ttl = leader_ttl
+        self.enforce_single_coordinator = enforce_single_coordinator
         self.leader_epoch = None  # 리더 lease 획득 후 채워짐(현 리더 세대)
         # heartbeat 만료 시 좀비 회수. 기본 ON(P0-7) — None=비활성. 끄면 죽은 물방울의
         # 궤도/작업이 영구 고아가 된다(사용자 핵심 우려). 권장 90s, renew는 TTL/3 주기.
@@ -102,7 +104,8 @@ class Coordinator:
         # §D14: 리더 lease 획득 — 살아있는 다른 코디네이터가 있으면 CoordinatorConflict 거부.
         # 이 호출 *전*엔 어떤 변이도(특히 _recover 의 git↔DB 조정) 하면 안 된다(writer 둘 방지).
         # _lock/events/store 가 필요하므로 그것들 뒤에 둔다.
-        self._acquire_leadership()
+        if self.enforce_single_coordinator:
+            self._acquire_leadership()
         self.merge_timeout = merge_timeout if merge_timeout is not None else MERGE_TIMEOUT_S
         self.git = GitRepo(repo) if repo else None
         self.integration_branch = integration_branch
@@ -128,7 +131,8 @@ class Coordinator:
         leader_guard=False 는 리더십 *획득 중*(아직 epoch 미설정)에만 쓴다."""
         with self._lock:
             with self.store.tx():
-                if leader_guard and self.leader_epoch is not None:
+                if (self.enforce_single_coordinator and leader_guard
+                        and self.leader_epoch is not None):
                     self._assert_leader()
                 yield
 
