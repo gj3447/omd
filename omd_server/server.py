@@ -4,6 +4,7 @@
 fastmcp 미설치 시 import만 가드 (core/cli/tests는 fastmcp 없이 동작).
 
 툴 표면:
+  about()                                   OMD 가 뭔지/뭐가 아닌지 + 표준 운행 루프 (오리엔테이션)
   claim(agent, paths, mode, ttl, task)      궤도 lease 획득 (입체 검사 → HELD or PENDING)
   release(orbit_id) / renew(orbit_id, ttl)
   declare(task, name, writes, reads, deps)  write-set(궤도) 선언
@@ -20,6 +21,36 @@ import asyncio
 import contextlib
 
 from .core import Coordinator
+
+# 첫 접점(MCP `initialize`)에서 클라이언트/에이전트에 그대로 노출되는 자기소개.
+# 비어 있으면 에이전트가 OMD 를 'object-model/스키마/계약 정의물'로 오독한다
+# (호스트 프로젝트의 정의·계약 패러다임으로 빈칸을 채움). 그 오독을 구조적으로 차단한다.
+OMD_INSTRUCTIONS = """\
+OMD (Orbital Motion Droplet / 입체운행물방울) — a runtime COORDINATOR for running
+N coding agents in PARALLEL on ONE git repository, with merge conflicts prevented
+*in advance* by server-authoritative disjoint write-set leases + git-worktree
+isolation, then merged back via CLOUD CONNECT.
+
+WHAT IT IS *NOT*: OMD is NOT an object model, NOT a data schema, NOT an acceptance
+contract, and NOT an artifact you must define/author/adopt per project before using
+it. There is nothing to define first. If you were asked to "use/apply OMD on project
+X", that means "coordinate parallel dev on repo X with these tools" — it does NOT
+mean "author an OMD schema/contract and gate it through OOPTDD".
+
+DRIVER LOOP (per task; MCP verbs == CLI verbs):
+  declare(task, writes=[...], deps=[...])   # 1. register disjoint write-sets (orbits)
+  next(agent)                               # 2. get a safe disjoint READY task
+  start(task, agent)                        # 3. launch the agent's git worktree
+  claim(agent, paths, task=...)             # 4. lease the write-set (HELD / PENDING)
+  ...agent edits files only in its worktree...
+  commit(task, msg); finish(task)           # 5. commit + mark DONE
+  connect(task)                             # 6. CLOUD CONNECT = real git merge (fenced)
+
+SYNC PRIMITIVES: barrier_* (rendezvous before merge), flag_* (signals),
+sem_*/acquire (semaphores), heartbeat/sweep/bail (liveness & emergency escape).
+
+Call about() any time to re-read this orientation. Full design: README.md / CONCEPT.md.
+"""
 
 try:
     import anyio
@@ -58,7 +89,31 @@ def build_server(db_path: str = "omd.db"):
     # leader lease makes concurrent MCP clients fail before initialize; SQLite
     # BEGIN IMMEDIATE still serializes cross-process mutations for this surface.
     omd = Coordinator(db_path, enforce_single_coordinator=False)
-    mcp = FastMCP("omd", lifespan=_coordinator_lifespan(omd))
+    mcp = FastMCP("omd", instructions=OMD_INSTRUCTIONS, lifespan=_coordinator_lifespan(omd))
+
+    @mcp.tool()
+    def about() -> dict:
+        """OMD 가 무엇이고(병렬 코딩 에이전트 코디네이터) 무엇이 아닌지(정의/스키마/계약이 아님),
+        그리고 표준 운행 루프(declare→next→start→claim→commit→finish→connect)를 돌려준다.
+        OMD 적용을 시작하기 전에/헷갈릴 때 이걸 먼저 호출할 것."""
+        return {
+            "name": "OMD — Orbital Motion Droplet / 입체운행물방울",
+            "is": "병렬 코딩 에이전트 코디네이터 (1 git repo 에서 N 에이전트를 서로소 "
+                  "write-set 으로 충돌 없이 병렬 운행 → CLOUD CONNECT 로 merge)",
+            "is_not": [
+                "object model 아님", "data schema 아님", "acceptance contract 아님",
+                "프로젝트마다 먼저 정의/채택해야 하는 정의물 아님 — 시작 전 작성할 게 없다",
+            ],
+            "driver_loop": [
+                "declare(task, writes=[...], deps=[...])",
+                "next(agent)", "start(task, agent)",
+                "claim(agent, paths, task=...)",
+                "commit(task, msg)", "finish(task)", "connect(task)",
+            ],
+            "sync_primitives": ["barrier_*", "flag_*", "sem_*/acquire",
+                                "heartbeat/sweep/bail"],
+            "docs": ["README.md", "CONCEPT.md", "SERVER_SPEC.md", "CONCURRENCY.md"],
+        }
 
     @mcp.tool()
     def claim(agent: str, paths: list[str], mode: str = "write", ttl: float = 600.0,
