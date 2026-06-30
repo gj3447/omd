@@ -111,6 +111,12 @@ class GitRepo:
             raise GitError(f"merge conflict on {branch}: {e}")
         return self._git("rev-parse", "HEAD", cwd=wt)
 
+    def undo_last_commit(self, worktree: str) -> None:
+        """방금 commit_all 한 커밋을 되돌리되 working/staged 변경은 보존(P5 strict-writeset 롤백).
+        `git reset --soft HEAD~1` — 에이전트가 궤도-밖 경로만 빼고 재커밋 가능. 부모 없으면(첫 커밋)
+        GitError → 전파(fail-loud; 드롭릿 브랜치는 base 가 항상 있어 정상)."""
+        self._git("reset", "--soft", "HEAD~1", cwd=str(Path(worktree).resolve()))
+
     def push_integration(self, integration_worktree: str, integration_branch: str,
                          remote: str, *, timeout: float | None = None) -> None:
         """통합 worktree 에서 integration_branch 를 remote 로 push(연결=merge 직후 remote sync).

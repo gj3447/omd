@@ -83,7 +83,9 @@ class Coordinator:
                  coordinator_id: str | None = None, leader_ttl: float = LEADER_TTL_S,
                  allow_memory_db: bool = False,
                  enforce_single_coordinator: bool = True,
-                 auto_push: str | None = None):
+                 auto_push: str | None = None,
+                 idem_ttl: float | None = 3600.0,
+                 strict_writeset: bool = False):
         # §D14: `:memory:` 디폴트 금지 — 재기동마다 모든 fence/leader_epoch 가 0 으로 리셋되어
         # 낡은 토큰/잔여 merge 와 충돌(고스트 writer). 영속 DB 필수. 단위테스트는 allow_memory_db=
         # True 로 명시 opt-in(프로세스 1개, 재기동 없음 — fence 리셋 위험 없음).
@@ -113,6 +115,13 @@ class Coordinator:
         # (operator "커밋하면 바로 sync"의 OMD 내장판). None=off(기본·기존동작). env OMD_AUTO_PUSH 폴백.
         # push 실패는 fail-soft(merge 는 로컬 반영됨) — connect 성공 유지.
         self.auto_push = auto_push if auto_push is not None else (os.environ.get("OMD_AUTO_PUSH") or None)
+        # §D9 멱등 캐시 GC TTL(초). 기본 1h — 어떤 현실적 MCP 재시도 윈도우보다 길어 replay 안전.
+        # None=GC 안 함(기존동작). _sweep_inline 이 idem_ttl 지난 DONE 행 정리(무한누적 차단).
+        self.idem_ttl = idem_ttl
+        # P5 strict-writeset: True 면 commit-time 에 write-set 위반 즉시 거부+soft-reset(빠른 fail-loud).
+        # 기본 off(connect-time enforce 유지=하위호환). env OMD_STRICT_WRITESET 폴백(정확 truthy 파싱).
+        self.strict_writeset = bool(strict_writeset) or (
+            (os.environ.get("OMD_STRICT_WRITESET") or "").strip().lower() in ("1", "true", "yes", "on"))
         self.integration_branch = integration_branch
         self.integration_worktree = None
         self.merge_resource = "cloud:default"   # repo-wide merge_token 키(§D11)
@@ -361,6 +370,10 @@ class Coordinator:
         for b in self.store.all_barriers(states=("ARMED",)):
             self._barrier_eval(b["barrier_id"])
         self._promote_pending()
+        # §D9 멱등 캐시 GC: idem_ttl 지난 DONE 행 정리(무한누적 차단). INFLIGHT(진행중)은
+        # completed_at NULL 로 보존. now 는 위에서 이미 정의됨(시각 일관).
+        if self.idem_ttl:
+            self.store.gc_idem(now - self.idem_ttl)
 
     def _reclaim_zombies_inline(self):
         """heartbeat 끊긴 물방울(involuntary) — 단일 회수 루틴으로 위임."""
@@ -1126,6 +1139,15 @@ class Coordinator:
                 offending = self._writeset_audit(task_id, t["branch"], write_globs)
                 res = {"ok": True, "sha": sha}
                 if offending:
+                    if self.strict_writeset:
+                        # P5 strict: commit-time 즉시 거부 + soft-reset 롤백(작업물은 보존 —
+                        # 밖-경로만 빼고 재커밋 가능). 기본 off 면 아래 advisory(하위호환).
+                        self.git.undo_last_commit(t["worktree"])
+                        self._emit("commit_rejected", task_id,
+                                   reason="writeset_violation", offending=offending)
+                        return cache.set({"ok": False, "reason": "writeset_violation",
+                                          "offending": offending, "claimed": write_globs,
+                                          "task_id": task_id, "sha": sha, "reverted": True})
                     # 자문 경고 — connect에서 거부될 것임. 물방울은 지금 바로잡아야 한다.
                     self._emit("commit_writeset_warning", task_id, offending=offending)
                     res["writeset_violation"] = True
@@ -1158,9 +1180,10 @@ class Coordinator:
                 return cache.set({"task_id": task_id, "state": "DONE"})
 
     # ---- CLOUD CONNECT — split-phase A–B–C (§3.B/§D8/§D11) ----
-    def connect(self, task_id, agent_id=None, fence=None, *, request_id=None,
+    def connect(self, task_id, agent_id=None, fence=None, push=None, *, request_id=None,
                 bail_epoch=None):
         """CLOUD CONNECT(응결=merge). **split-phase** — git merge가 락(_cs) **밖**에서 돈다:
+        push: per-call remote override(없으면 self.auto_push 상속). merge 직후 통합브랜치 push.
           A(락): write-orbit 재검증(P0-4 HELD∧fence==captured) + merge_token 획득 + →CONNECTING
                  + 궤도 pin(merging=1) + intent 영속 + 커밋.
           B(락밖): 전용 통합 worktree에서 merge --no-ff(타임아웃, §E). 충돌/타임아웃이면 abort.
@@ -1196,7 +1219,7 @@ class Coordinator:
                 return a
             # ----- Phase B: 락 밖(no _cs, no live tx) git merge -----
             token_id, intent = a["token_id"], a["intent"]
-            merge_sha, err = self._connect_phase_b(intent)
+            merge_sha, err = self._connect_phase_b(intent, push=push)
             # ----- Phase C: 락 안 — merge_sha 먼저 기록 후 해제(P0-6) -----
             res = self._connect_phase_c(task_id, token_id, intent, merge_sha, err)
             # §D9: 성공 종단만 캐시(merge conflict/timeout=retryable → 캐시 금지).
@@ -1206,6 +1229,41 @@ class Coordinator:
                                           self._arg_hash("connect", [task_id, fence]))
                     self.store.finish_idem(request_id, res)
             return res
+
+    def complete_task(self, task_id, msg=None, agent_id=None, fence=None, push=None,
+                      *, request_id=None, bail_epoch=None):
+        """P5 — happy-path 원샷: (선택)commit → finish → connect(+push). verb 망각-스트랜드
+        (finish 빼면 IN_ORBIT 기아·connect 빼면 미통합) 방지. INV: ok:True 는 **오직 최종
+        task state == MERGED** 일 때뿐 — 어느 단계 거부든 {ok:False, stage:'commit'|'finish'|
+        'connect', ...원본거부...}로 fail-loud 전파(거부 은폐 금지). 하위 verb 엔 request_id
+        suffix(:commit/:finish/:connect)로 idem PK 분리."""
+        def _rid(s):
+            return f"{request_id}:{s}" if request_id else None
+        committed = False
+        if msg is not None:
+            try:
+                cr = self.commit(task_id, msg, agent_id, fence,
+                                 request_id=_rid("commit"), bail_epoch=bail_epoch)
+            except (GitError, GitTimeout) as e:
+                if "nothing to commit" in str(e).lower() or "no changes" in str(e).lower():
+                    cr = {"ok": True, "noop": True}   # 변경 없음 — commit skip
+                else:
+                    return {"ok": False, "stage": "commit", "error": str(e)}
+            if cr.get("ok") is False:
+                return {**cr, "ok": False, "stage": "commit"}
+            committed = not cr.get("noop")
+        fr = self.finish(task_id, agent_id, fence,
+                         request_id=_rid("finish"), bail_epoch=bail_epoch)
+        if fr.get("ok") is False:   # finish 성공은 'ok' 키 없음(state=DONE); 거부만 ok=False
+            return {**fr, "ok": False, "stage": "finish"}
+        cn = self.connect(task_id, agent_id, fence, push=push,
+                          request_id=_rid("connect"), bail_epoch=bail_epoch)
+        st = self.store.get_task(task_id)
+        final = st["state"] if st else None
+        if cn.get("ok") and final == "MERGED":   # INV: ok ⟺ MERGED(store 권위 확인)
+            return {**cn, "ok": True, "stage": "connect", "state": "MERGED",
+                    "committed": committed}
+        return {**cn, "ok": False, "stage": "connect", "state": final}
 
     def _connect_phase_a(self, task_id, agent_id, fence, bail_epoch=None):
         """Phase A(임계구역): fence 재검증(P0-4) + merge_token 획득 + intent 영속 + pin + →CONNECTING."""
@@ -1294,9 +1352,10 @@ class Coordinator:
                       "writes": [o["orbit_id"] for o in writes]}
             return {"ok": True, "token_id": token_id, "intent": intent}
 
-    def _connect_phase_b(self, intent):
+    def _connect_phase_b(self, intent, push=None):
         """Phase B(**락 밖** — live tx 없음): 전용 통합 worktree에서 merge --no-ff(타임아웃, §E).
-        절대 _cs()/store.tx()를 잡지 않는다 — 다른 코디네이터 변이가 이 동안 interleave 가능."""
+        절대 _cs()/store.tx()를 잡지 않는다 — 다른 코디네이터 변이가 이 동안 interleave 가능.
+        push: per-call remote override(complete_task 등). None 이면 self.auto_push 상속."""
         if not self.git:
             return None, None   # repo 미바인딩 — DB-only 응결(테스트/드라이런)
         task_id, branch = intent["task_id"], intent["branch"]
@@ -1306,15 +1365,16 @@ class Coordinator:
             sha = self.git.merge_into(wt, self.integration_branch, branch, msg,
                                       timeout=self.merge_timeout)
             # 연결=merge 직후 remote sync(operator "커밋하면 바로 sync"의 OMD 내장판).
-            # opt-in(self.auto_push). fail-soft: push 실패해도 merge 는 로컬 반영됨이라
-            # connect 는 성공 유지(다음 connect/수동 push 가 따라잡음). 강제 push 안 함.
-            if self.auto_push:
+            # opt-in(push override > self.auto_push). fail-soft: push 실패해도 merge 는 로컬
+            # 반영됨이라 connect 는 성공 유지(다음 connect/수동 push 가 따라잡음). 강제 push 안 함.
+            remote = push if push is not None else self.auto_push
+            if remote:
                 try:
-                    self.git.push_integration(wt, self.integration_branch, self.auto_push,
+                    self.git.push_integration(wt, self.integration_branch, remote,
                                               timeout=self.merge_timeout)
-                    self._emit("connect_pushed", task_id, remote=self.auto_push, merge_sha=sha)
+                    self._emit("connect_pushed", task_id, remote=remote, merge_sha=sha)
                 except (GitError, GitTimeout) as pe:
-                    self._emit("connect_push_failed", task_id, remote=self.auto_push, error=str(pe))
+                    self._emit("connect_push_failed", task_id, remote=remote, error=str(pe))
             return sha, None
         except (GitError, GitTimeout) as e:
             return None, e
