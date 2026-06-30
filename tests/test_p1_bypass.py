@@ -95,6 +95,15 @@ def test_first_parent_vs_all_distinction(tmp_path):
     assert rep.clean, [(c.subject, k) for c, k in rep.bypass]
 
 
+def test_warn_only_allows_despite_bypass(tmp_path):
+    """warn_only: 우회 있어도 경고만 하고 GO(0) — 채택 0% 브랜치 안전 적용용."""
+    r = tmp_path / "repo"; _init(r)
+    since = _out(["rev-parse", "HEAD"], r)
+    _bypass_direct(r, "hack.txt")
+    assert gate(str(r), "main", since) == 1                      # enforce → NO_GO
+    assert gate(str(r), "main", since, warn_only=True) == 0      # warn → GO(경고만)
+
+
 def test_git_failure_is_fail_loud(tmp_path):
     """잘못된 ref → 빈 리포트로 삼키지 않고 NO_GO(2). silent skip 금지."""
     r = tmp_path / "repo"; _init(r)

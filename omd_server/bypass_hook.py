@@ -15,30 +15,32 @@ from .gitio import GitRepo
 ZERO = "0" * 40
 
 _HOOK_TMPL = """#!/usr/bin/env bash
-# [OMD P1 bypass guard] 우회 커밋(OMD 안 거친 직접커밋/foreign merge)의 보호 통합브랜치 push 거부.
+# [OMD P1 bypass guard] 우회 커밋(OMD 안 거친 직접커밋/foreign merge)을 보호 통합브랜치 push 시
+# 검사. WARN=1 이면 경고만(allow), 아니면 거부(exit 1). (채택 0% 브랜치는 WARN 으로 시작.)
 set -euo pipefail
 PROTECTED_REF="refs/heads/{branch}"
 SINCE="{since_ref}"
 PY="{python}"
 ZERO="{zero}"
+WARN="{warn}"
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$remote_ref" = "$PROTECTED_REF" ] || continue
   [ "$local_sha" = "$ZERO" ] && continue            # 브랜치 삭제 push
   if [ "$remote_sha" = "$ZERO" ]; then base="$SINCE"; else base="$remote_sha"; fi
-  "$PY" -m omd_server.bypass_hook _check "$(git rev-parse --show-toplevel)" "{branch}" "$base" "$local_sha" || exit 1
+  "$PY" -m omd_server.bypass_hook _check "$(git rev-parse --show-toplevel)" "{branch}" "$base" "$local_sha" "$WARN" || exit 1
 done
 exit 0
 """
 
 
 def generate_pre_push_hook(integration_branch: str, since_ref: str = "",
-                           python: str = "python3") -> str:
+                           python: str = "python3", warn_only: bool = False) -> str:
     return _HOOK_TMPL.format(branch=integration_branch, since_ref=since_ref,
-                             zero=ZERO, python=python)
+                             zero=ZERO, python=python, warn="1" if warn_only else "")
 
 
 def install_pre_push_hook(repo: str, integration_branch: str, since_ref: str = "",
-                          python: str = "python3") -> str:
+                          python: str = "python3", warn_only: bool = False) -> str:
     """repo 의 **repo-local** .git/hooks/pre-push 에 설치(기존 있으면 덮어씀). 설치 경로 반환.
 
     ⚠️ 반드시 `--git-common-dir`(=repo 의 실제 .git, worktree 도 안전)로 repo-local hooks 에
@@ -55,7 +57,7 @@ def install_pre_push_hook(repo: str, integration_branch: str, since_ref: str = "
     hooks_dir = common / "hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)
     p = hooks_dir / "pre-push"
-    p.write_text(generate_pre_push_hook(integration_branch, since_ref, python))
+    p.write_text(generate_pre_push_hook(integration_branch, since_ref, python, warn_only))
     p.chmod(0o755)
     # core.hooksPath 가 이 repo-local hooks 를 안 가리면 git 이 이 hook 을 안 부른다 → 경고.
     eff = Path(git._git("rev-parse", "--git-path", "hooks"))
@@ -68,21 +70,21 @@ def install_pre_push_hook(repo: str, integration_branch: str, since_ref: str = "
     return str(p)
 
 
-def _check(repo: str, branch: str, base: str, local_sha: str) -> int:
+def _check(repo: str, branch: str, base: str, local_sha: str, warn_only: bool = False) -> int:
     """hook 내부 호출: base..local_sha 범위의 first-parent 우회 검사. base 가 빈값이면 전수.
-    push 범위만 보도록 임시로 local_sha 를 tip 으로 간주 — gate 는 since..branch 를 쓰므로
-    branch 대신 local_sha 를 'branch' 인자로 넘겨 push 될 실제 tip 을 검사한다."""
+    push 범위만 보도록 local_sha 를 tip(=gate 의 branch 인자)으로 검사한다. warn_only 면 경고만."""
     since = base if base and base != ZERO else None
-    return gate(repo, local_sha, since, out=sys.stderr)
+    return gate(repo, local_sha, since, warn_only=warn_only, out=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "_check":
-        # _check <repo> <branch> <base> <local_sha>
+        # _check <repo> <branch> <base> <local_sha> [warn(1/'')]
         repo, branch, base, local_sha = argv[1], argv[2], argv[3], argv[4]
-        return _check(repo, branch, base, local_sha)
-    print("usage: python -m omd_server.bypass_hook _check <repo> <branch> <base> <local_sha>",
+        warn_only = len(argv) > 5 and argv[5] == "1"
+        return _check(repo, branch, base, local_sha, warn_only)
+    print("usage: python -m omd_server.bypass_hook _check <repo> <branch> <base> <local_sha> [warn]",
           file=sys.stderr)
     return 64
 

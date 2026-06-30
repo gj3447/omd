@@ -21,14 +21,17 @@ def main(argv=None) -> int:
     ap.add_argument("--branch", required=True, help="보호 통합브랜치 (예: kjra/main)")
     ap.add_argument("--since", default=None, help="이 ref 이후만 강제(미설정시 전수 — noise 주의)")
     ap.add_argument("--min-adoption", type=float, default=1.0)
+    ap.add_argument("--warn-only", action="store_true",
+                    help="우회를 경고만 하고 통과(채택 0%% 브랜치 안전 적용)")
     ap.add_argument("--install-hook", action="store_true",
                     help="검사 대신 pre-push hook 설치")
     a = ap.parse_args(argv)
     if a.install_hook:
-        p = install_pre_push_hook(a.repo, a.branch, a.since or "", sys.executable)
-        print(f"[omd-bypass] pre-push hook 설치: {p}")
+        p = install_pre_push_hook(a.repo, a.branch, a.since or "", sys.executable,
+                                  warn_only=a.warn_only)
+        print(f"[omd-bypass] pre-push hook 설치({'warn-only' if a.warn_only else 'enforce'}): {p}")
         return 0
-    return gate(a.repo, a.branch, a.since, min_adoption=a.min_adoption)
+    return gate(a.repo, a.branch, a.since, min_adoption=a.min_adoption, warn_only=a.warn_only)
 
 
 if __name__ == "__main__":

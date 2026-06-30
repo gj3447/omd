@@ -143,17 +143,21 @@ def bypass_audit(repo: str, integration_branch: str, since_ref: str | None = Non
 
 
 def gate(repo: str, integration_branch: str, since_ref: str | None = None,
-         *, min_adoption: float = 1.0, out=sys.stderr) -> int:
-    """fail-loud 게이트: 우회 1건 또는 adoption < min_adoption → 1(NO_GO); git 실패 → 2; else 0(GO)."""
+         *, min_adoption: float = 1.0, warn_only: bool = False, out=sys.stderr) -> int:
+    """fail-loud 게이트: 우회 1건 또는 adoption < min_adoption → 1(NO_GO); git 실패 → 2; else 0(GO).
+    warn_only=True 면 우회를 라우드 경고만 하고 0(GO) 반환 — 채택 0%인 브랜치에 hard-block 을
+    걸면 모든 push 가 막히므로(닭-달걀), 채택 전 단계의 안전 적용용. 채택되면 warn_only=False 로."""
     try:
         r = bypass_audit(repo, integration_branch, since_ref)
     except (GitError, Exception) as e:  # noqa: BLE001 — silent skip 금지(OOPTDD trace-ground)
         print(f"[omd-bypass-gate] NO_GO: git 실패(silent skip 금지) — {e!r}", file=out)
-        return 2
+        return 2 if not warn_only else 0
     ok = r.clean and r.adoption_ratio >= min_adoption
+    tag = "GO" if ok else ("WARN(allow)" if warn_only else "NO_GO")
     print(f"[omd-bypass-gate] branch={integration_branch} since={since_ref} "
           f"omd={len(r.omd_connect)} bypass={len(r.bypass)} "
-          f"adoption={r.adoption_ratio:.0%} → {'GO' if ok else 'NO_GO'}", file=out)
+          f"adoption={r.adoption_ratio:.0%} → {tag}", file=out)
     for c, k in r.bypass:
-        print(f"  🔴 BYPASS[{k.value}] {c.sha[:10]} {c.author}: {c.subject[:70]}", file=out)
-    return 0 if ok else 1
+        sev = "⚠️" if warn_only else "🔴"
+        print(f"  {sev} BYPASS[{k.value}] {c.sha[:10]} {c.author}: {c.subject[:70]}", file=out)
+    return 0 if (ok or warn_only) else 1

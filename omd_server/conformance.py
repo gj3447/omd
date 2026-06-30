@@ -99,3 +99,7 @@ def gate(root: Path = ROOT, out=sys.stderr) -> int:
     for x in r["newly_done"]:
         print(f"  ✅ NEW: {x['key']} 구현됨 — must=True 로 승격 권장", file=out)
     return 0 if r["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(gate(out=sys.stdout))
