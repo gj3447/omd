@@ -25,20 +25,23 @@ from enum import Enum
 from .gitio import GitError, GitRepo
 
 TRAILER_KEY = "OMD-Connect"
+OMD_AUTHOR = "omd"   # gitio._IDENT(user.name=omd) — 진짜 OMD 응결 머지의 작성자(%an)
 _SEP = "\x1f"   # unit separator — 커밋 메시지에 안 나오는 제어문자
 _REC = "\x1e"   # record separator
 
 
 class Kind(Enum):
-    OMD_CONNECT = "omd_connect"        # 머지(≥2 parent) + trailer = 정상 응결
+    OMD_CONNECT = "omd_connect"        # 머지(≥2 parent) + trailer + 작성자=OMD = 정상 응결
     DIRECT_COMMIT = "direct_commit"    # 1 parent, trailer 없음 = 직접커밋(우회)
     FOREIGN_MERGE = "foreign_merge"    # ≥2 parent, trailer 없음 = git pull/수동머지(우회)
     FORGED_TRAILER = "forged_trailer"  # non-merge + trailer = 위조(gitio 는 --no-ff 머지만 박음)
+    FORGED_MERGE = "forged_merge"      # 머지 + trailer 지만 작성자≠OMD = 수동 위조 머지(우회)
     ROOT = "root"                      # parent 0 = 루트(분류 제외)
 
     @property
     def is_bypass(self) -> bool:
-        return self in (Kind.DIRECT_COMMIT, Kind.FOREIGN_MERGE, Kind.FORGED_TRAILER)
+        return self in (Kind.DIRECT_COMMIT, Kind.FOREIGN_MERGE,
+                        Kind.FORGED_TRAILER, Kind.FORGED_MERGE)
 
 
 @dataclass(frozen=True)
@@ -62,12 +65,20 @@ class Commit:
         return classify(self)
 
 
-def classify(c: Commit) -> Kind:
-    """parent 수 × trailer 유무로 5분류. trailer 만 보고 GO 주면 위조 가능 → parent≥2 동반 요구."""
+def classify(c: Commit, omd_author: str = OMD_AUTHOR) -> Kind:
+    """parent 수 × trailer × 작성자로 분류. trailer 만 보고 GO 주면 수동 위조 가능 →
+    OMD_CONNECT 는 (parent≥2 머지) AND (trailer) AND (작성자=OMD) 셋 다 요구.
+    ⚠️ 작성자(%an)도 `git -c user.name=omd` 로 위조 가능 — 이 검사는 캐주얼/실수 우회를 막고
+    바를 높일 뿐 암호학적 방어가 아니다. 완전방어는 OMD ledger(store) 의 실제 MERGED task_id
+    대조(merge 머신은 등록 task 만 응결) — 그건 store 접근이 있는 곳(서버측 hook)에서 추가."""
     if not c.parents:
         return Kind.ROOT
     if c.has_trailer:
-        return Kind.OMD_CONNECT if c.is_merge else Kind.FORGED_TRAILER
+        if not c.is_merge:
+            return Kind.FORGED_TRAILER          # non-merge + trailer = 위조
+        if omd_author and c.author != omd_author:
+            return Kind.FORGED_MERGE            # merge + trailer 지만 작성자≠OMD = 수동 위조
+        return Kind.OMD_CONNECT
     return Kind.FOREIGN_MERGE if c.is_merge else Kind.DIRECT_COMMIT
 
 

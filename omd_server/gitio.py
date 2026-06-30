@@ -15,6 +15,11 @@ class GitError(RuntimeError):
     pass
 
 
+class GitNothingToCommit(GitError):
+    """staged 변경이 없어 커밋할 게 없음 — 부분문자열/로케일 추측이 아니라 구조적 판별.
+    호출부가 '변경 없음 → skip' 을 정확히 분기하게 해 진짜 commit 실패와 안 섞이게 한다."""
+
+
 class GitTimeout(GitError):
     """merge 서브프로세스가 타임아웃(§E — 무한 hang 방지). abort 대상."""
 
@@ -66,8 +71,31 @@ class GitRepo:
         return p
 
     def commit_all(self, worktree: str, msg: str) -> str:
-        """worktree의 모든 변경을 스테이지+커밋. 빈 변경이면 GitError."""
+        """worktree의 모든 변경을 스테이지+커밋. 빈 변경이면 GitNothingToCommit(구조적 판별 —
+        `git status --porcelain` 빈값 = 커밋할 것 없음; 부분문자열/로케일 추측 안 함)."""
         self._git("add", "-A", cwd=worktree)
+        if not self._git("status", "--porcelain", cwd=worktree).strip():
+            raise GitNothingToCommit(f"nothing to commit in {worktree}")
+        self._git(*self._IDENT, "commit", "-m", msg, cwd=worktree)
+        return self._git("rev-parse", "HEAD", cwd=worktree)
+
+    # ---- P5 strict-writeset: 궤도-밖 경로를 commit 전에 staged 에서 제외(no wedge) ----
+    def stage_all(self, worktree: str) -> None:
+        self._git("add", "-A", cwd=worktree)
+
+    def staged_paths(self, worktree: str) -> list[str]:
+        out = self._git("diff", "--cached", "--name-only", cwd=worktree)
+        return [p for p in out.splitlines() if p.strip()]
+
+    def unstage(self, worktree: str, paths: list[str]) -> None:
+        """staged 에서 paths 만 빼고(working tree 변경은 보존). git restore --staged."""
+        if paths:
+            self._git("restore", "--staged", "--", *paths, cwd=worktree)
+
+    def commit_staged(self, worktree: str, msg: str) -> str:
+        """이미 staged 된 것만 커밋(add 없이). 빈 index 면 GitNothingToCommit."""
+        if not self.staged_paths(worktree):
+            raise GitNothingToCommit(f"nothing staged in {worktree}")
         self._git(*self._IDENT, "commit", "-m", msg, cwd=worktree)
         return self._git("rev-parse", "HEAD", cwd=worktree)
 
@@ -110,12 +138,6 @@ class GitRepo:
                 raise GitTimeout(f"merge timeout on {branch}: {e}")
             raise GitError(f"merge conflict on {branch}: {e}")
         return self._git("rev-parse", "HEAD", cwd=wt)
-
-    def undo_last_commit(self, worktree: str) -> None:
-        """방금 commit_all 한 커밋을 되돌리되 working/staged 변경은 보존(P5 strict-writeset 롤백).
-        `git reset --soft HEAD~1` — 에이전트가 궤도-밖 경로만 빼고 재커밋 가능. 부모 없으면(첫 커밋)
-        GitError → 전파(fail-loud; 드롭릿 브랜치는 base 가 항상 있어 정상)."""
-        self._git("reset", "--soft", "HEAD~1", cwd=str(Path(worktree).resolve()))
 
     def push_integration(self, integration_worktree: str, integration_branch: str,
                          remote: str, *, timeout: float | None = None) -> None:

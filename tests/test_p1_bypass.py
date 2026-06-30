@@ -25,13 +25,15 @@ def _init(root):
 
 
 def _omd_connect(root, task, fname):
-    """OMD 정상 응결 시뮬: feature 브랜치 → --no-ff 머지 + OMD-Connect trailer."""
+    """OMD 정상 응결 시뮬: feature 브랜치 → --no-ff 머지 + OMD-Connect trailer + 작성자=omd
+    (gitio._IDENT 와 동일 — 진짜 OMD 머지의 작성자)."""
     _git(["checkout", "-b", f"omd/{task}", "main"], root)
     (root / fname).write_text("x\n")
     _git(["add", "-A"], root)
     _git(["commit", "-m", f"feat {task} (drop-let, no trailer)"], root)
     _git(["checkout", "main"], root)
-    _git(["merge", "--no-ff", "-m", f"CLOUD CONNECT {task}\n\nOMD-Connect: {task}", f"omd/{task}"], root)
+    _git(["-c", "user.name=omd", "-c", "user.email=omd@airobotics", "merge", "--no-ff",
+          "-m", f"CLOUD CONNECT {task}\n\nOMD-Connect: {task}", f"omd/{task}"], root)
 
 
 def _bypass_direct(root, fname):
@@ -138,10 +140,27 @@ def test_pre_push_hook_rejects_bypass_push(tmp_path):
     assert res.returncode != 0   # hook 이 우회 push 거부(fail-loud)
 
 
+def test_forged_merge_wrong_author_is_bypass(tmp_path):
+    """수동 위조: 누가 직접 `git merge --no-ff -m '..OMD-Connect: X'`(작성자≠omd)로 가짜 응결을
+    만들어 우회. 작성자 신원 검사로 FORGED_MERGE(bypass) 분류 — false-green 차단."""
+    r = tmp_path / "repo"; _init(r)
+    since = _out(["rev-parse", "HEAD"], r)
+    _git(["checkout", "-b", "side", "main"], r)
+    (r / "evil.txt").write_text("evil\n"); _git(["add", "-A"], r); _git(["commit", "-m", "evil"], r)
+    _git(["checkout", "main"], r)
+    # 작성자 omd 를 *안* 씀(기본 user.name=t) → 위조 머지
+    _git(["merge", "--no-ff", "-m", "CLOUD CONNECT faketask\n\nOMD-Connect: faketask", "side"], r)
+    rep = bypass_audit(str(r), "main", since)
+    assert any(k is Kind.FORGED_MERGE for _, k in rep.bypass), [(c.subject, k) for c, k in rep.bypass]
+    assert gate(str(r), "main", since) == 1   # 위조 머지도 NO_GO
+
+
 def test_classify_unit():
     from omd_server.bypass_audit import Commit
-    assert classify(Commit("s", (), (), "a", "root")) is Kind.ROOT
-    assert classify(Commit("s", ("p1", "p2"), ("T1",), "a", "m")) is Kind.OMD_CONNECT
-    assert classify(Commit("s", ("p1",), (), "a", "c")) is Kind.DIRECT_COMMIT
-    assert classify(Commit("s", ("p1", "p2"), (), "a", "m")) is Kind.FOREIGN_MERGE
-    assert classify(Commit("s", ("p1",), ("T1",), "a", "c")) is Kind.FORGED_TRAILER
+    assert classify(Commit("s", (), (), "omd", "root")) is Kind.ROOT
+    assert classify(Commit("s", ("p1", "p2"), ("T1",), "omd", "m")) is Kind.OMD_CONNECT
+    assert classify(Commit("s", ("p1",), (), "omd", "c")) is Kind.DIRECT_COMMIT
+    assert classify(Commit("s", ("p1", "p2"), (), "omd", "m")) is Kind.FOREIGN_MERGE
+    assert classify(Commit("s", ("p1",), ("T1",), "omd", "c")) is Kind.FORGED_TRAILER
+    # 머지+trailer 지만 작성자≠omd = 위조 머지(bypass)
+    assert classify(Commit("s", ("p1", "p2"), ("T1",), "attacker", "m")) is Kind.FORGED_MERGE
