@@ -111,6 +111,14 @@ class GitRepo:
             raise GitError(f"merge conflict on {branch}: {e}")
         return self._git("rev-parse", "HEAD", cwd=wt)
 
+    def push_integration(self, integration_worktree: str, integration_branch: str,
+                         remote: str, *, timeout: float | None = None) -> None:
+        """통합 worktree 에서 integration_branch 를 remote 로 push(연결=merge 직후 remote sync).
+        네트워크 I/O라 connect Phase B(락 밖)에서 호출. 실패(원격 이동·net)는 호출부가 fail-soft —
+        merge 는 이미 로컬 반영됨이라 connect 성공은 유지. 비fast-forward면 raise(강제 push 안 함)."""
+        wt = str(Path(integration_worktree).resolve())
+        self._git("push", remote, integration_branch, cwd=wt, timeout=timeout)
+
     def branch_in_integration(self, integration_worktree: str, integration_branch: str,
                               trailer: str) -> str | None:
         """통합 브랜치에 주어진 trailer를 가진 머지 커밋이 있으면 그 sha를 반환(없으면 None).
