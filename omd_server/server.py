@@ -191,10 +191,23 @@ def build_server(db_path: str = "omd.db"):
 
     @mcp.tool()
     def connect(task: str, agent: str | None = None, fence: int | None = None,
+                push: str | None = None,
                 request_id: str | None = None, bail_epoch: int | None = None) -> dict:
         """CLOUD CONNECT(응결=merge, split-phase). agent/fence를 주면 write-orbit fence==captured
-        까지 재검증(P0-4). 작업 중 lease 만료/ABA면 fencing으로 거부. merge_token으로 직렬화."""
-        return omd.connect(task, agent, fence, request_id=request_id, bail_epoch=bail_epoch)
+        까지 재검증(P0-4). 작업 중 lease 만료/ABA면 fencing으로 거부. merge_token으로 직렬화.
+        push=remote 면 merge 직후 통합브랜치를 그 remote 로 push(없으면 self.auto_push 상속)."""
+        return omd.connect(task, agent, fence, push=push,
+                           request_id=request_id, bail_epoch=bail_epoch)
+
+    @mcp.tool()
+    def complete_task(task: str, msg: str | None = None, agent: str | None = None,
+                      fence: int | None = None, push: str | None = None,
+                      request_id: str | None = None, bail_epoch: int | None = None) -> dict:
+        """P5 원샷(happy-path): (선택)commit → finish → connect(+push) 한 번에. verb 망각-스트랜드
+        (finish 빼면 IN_ORBIT 기아·connect 빼면 미통합) 방지. ok:True 는 오직 최종 state==MERGED;
+        어느 단계 거부든 {ok:False, stage:'commit'|'finish'|'connect', ...}로 fail-loud 전파."""
+        return omd.complete_task(task, msg, agent, fence, push=push,
+                                 request_id=request_id, bail_epoch=bail_epoch)
 
     @mcp.tool()
     def flag_set(key: str, value: str, agent: str | None = None,
