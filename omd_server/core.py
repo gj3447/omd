@@ -82,7 +82,8 @@ class Coordinator:
                  merge_timeout: float | None = None, *,
                  coordinator_id: str | None = None, leader_ttl: float = LEADER_TTL_S,
                  allow_memory_db: bool = False,
-                 enforce_single_coordinator: bool = True):
+                 enforce_single_coordinator: bool = True,
+                 auto_push: str | None = None):
         # §D14: `:memory:` 디폴트 금지 — 재기동마다 모든 fence/leader_epoch 가 0 으로 리셋되어
         # 낡은 토큰/잔여 merge 와 충돌(고스트 writer). 영속 DB 필수. 단위테스트는 allow_memory_db=
         # True 로 명시 opt-in(프로세스 1개, 재기동 없음 — fence 리셋 위험 없음).
@@ -108,6 +109,10 @@ class Coordinator:
             self._acquire_leadership()
         self.merge_timeout = merge_timeout if merge_timeout is not None else MERGE_TIMEOUT_S
         self.git = GitRepo(repo) if repo else None
+        # 연결(connect=merge) 직후 통합 브랜치를 이 remote 로 push — 로컬 누적 divergence 방지
+        # (operator "커밋하면 바로 sync"의 OMD 내장판). None=off(기본·기존동작). env OMD_AUTO_PUSH 폴백.
+        # push 실패는 fail-soft(merge 는 로컬 반영됨) — connect 성공 유지.
+        self.auto_push = auto_push if auto_push is not None else (os.environ.get("OMD_AUTO_PUSH") or None)
         self.integration_branch = integration_branch
         self.integration_worktree = None
         self.merge_resource = "cloud:default"   # repo-wide merge_token 키(§D11)
@@ -1300,6 +1305,16 @@ class Coordinator:
             msg = f"CLOUD CONNECT {task_id}\n\n{self._trailer(task_id)}"
             sha = self.git.merge_into(wt, self.integration_branch, branch, msg,
                                       timeout=self.merge_timeout)
+            # 연결=merge 직후 remote sync(operator "커밋하면 바로 sync"의 OMD 내장판).
+            # opt-in(self.auto_push). fail-soft: push 실패해도 merge 는 로컬 반영됨이라
+            # connect 는 성공 유지(다음 connect/수동 push 가 따라잡음). 강제 push 안 함.
+            if self.auto_push:
+                try:
+                    self.git.push_integration(wt, self.integration_branch, self.auto_push,
+                                              timeout=self.merge_timeout)
+                    self._emit("connect_pushed", task_id, remote=self.auto_push, merge_sha=sha)
+                except (GitError, GitTimeout) as pe:
+                    self._emit("connect_push_failed", task_id, remote=self.auto_push, error=str(pe))
             return sha, None
         except (GitError, GitTimeout) as e:
             return None, e
