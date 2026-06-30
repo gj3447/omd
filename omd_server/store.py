@@ -516,6 +516,15 @@ class Store:
         """비성공(DENIED/stale-fence/fenced_out) — INFLIGHT 흔적 제거 → 세상이 바뀌면 재시도 가능."""
         self.db.execute("DELETE FROM idempotency WHERE request_id=?", (request_id,))
 
+    def gc_idem(self, cutoff: float) -> int:
+        """§D9 멱등 캐시 GC: cutoff 이전에 완료된 DONE 행 삭제(무한누적 차단).
+        INFLIGHT(진행중)은 completed_at IS NULL 이라 제외(진행중 멱등 윈도우 보존).
+        status='DONE' 명시로 의도 고정. 반환=삭제 행 수."""
+        cur = self.db.execute(
+            "DELETE FROM idempotency WHERE status='DONE' AND completed_at IS NOT NULL"
+            " AND completed_at < ?", (cutoff,))
+        return cur.rowcount
+
     # --- agents (물방울 heartbeat / 좀비 회수) ---
     def upsert_agent(self, agent_id, name=None, state="WORKING", now=None):
         now = now if now is not None else time.time()

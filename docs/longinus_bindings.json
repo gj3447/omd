@@ -184,9 +184,10 @@
    "symbol": "_connect_phase_b",
    "kind": "function",
    "line_hint": 1287,
-   "sha256": "48d4afceb199c99d",
+   "sha256": "8ff4a44f93f389ae",
    "layer": "domain-policy",
-   "frege_sinn": "split-phase Phase B(락 밖): 전용 통합 worktree에서 merge --no-ff(타임아웃, §E/§D11)"
+   "frege_sinn": "split-phase Phase B(락 밖): 전용 통합 worktree에서 merge --no-ff(타임아웃, §E/§D11)",
+   "note": "[re-baseline 2026-06-30: push=None 파라미터 추가(complete_task per-call push override)]"
   },
   {
    "sourceId": "core._connect_phase_c",
