@@ -34,18 +34,46 @@ def _mk(tmp_path, *, strict):
                        strict_writeset=strict), repo
 
 
-def test_strict_rejects_out_of_bounds_at_commit(tmp_path):
+def test_strict_excludes_out_of_bounds_at_commit(tmp_path):
+    """strict: 궤도-밖 경로는 commit 에서 자동 제외(history 진입 X·working tree 보존). in-orbit 만 커밋."""
     omd, _ = _mk(tmp_path, strict=True)
     wt = Path(_drive_to_worktree(omd, ["a/**"]))
     (wt / "a").mkdir(parents=True); (wt / "a" / "x.py").write_text("x=1\n")        # 안
     (wt / "b").mkdir(parents=True); (wt / "b" / "foo.py").write_text("foo=1\n")    # 밖
-    r = omd.commit("A", "feat with out-of-bounds")
-    assert r["ok"] is False and r["reason"] == "writeset_violation"
-    assert r["offending"] == ["b/foo.py"] and r["reverted"] is True
-    # 롤백: 작업물 보존(파일 존재) + 커밋은 안 남음(soft reset)
-    assert (wt / "b" / "foo.py").exists() and (wt / "a" / "x.py").exists()
-    log = subprocess.run(["git", "log", "--oneline"], cwd=str(wt), capture_output=True, text=True).stdout
-    assert "out-of-bounds" not in log
+    r = omd.commit("A", "feat in-orbit, b/foo.py excluded")
+    assert r["ok"] is True and r["excluded_out_of_orbit"] == ["b/foo.py"]
+    # 밖-경로는 working tree 에 보존되되 커밋엔 안 들어감
+    assert (wt / "b" / "foo.py").exists()
+    committed = subprocess.run(["git", "show", "--name-only", "--format=", "HEAD"],
+                               cwd=str(wt), capture_output=True, text=True).stdout
+    assert "a/x.py" in committed and "b/foo.py" not in committed
+
+
+def test_strict_no_livelock_recommit(tmp_path):
+    """위반 후에도 in-orbit 재커밋이 막히지 않음(no wedge) — 밖-경로는 매번 일관 제외."""
+    omd, _ = _mk(tmp_path, strict=True)
+    wt = Path(_drive_to_worktree(omd, ["a/**"]))
+    (wt / "a").mkdir(parents=True); (wt / "a" / "x.py").write_text("x=1\n")
+    (wt / "b").mkdir(parents=True); (wt / "b" / "foo.py").write_text("foo=1\n")   # 밖(잔존)
+    r1 = omd.commit("A", "first in-orbit")
+    assert r1["ok"] is True and r1["excluded_out_of_orbit"] == ["b/foo.py"]
+    # 밖-파일이 working tree 에 남아도 추가 in-orbit 작업 재커밋이 성공해야(livelock 0)
+    (wt / "a" / "y.py").write_text("y=1\n")
+    r2 = omd.commit("A", "second in-orbit after violation")
+    assert r2["ok"] is True
+    committed = subprocess.run(["git", "show", "--name-only", "--format=", "HEAD"],
+                               cwd=str(wt), capture_output=True, text=True).stdout
+    assert "a/y.py" in committed   # 새 in-orbit 작업이 실제로 랜딩(wedge 아님)
+
+
+def test_strict_only_out_of_orbit_is_nothing_in_orbit(tmp_path):
+    """밖-경로만 있고 in-orbit 변경이 0이면 ok:False(nothing_in_orbit) — 빈 커밋 안 만듦."""
+    omd, _ = _mk(tmp_path, strict=True)
+    wt = Path(_drive_to_worktree(omd, ["a/**"]))
+    (wt / "b").mkdir(parents=True); (wt / "b" / "foo.py").write_text("foo=1\n")   # 밖만
+    r = omd.commit("A", "only out-of-orbit")
+    assert r["ok"] is False and r["reason"] == "nothing_in_orbit"
+    assert r["excluded"] == ["b/foo.py"]
 
 
 def test_strict_allows_in_bounds(tmp_path):

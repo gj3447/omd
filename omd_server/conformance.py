@@ -37,9 +37,10 @@ CHECKS = [
     Check("idem_gc", "멱등 캐시 GC(§D9 무한누적 차단)", True,
           lambda r: "def gc_idem" in _src(r, "omd_server/store.py")
           and "gc_idem(" in _src(r, "omd_server/core.py")),
-    Check("strict_writeset", "commit-time write-set strict 거부+롤백(P5)", True,
+    Check("strict_writeset", "commit-time write-set strict 자동제외(no wedge)(P5)", True,
           lambda r: "strict_writeset" in _src(r, "omd_server/core.py")
-          and "def undo_last_commit" in _src(r, "omd_server/gitio.py")),
+          and "def commit_staged" in _src(r, "omd_server/gitio.py")
+          and "commit_excluded_out_of_orbit" in _src(r, "omd_server/core.py")),
     Check("auto_push", "connect→remote auto-push(로컬 divergence 방지)", True,
           lambda r: "def push_integration" in _src(r, "omd_server/gitio.py")),
     Check("bypass_gate", "P1 OMD 우회 감지 게이트(out-of-band)", True,

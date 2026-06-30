@@ -38,7 +38,7 @@ from contextlib import contextmanager
 from . import fsm
 from .disjoint import path_in_globs, sets_overlap
 from .events import NOOP
-from .gitio import GitError, GitRepo, GitTimeout
+from .gitio import GitError, GitNothingToCommit, GitRepo, GitTimeout
 from .store import Store
 
 # Phase B(락밖 merge) 서브프로세스 타임아웃(§E — 무한 hang 방지). pin은 이보다 길게 잡아
@@ -1131,23 +1131,37 @@ class Coordinator:
                     self._emit("commit_rejected", task_id, reason=bad["reason"])
                     return cache.set(bad)
                 t = self.store.get_task(task_id)
-                sha = self.git.commit_all(t["worktree"], msg)
-                self._emit("task_committed", t["agent_id"], task=task_id, sha=sha)
                 writes = [o for o in self.store.orbits_for_task(task_id)
                           if o["mode"] == "write" and o["state"] == "HELD"]
                 write_globs = self._claimed_write_globs(task_id, writes)
+                if self.strict_writeset:
+                    # P5 strict: 궤도-밖 경로를 **commit 전에** staged 에서 제외 → 위반이 history
+                    # 진입 못 함(no wedge). 밖-경로는 working tree 에 보존(uncommitted) + 라우드
+                    # 리포트. in-orbit 변경이 하나도 없으면 ok:False(nothing_in_orbit). git add -A
+                    # 로 재staged 되어도 매 commit 마다 일관 제외 → livelock 0(기본 off=advisory).
+                    self.git.stage_all(t["worktree"])
+                    excluded = [p for p in self.git.staged_paths(t["worktree"])
+                                if not path_in_globs(p, write_globs)]
+                    if excluded:
+                        self.git.unstage(t["worktree"], excluded)
+                        self._emit("commit_excluded_out_of_orbit", task_id, excluded=excluded)
+                    try:
+                        sha = self.git.commit_staged(t["worktree"], msg)
+                    except GitNothingToCommit:
+                        return cache.set({"ok": False, "reason": "nothing_in_orbit",
+                                          "excluded": excluded, "claimed": write_globs,
+                                          "task_id": task_id})
+                    self._emit("task_committed", t["agent_id"], task=task_id, sha=sha)
+                    res = {"ok": True, "sha": sha}
+                    if excluded:
+                        res["excluded_out_of_orbit"] = excluded
+                    return cache.set(res)
+                # ---- advisory(기본) 경로 — 기존 동작 불변(commit 후 자문 감사, connect가 권위 거부) ----
+                sha = self.git.commit_all(t["worktree"], msg)
+                self._emit("task_committed", t["agent_id"], task=task_id, sha=sha)
                 offending = self._writeset_audit(task_id, t["branch"], write_globs)
                 res = {"ok": True, "sha": sha}
                 if offending:
-                    if self.strict_writeset:
-                        # P5 strict: commit-time 즉시 거부 + soft-reset 롤백(작업물은 보존 —
-                        # 밖-경로만 빼고 재커밋 가능). 기본 off 면 아래 advisory(하위호환).
-                        self.git.undo_last_commit(t["worktree"])
-                        self._emit("commit_rejected", task_id,
-                                   reason="writeset_violation", offending=offending)
-                        return cache.set({"ok": False, "reason": "writeset_violation",
-                                          "offending": offending, "claimed": write_globs,
-                                          "task_id": task_id, "sha": sha, "reverted": True})
                     # 자문 경고 — connect에서 거부될 것임. 물방울은 지금 바로잡아야 한다.
                     self._emit("commit_writeset_warning", task_id, offending=offending)
                     res["writeset_violation"] = True
@@ -1244,11 +1258,10 @@ class Coordinator:
             try:
                 cr = self.commit(task_id, msg, agent_id, fence,
                                  request_id=_rid("commit"), bail_epoch=bail_epoch)
+            except GitNothingToCommit:
+                cr = {"ok": True, "noop": True}   # 변경 없음(구조적 판별) — commit skip
             except (GitError, GitTimeout) as e:
-                if "nothing to commit" in str(e).lower() or "no changes" in str(e).lower():
-                    cr = {"ok": True, "noop": True}   # 변경 없음 — commit skip
-                else:
-                    return {"ok": False, "stage": "commit", "error": str(e)}
+                return {"ok": False, "stage": "commit", "error": str(e)}   # 진짜 실패는 은폐 안 함
             if cr.get("ok") is False:
                 return {**cr, "ok": False, "stage": "commit"}
             committed = not cr.get("noop")

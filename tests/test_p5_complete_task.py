@@ -74,6 +74,18 @@ def test_msg_none_skips_commit(tmp_path):
     assert r["ok"] is True and r["state"] == "MERGED" and r["committed"] is False
 
 
+def test_msg_given_but_nothing_to_commit_skips_structurally(tmp_path):
+    """Fig4: msg 줬는데 새 변경 없음 → GitNothingToCommit(구조적)로 commit skip(부분문자열 추측 X).
+    진짜 commit 실패는 안 삼키고, 빈 변경만 정확히 skip."""
+    repo = tmp_path / "repo"; _init(repo)
+    omd = Coordinator(db_path=str(tmp_path / "o.db"), repo=str(repo),
+                      worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
+    _claim_and_write(omd, {"a/x.py": "x=1\n"})
+    omd.commit("A", "real commit")                    # a/x.py 이미 커밋
+    r = omd.complete_task("A", "redundant — nothing new")   # msg 주지만 새 변경 0
+    assert r["ok"] is True and r["state"] == "MERGED" and r["committed"] is False
+
+
 def test_push_override_syncs_remote(tmp_path):
     repo = tmp_path / "repo"
     remote = _init(repo, with_remote=True, tmp=tmp_path)
