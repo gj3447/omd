@@ -668,7 +668,30 @@ class Coordinator:
                                      released_at=time.time())
                 self._emit("merge_token_reclaimed", mt["agent_id"],
                            orbit_id=mt["orbit_id"], reason="recover")
+            # §3.D 배리어-bound 단위복구(증분11) — task-단위 조정이 끝난 *뒤* 배리어를 단위로
+            # 조정한다(위에서 CONNECTING 이 전부 MERGED/DONE 으로 수렴했으므로 여기의 멤버
+            # 상태 = git 진실).
+            self._barrier_recover()
             self._promote_pending()
+
+    def _barrier_recover(self):
+        """§3.D: TRIPPING 중 크래시한 배리어를 *단위*로 조정(임계구역 안, _recover 말미).
+        전 멤버 MERGED = 트립이 사실상 완료 → TRIPPED 전진수정. 일부만 MERGED = 반쪽 트립 →
+        BROKEN(coordinator_crash_partial_trip) fail-loud — "BROKEN 신호 없이 반쪽 MERGED" 함정
+        폐쇄. MERGED 는 단조 사실이라 되돌리지 않고(§D5 deviation 1과 동일 계약), 미응결
+        task 는 task-단위 복구가 이미 재시도 가능 상태로 되돌려 놓았다. ARMED/종단은 불가침."""
+        for b in self.store.all_barriers(states=["TRIPPING"]):
+            parts = self.store.barrier_parties(b["barrier_id"], b["generation"])
+            tasks = [self.store.get_task(p["task_id"]) for p in parts]
+            if parts and all(t is not None and t["state"] == "MERGED" for t in tasks):
+                self.store.set_barrier(b["barrier_id"],
+                                       state=fsm.advance("barrier", "TRIPPING", "trip"))
+                self._emit("barrier_recovered", b["name"], barrier=b["name"],
+                           generation=b["generation"], outcome="tripped")
+            else:
+                self._break_barrier(b, reason="coordinator_crash_partial_trip")
+                self._emit("barrier_recovered", b["name"], barrier=b["name"],
+                           generation=b["generation"], outcome="broken")
 
     # ---- write-set 파일시스템 감사 (§D10, P0-11 = "최대 구멍") ----
     def _claimed_write_globs(self, task_id, writes) -> list[str]:
@@ -2210,6 +2233,39 @@ class Coordinator:
                                       "noop": True})
                 self._break_barrier(b, reason="aborted")
                 return cache.set({"ok": True, "state": "BROKEN", "name": name})
+
+    def barrier_consume(self, name, agent_id=None, *, request_id=None, bail_epoch=None):
+        """TRIPPED 배리어의 결과를 수거(§D5 CONSUMED 종단, 증분11) — 멤버별 merge_sha 동봉.
+        TRIPPED 에서만 유효(ARMED/TRIPPING=아직 결과 없음, BROKEN=수거할 성공 없음);
+        CONSUMED 재호출은 멱등 noop(결과 재동봉). 수거는 관측이 아니라 소비의 표식 —
+        같은 세대를 두 번 소비하는 파이프라인 버그를 FSM 이 잡아준다."""
+        with self._cs():
+            with self._idem(request_id, agent_id, "barrier_consume", [name]) as cache:
+                if cache.hit:
+                    return cache.value
+                dead = self._check_alive(agent_id, bail_epoch)
+                if dead:
+                    return cache.set(dead)
+                b = self.store.barrier_by_name(name)
+                if b is None:
+                    return cache.set({"ok": False, "reason": "no such barrier",
+                                      "name": name})
+                if b["state"] not in ("TRIPPED", "CONSUMED"):
+                    return cache.set({"ok": False, "state": b["state"], "name": name,
+                                      "reason": f"not TRIPPED: {b['state']} — 수거할 결과 없음"})
+                parts = self.store.barrier_parties(b["barrier_id"], b["generation"])
+                results = [{"task_id": p["task_id"],
+                            "merge_sha": (self.store.get_task(p["task_id"]) or {}).get("merge_sha")}
+                           for p in parts]
+                if b["state"] == "TRIPPED":
+                    self.store.set_barrier(b["barrier_id"],
+                                           state=fsm.advance("barrier", "TRIPPED", "consume"))
+                    self._emit("barrier_consumed", name, barrier=name,
+                               generation=b["generation"])
+                    return cache.set({"ok": True, "state": "CONSUMED", "name": name,
+                                      "generation": b["generation"], "results": results})
+                return cache.set({"ok": True, "state": "CONSUMED", "name": name, "noop": True,
+                                  "generation": b["generation"], "results": results})
 
     def barrier_status(self, name):
         """배리어 현황(상태/세대/도착/참가). 관측용 — 내부 sweep 으로 사망/타임아웃 반영."""

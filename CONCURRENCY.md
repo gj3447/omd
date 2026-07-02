@@ -722,10 +722,25 @@ FEEDBACK P2 + 현장실측(jg_bpc kjra~200: adoption 0%·hot 30파일, env.py/mo
   경보 아님 — P3 부분 해소). shared 궤도 없는 task 의 충돌은 기존 '구조적 불가=경보' 의미론 불변.
 - 가드: `tests/test_p2_shared_lane.py` 5종(공존/배타보존/automerge/shared_conflict/경보 음성컨트롤).
 
+### ✅ 증분 11 — §3.D 배리어-bound 재기동 단위복구 + TRIPPED→CONSUMED 수거 — DONE
+
+증분8 deviation 3·4(정직 표기 부채)를 닫는다.
+
+- **`_barrier_recover()`** (`_recover()` 말미, task-단위 조정 *후*): TRIPPING 잔해를 단위로 조정 —
+  전 멤버 MERGED(git 진실) → **TRIPPED 전진수정**; 일부만 MERGED → **BROKEN
+  (`coordinator_crash_partial_trip`)** fail-loud. "BROKEN 신호 없이 반쪽 MERGED"(§3.D 함정) 폐쇄.
+  MERGED 는 단조 사실로 유지(증분8 deviation 1과 동일 계약), 미응결 task 는 task-단위 복구가
+  재시도 가능 상태로 되돌림. ARMED/종단 배리어는 불가침.
+- **`barrier_consume(name, agent)`** (MCP 동반 노출): TRIPPED→CONSUMED 종단 + 멤버별 merge_sha
+  수거. 비-TRIPPED 거부(수거할 결과 없음), CONSUMED 재호출은 멱등 noop(결과 재동봉) — 같은
+  세대 이중 소비를 FSM 이 잡는다.
+- 가드: `tests/test_p4_barrier_restart.py` 5종(전진수정/부분트립 BROKEN/ARMED 무해/수거+멱등/비-TRIPPED 거부).
+  적합성 `barrier_restart_recovery` 를 must=True 로 승격(회귀가드).
+
 ### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
-§3.D 배리어 재기동 단위복구 · D13 git/FS 장애 분류 · D14 leader heartbeat 자동주기/페일오버.
+D13 git/FS 장애 분류 · D14 leader heartbeat 자동주기/페일오버 · periodic sweep(§7).
 (P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6, D4 = 증분7, D5 = 증분8, D12+D14 = 증분9,
-P2 shared 레인 = 증분10 에서 닫힘.)
+P2 shared 레인 = 증분10, §3.D 배리어 재기동+CONSUMED = 증분11 에서 닫힘.)
 
 ---
 
