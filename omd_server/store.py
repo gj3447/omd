@@ -162,6 +162,9 @@ _MIGRATIONS = [
     ("orbits", "read_gen", "INTEGER"),
     ("orbits", "stale", "INTEGER NOT NULL DEFAULT 0"),
     ("tasks", "read_synced_gen", "INTEGER"),
+    # P2 shared 레인: hot 공유파일 glob 선언(배타 writes 와 분리 — next_task 가 shared HELD
+    # 와의 겹침은 허용, connect 응결은 3-way).
+    ("tasks", "shared", "TEXT NOT NULL DEFAULT '[]'"),
 ]
 
 
@@ -373,14 +376,15 @@ class Store:
             "AND expires_at IS NOT NULL AND expires_at<=?", (now,)))
 
     # --- tasks ---
-    def add_task(self, *, task_id, name, writes, reads, deps, state, priority):
+    def add_task(self, *, task_id, name, writes, reads, deps, state, priority, shared=None):
         self.db.execute(
-            "INSERT INTO tasks(task_id,name,writes,reads,deps,state,priority,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET "
+            "INSERT INTO tasks(task_id,name,writes,reads,deps,state,priority,created_at,shared)"
+            " VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET "
             "name=excluded.name,writes=excluded.writes,reads=excluded.reads,"
-            "deps=excluded.deps,priority=excluded.priority",
+            "deps=excluded.deps,priority=excluded.priority,shared=excluded.shared",
             (task_id, name, json.dumps(writes), json.dumps(reads),
-             json.dumps(deps), state, priority, time.time()))
+             json.dumps(deps), state, priority, time.time(),
+             json.dumps(shared or [])))
 
     def get_task(self, task_id) -> dict | None:
         return _row(self.db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)))

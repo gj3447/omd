@@ -46,6 +46,12 @@ from .store import Store
 MERGE_TIMEOUT_S = 120.0
 MERGE_PIN_GRACE_S = 60.0
 
+# P2 shared 레인: write-동급 궤도 mode. "shared" = hot 공유파일 전용 — 같은 경로에 shared↔shared
+# 동시 HELD 를 허용하고(직렬화 마찰 제거) 응결은 git 3-way 에 맡긴다. 진짜 충돌(같은 hunk)은
+# connect 에서 shared_conflict(정상사건·retryable)로 표면화. write-set 감사/fence/해제 경로에선
+# write 와 동급으로 취급돼 disjoint(write) 궤도의 배타 의미론은 불변.
+WRITE_MODES = ("write", "shared")
+
 # D3 단조 LATCH 랭크(§D3): done(1) < merged(2). 하향 set 은 거부, 동값 재발행은 멱등 no-op.
 # 0 = 랭크 없는 일반 LATCH(임의 값, 단조검사 안 함). 의존 해제는 =merged 에 건다(§3.H).
 LATCH_RANK = {"done": 1, "merged": 2}
@@ -233,10 +239,13 @@ class Coordinator:
 
     # ---- 내부 (모두 임계구역 안에서 호출됨) ----
     def _conflicts(self, pathspec, mode) -> list[str]:
-        """pathspec/mode가 충돌하는 활성 HELD 궤도 id들. read↔read는 공존."""
+        """pathspec/mode가 충돌하는 활성 HELD 궤도 id들. read↔read 공존; shared↔shared 공존
+        (P2 hot 공유파일 레인 — 응결은 3-way, 배타 write/read 와 겹치면 여전히 충돌)."""
         out = []
         for o in self.store.held_orbits():
             if mode == "read" and o["mode"] == "read":
+                continue
+            if mode == "shared" and o["mode"] == "shared":
                 continue
             if sets_overlap(pathspec, json.loads(o["pathspec"])):
                 out.append(o["orbit_id"])
@@ -491,7 +500,8 @@ class Coordinator:
         if agent_id is not None and t["agent_id"] not in (agent_id, None):
             return {"ok": False, "reason": "not owner", "owner": t["agent_id"],
                     "fenced_out": True}
-        writes = [o for o in self.store.orbits_for_task(task_id) if o["mode"] == "write"]
+        writes = [o for o in self.store.orbits_for_task(task_id)
+                  if o["mode"] in WRITE_MODES]
         stale = [o["orbit_id"] for o in writes if o["state"] != "HELD"]
         if not stale:
             for o in writes:
@@ -687,7 +697,7 @@ class Coordinator:
     def _release_task_write_orbits(self, task_id):
         """task의 HELD write-orbit 전부 해제 + unpin(merge_sha 기록 *후* 호출 — P0-6 순서)."""
         for o in self.store.orbits_for_task(task_id):
-            if o["mode"] == "write" and o["state"] == "HELD":
+            if o["mode"] in WRITE_MODES and o["state"] == "HELD":
                 self.store.set_orbit(o["orbit_id"],
                                      state=fsm.advance("orbit", "HELD", "release"),
                                      released_at=time.time(), merging=0, merge_deadline=None)
@@ -702,11 +712,12 @@ class Coordinator:
         if t:
             try:
                 globs.extend(json.loads(t["writes"] or "[]"))
+                globs.extend(json.loads(t["shared"] or "[]"))
             except (TypeError, ValueError):
                 pass
         # write-orbit pathspec(해제 직전에 부르므로 아직 잡을 수 있을 때 합집합) 도 포함.
         for o in self.store.orbits_for_task(task_id):
-            if o["mode"] == "write":
+            if o["mode"] in WRITE_MODES:
                 globs.extend(json.loads(o["pathspec"]))
         return list(dict.fromkeys(globs))  # 중복 제거(순서 보존)
 
@@ -811,7 +822,7 @@ class Coordinator:
                     return cache.set({"ok": False, "reason": "no such task"})
                 # 소유+fence: caller 가 이 task 의 HELD write-orbit 을 (agent,fence)로 쥐어야.
                 writes = [o for o in self.store.orbits_for_task(task_id)
-                          if o["mode"] == "write"]
+                          if o["mode"] in WRITE_MODES]
                 live = [o for o in writes if o["state"] == "HELD"]
                 if not live:
                     return cache.set({"ok": False, "reason": "no held write orbit for task",
@@ -834,7 +845,10 @@ class Coordinator:
                                   "stale": False})
 
     # ---- 공개 API (= MCP 툴 / CLI 동사) ----
-    def declare(self, task_id, *, name="", writes=None, reads=None, deps=None, priority=0):
+    def declare(self, task_id, *, name="", writes=None, reads=None, deps=None, priority=0,
+                shared=None):
+        """shared(P2 레인): hot 공유파일 glob — 배타 writes 와 달리 다른 task 의 shared 궤도와
+        겹쳐도 next_task/claim 을 막지 않는다(응결은 3-way, 충돌 시 shared_conflict retryable)."""
         with self._cs():
             # P0-10/§D7: deps가 의존 DAG에 사이클을 만들면 거부(그래프 불변) — 안 그러면
             # 상호의존(A after B, B after A)이 둘 다 영구 BLOCKED. self-dep 도 잡힌다.
@@ -846,7 +860,7 @@ class Coordinator:
                             "task_id": task_id}
             self.store.add_task(task_id=task_id, name=name, writes=writes or [],
                                 reads=reads or [], deps=deps or [], state="PENDING",
-                                priority=priority)
+                                priority=priority, shared=shared or [])
         return {"ok": True, "task_id": task_id, "state": "PENDING"}
 
     def depend(self, task_id, after):
@@ -1053,7 +1067,9 @@ class Coordinator:
             return {"expired": sorted(before - after)}
 
     def next_task(self, agent_id):
-        """deps 충족 + write-set이 활성 HELD와 서로소인 작업 1개 → READY로 올려 반환."""
+        """deps 충족 + write-set이 활성 HELD와 서로소인 작업 1개 → READY로 올려 반환.
+        P2 레인: 선언 shared glob 은 shared HELD 궤도와의 겹침은 허용(공존) — 배타(write/read)
+        HELD 와 겹치면 여전히 대기."""
         with self._cs():
             self._sweep_inline()
             held = self.store.held_orbits()
@@ -1064,6 +1080,10 @@ class Coordinator:
                     continue
                 writes = json.loads(t["writes"])
                 if any(sets_overlap(writes, spec) for spec, _ in held_specs):
+                    continue
+                shared = json.loads(t["shared"] or "[]") if "shared" in t.keys() else []
+                if any(sets_overlap(shared, spec)
+                       for spec, m in held_specs if m != "shared"):
                     continue
                 if t["state"] != "READY":
                     self.store.set_task(t["task_id"],
@@ -1132,7 +1152,7 @@ class Coordinator:
                     return cache.set(bad)
                 t = self.store.get_task(task_id)
                 writes = [o for o in self.store.orbits_for_task(task_id)
-                          if o["mode"] == "write" and o["state"] == "HELD"]
+                          if o["mode"] in WRITE_MODES and o["state"] == "HELD"]
                 write_globs = self._claimed_write_globs(task_id, writes)
                 if self.strict_writeset:
                     # P5 strict: 궤도-밖 경로를 **commit 전에** staged 에서 제외 → 위반이 history
@@ -1293,7 +1313,8 @@ class Coordinator:
             if t["state"] == "MERGED":
                 return {"ok": True, "noop": True, "task_id": task_id, "state": "MERGED",
                         "merge_sha": t["merge_sha"]}
-            writes = [o for o in self.store.orbits_for_task(task_id) if o["mode"] == "write"]
+            writes = [o for o in self.store.orbits_for_task(task_id)
+                      if o["mode"] in WRITE_MODES]
             if not writes:
                 return {"ok": False, "reason": "no write orbit for task"}
             # P0-4: 모든 write-orbit이 HELD여야(만료/해제면 stale). + 호출자가 (agent,fence)를
@@ -1405,9 +1426,21 @@ class Coordinator:
                 self._release_merge_token_locked(token_id)
                 self._promote_pending()
                 reason = "merge timeout" if isinstance(err, GitTimeout) else "merge conflict"
-                self._emit("connect_aborted", task_id, reason=str(err))
-                return {"ok": False, "reason": f"{reason}: {err}", "task_id": task_id,
-                        "state": "DONE", "retryable": True}
+                out = {"ok": False, "task_id": task_id, "state": "DONE", "retryable": True}
+                # P2 shared 레인: shared 궤도를 쥔 task 의 merge conflict 는 불변식 버그가
+                # 아니라 **정상사건**(같은 hunk 동시편집) — 경보 대신 rebase 복구 힌트(P3).
+                # 배타(write-only) task 의 conflict 는 기존 '구조적 불가=경보' 의미론 유지.
+                shared = any(o["mode"] == "shared"
+                             for o in self.store.orbits_for_task(task_id))
+                if reason == "merge conflict" and shared:
+                    reason = "shared_conflict"
+                    out["hint"] = ("shared-lane 3-way conflict (정상사건) — worktree 브랜치를 "
+                                   "통합 tip 위로 rebase 해 충돌을 해소하고 connect 를 재시도")
+                    self._emit("connect_shared_conflict", task_id, error=str(err))
+                else:
+                    self._emit("connect_aborted", task_id, reason=str(err))
+                out["reason"] = f"{reason}: {err}"
+                return out
             # 성공: P0-6 순서 — merge_sha 먼저 기록 → MERGED → write-orbit 해제(+unpin).
             self.store.set_task(task_id, merge_sha=merge_sha, merged_at=time.time())
             self.store.set_task(task_id, state=fsm.advance("task", "CONNECTING", "merged"))
@@ -1837,7 +1870,7 @@ class Coordinator:
         """이 task 의 HELD write-orbit 들의 capture fence(arrive 시점 기록 / trip 재검증 기준).
         write-orbit 이 하나도 HELD 가 아니면 None(=참가 자격 없음/사망)."""
         writes = [o for o in self.store.orbits_for_task(task_id)
-                  if o["mode"] == "write" and o["state"] == "HELD"]
+                  if o["mode"] in WRITE_MODES and o["state"] == "HELD"]
         if not writes:
             return None
         return max((o["fence"] for o in writes if o["fence"] is not None), default=None)
@@ -2076,7 +2109,8 @@ class Coordinator:
             if t["state"] == "MERGED":
                 return {"ok": True, "noop": True, "task_id": task_id, "state": "MERGED",
                         "merge_sha": t["merge_sha"]}
-            writes = [o for o in self.store.orbits_for_task(task_id) if o["mode"] == "write"]
+            writes = [o for o in self.store.orbits_for_task(task_id)
+                      if o["mode"] in WRITE_MODES]
             if not writes:
                 return {"ok": False, "reason": "no write orbit for task"}
             stale = [o["orbit_id"] for o in writes if o["state"] != "HELD"]
