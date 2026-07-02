@@ -49,6 +49,10 @@ CHECKS = [
           lambda r: "def complete_task" in _src(r, "omd_server/core.py")),
     Check("hot_file_gate", "P2 hot/공유파일 경합 감지", True,
           lambda r: (r / "omd_server" / "hot_files.py").exists()),
+    Check("conflict_recovery_ux", "P3 충돌 진단 동봉 + rerere 레인(증분13)", True,
+          lambda r: "_diagnose_conflict" in _src(r, "omd_server/core.py")
+          and "GitMergeConflict" in _src(r, "omd_server/gitio.py")
+          and "def enable_rerere" in _src(r, "omd_server/gitio.py")),
     # ---- 알려진 잔여 GAP(must=False, 정직히 리포트) ----
     Check("periodic_sweep", "주기적 백그라운드 sweep(§D3/D4: 현재 inline-only→유휴 후 spike)", False,
           lambda r: bool(re.search(r"threading\.Thread|_sweep_thread|class .*SweepThread",

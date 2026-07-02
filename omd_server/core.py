@@ -35,10 +35,10 @@ import time
 import uuid
 from contextlib import contextmanager
 
-from . import fsm
+from . import bypass_audit, fsm
 from .disjoint import path_in_globs, sets_overlap
 from .events import NOOP
-from .gitio import GitError, GitNothingToCommit, GitRepo, GitTimeout
+from .gitio import GitError, GitMergeConflict, GitNothingToCommit, GitRepo, GitTimeout
 from .store import Store
 
 # Phase B(락밖 merge) 서브프로세스 타임아웃(§E — 무한 hang 방지). pin은 이보다 길게 잡아
@@ -139,6 +139,12 @@ class Coordinator:
             if self.integration_branch is None:
                 self.integration_branch = self.git.current_branch()
             self.integration_worktree = self.git.root.rstrip("/") + "-omd-integration"
+            # P3 증분13(O2): rerere 레인 — 물방울 rebase 해소가 기록되고 동일충돌 재발 시
+            # 자동 재적용(rr-cache 는 worktree 공유). fail-soft(rerere 불가여도 OMD 는 동작).
+            try:
+                self.git.enable_rerere()
+            except GitError:
+                pass
         # 재기동 복구(§D8, 멱등) — git↔DB 조정 + dangling merge_token abort.
         self._recover()
 
@@ -1444,6 +1450,28 @@ class Coordinator:
                       "writes": [o["orbit_id"] for o in writes]}
             return {"ok": True, "token_id": token_id, "intent": intent}
 
+    def _diagnose_conflict(self, branch, conflict_files):
+        """P3 증분13(O1): 통합측에서 충돌 경로를 건드린 원인 커밋들을 bypass_audit 분류
+        (direct_commit/foreign_merge/forged_*/omd_connect)와 함께 지목 — '충돌의 범인'을
+        기계가 말한다. fail-soft: 진단 실패는 빈 목록(복구 응답 자체를 막지 않음)."""
+        if not self.git or not branch or not conflict_files:
+            return []
+        try:
+            wt = self._ensure_integration_wt()
+            mb = self.git.merge_base(branch, self.integration_branch, cwd=wt)
+            rows = self.git.commits_touching(f"{mb}..{self.integration_branch}",
+                                             conflict_files, cwd=wt)
+            out = []
+            for r in rows:
+                c = bypass_audit.Commit(sha=r["sha"], parents=r["parents"],
+                                        trailers=r["trailers"], author=r["author"],
+                                        subject=r["subject"])
+                out.append({"sha": r["sha"], "kind": bypass_audit.classify(c).value,
+                            "author": r["author"], "subject": r["subject"]})
+            return out
+        except GitError:
+            return []
+
     def _connect_phase_b(self, intent, push=None):
         """Phase B(**락 밖** — live tx 없음): 전용 통합 worktree에서 merge --no-ff(타임아웃, §E).
         절대 _cs()/store.tx()를 잡지 않는다 — 다른 코디네이터 변이가 이 동안 interleave 가능.
@@ -1485,6 +1513,13 @@ class Coordinator:
                 self._promote_pending()
                 reason = "merge timeout" if isinstance(err, GitTimeout) else "merge conflict"
                 out = {"ok": False, "task_id": task_id, "state": "DONE", "retryable": True}
+                # P3 증분13(O1): 충돌이면 진단 동봉 — 충돌 경로 + 통합측 원인 커밋
+                # (bypass_audit 분류: 우회 여부·작성자까지 지목). Zuul reporter 교훈:
+                # 실패는 유지하되 '왜/무엇 때문에'의 보고가 복구 UX 의 본체.
+                if isinstance(err, GitMergeConflict):
+                    out["conflict_files"] = err.conflicts
+                    out["culprits"] = self._diagnose_conflict(intent.get("branch"),
+                                                              err.conflicts)
                 # P2 shared 레인: shared 궤도를 쥔 task 의 merge conflict 는 불변식 버그가
                 # 아니라 **정상사건**(같은 hunk 동시편집) — 경보 대신 rebase 복구 힌트(P3).
                 # 배타(write-only) task 의 conflict 는 기존 '구조적 불가=경보' 의미론 유지.
@@ -1495,6 +1530,13 @@ class Coordinator:
                     out["hint"] = ("shared-lane 3-way conflict (정상사건) — worktree 브랜치를 "
                                    "통합 tip 위로 rebase 해 충돌을 해소하고 connect 를 재시도")
                     self._emit("connect_shared_conflict", task_id, error=str(err))
+                elif reason == "merge conflict":
+                    out["hint"] = ("배타 write-set 충돌 = out-of-band 우회가 통합을 가른 것"
+                                   "(culprits 로 원인 커밋 확인). worktree 브랜치를 통합 tip "
+                                   "위로 rebase 해 충돌을 해소(해소는 rerere 가 기록·재사용)하고 "
+                                   "connect 를 재시도")
+                    self._emit("connect_aborted", task_id, reason=str(err),
+                               conflicts=out.get("conflict_files", []))
                 else:
                     self._emit("connect_aborted", task_id, reason=str(err))
                 out["reason"] = f"{reason}: {err}"
