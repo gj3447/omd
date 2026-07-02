@@ -309,6 +309,13 @@ def build_server(db_path: str = "omd.db"):
         return omd.barrier_status(name)
 
     @mcp.tool()
+    def barrier_consume(name: str, agent: str | None = None,
+                        request_id: str | None = None, bail_epoch: int | None = None) -> dict:
+        """TRIPPED 배리어 결과 수거(→CONSUMED 종단, 증분11) — 멤버별 merge_sha 동봉.
+        TRIPPED 에서만 유효; CONSUMED 재호출은 멱등 noop(결과 재동봉)."""
+        return omd.barrier_consume(name, agent, request_id=request_id, bail_epoch=bail_epoch)
+
+    @mcp.tool()
     def heartbeat(agent: str, ttl: float | None = None) -> dict:
         """물방울 생존 신호. 끊기면(생존창 초과) 좀비 회수로 궤도/작업 반환.
         ttl= 로 *자기 페이스 선언*(per-agent 생존창) — 인터랙티브 세션은 claim 직후 한 번

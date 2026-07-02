@@ -59,10 +59,9 @@ CHECKS = [
           lambda r: "read_coherence" in _src(r, "omd_server/core.py"),
           "소비자가 옛 base 로 머지(phantom read)하는 것 차단이 자문(non-blocking). "
           "blocking enforce 미구현 — 도입 시 read-gen CAS 게이트 필요."),
-    Check("barrier_restart_recovery", "배리어-bound 재기동 복구(§D5 미구현 P1/P2)", False,
-          lambda r: "barrier_recover" in _src(r, "omd_server/core.py"),
-          "코디네이터 크래시 시 배리어 부분트립 복구가 design-only. "
-          "현재는 sweep 가 ARMED 배리어 break/shrink 만 반영."),
+    Check("barrier_restart_recovery", "§3.D 배리어-bound 재기동 단위복구 + CONSUMED 수거(증분11)", True,
+          lambda r: "_barrier_recover" in _src(r, "omd_server/core.py")
+          and "def barrier_consume" in _src(r, "omd_server/core.py")),
     Check("durable_fsm", "crash-durable FSM(SERVER_SPEC: 처음엔 미도입)", False,
           lambda r: "durable" in _src(r, "omd_server/fsm.py").lower(),
           "FSM 전이가 crash-durable 아님(deferred). 크래시 내성은 store 영속+sweep 회수에 의존."),
