@@ -131,6 +131,13 @@ def build_server(db_path: str = "omd.db"):
         return omd.release(orbit_id, agent, fence, request_id=request_id, bail_epoch=bail_epoch)
 
     @mcp.tool()
+    def cancel(task: str, reason: str = "", request_id: str | None = None) -> dict:
+        """미시작 태스크(PENDING/READY/BLOCKED) 종결 — lease-only 흐름(declare+claim, start 미경유)
+        의 태스크를 PENDING 잔류 없이 닫는다(→ABORTED, requeue 로 재개 가능). 시작된 태스크는
+        거부(finish/bail 경유). 멱등(F4, 채택마찰 2026-07-02)."""
+        return omd.cancel(task, reason=reason, request_id=request_id)
+
+    @mcp.tool()
     def renew(orbit_id: str, agent: str, fence: int, ttl: float = 600.0,
               request_id: str | None = None, bail_epoch: int | None = None) -> dict:
         """궤도 lease 갱신(keepalive, TTL/3 주기). 소유+fence 불일치=FENCED_OUT."""
@@ -302,9 +309,11 @@ def build_server(db_path: str = "omd.db"):
         return omd.barrier_status(name)
 
     @mcp.tool()
-    def heartbeat(agent: str) -> dict:
-        """물방울 생존 신호. 끊기면(agent_ttl 초과) 좀비 회수로 궤도/작업 반환."""
-        return omd.heartbeat(agent)
+    def heartbeat(agent: str, ttl: float | None = None) -> dict:
+        """물방울 생존 신호. 끊기면(생존창 초과) 좀비 회수로 궤도/작업 반환.
+        ttl= 로 *자기 페이스 선언*(per-agent 생존창) — 인터랙티브 세션은 claim 직후 한 번
+        heartbeat(agent, ttl=3600) 식으로 선언할 것(미선언=기계 물방울 crash-fast 기본)."""
+        return omd.heartbeat(agent, ttl=ttl)
 
     @mcp.tool()
     def sweep() -> dict:
