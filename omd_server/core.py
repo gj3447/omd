@@ -385,12 +385,12 @@ class Coordinator:
             self.store.gc_idem(now - self.idem_ttl)
 
     def _reclaim_zombies_inline(self):
-        """heartbeat 끊긴 물방울(involuntary) — 단일 회수 루틴으로 위임."""
+        """heartbeat 끊긴 물방울(involuntary) — 단일 회수 루틴으로 위임.
+        F2: 생존창은 per-agent(liveness_ttl 선언, 미선언=agent_ttl) — 판정은 store 쿼리가 원자."""
         if not self.agent_ttl:
             return []
-        cutoff = time.time() - self.agent_ttl
         out = []
-        for a in self.store.stale_agents(cutoff):
+        for a in self.store.stale_agents(time.time(), self.agent_ttl):
             self._reclaim_agent_inline(a["agent_id"], voluntary=False)
             out.append(a["agent_id"])
         return out
@@ -993,6 +993,7 @@ class Coordinator:
                 dead = self._check_alive(agent_id, bail_epoch)
                 if dead:
                     return cache.set(dead)
+                self.store.upsert_agent(agent_id)   # F2: 활동=생존신호(mutating verb 가 liveness touch)
                 o = self.store.get_orbit(orbit_id)
                 if not o:
                     return cache.set({"ok": False, "reason": "no such orbit"})
@@ -1019,10 +1020,14 @@ class Coordinator:
                     return cache.value
                 return cache.set(self._reclaim_agent_inline(agent_id, voluntary=True))
 
-    def heartbeat(self, agent_id):
+    def heartbeat(self, agent_id, *, ttl=None):
         """물방울 생존 신호. §D6 표: 이미 회수(RETIRED)된 좀비에겐 `{fenced_out:true}` 회신 →
         좀비가 다음 heartbeat에서 자기 죽음을 안다(advisory). 살아있으면 현재 bail_epoch를 회신해
-        물방울이 이후 변이에 실어 보내면 회수 후 부활을 서버가 거부할 수 있다(§D6)."""
+        물방울이 이후 변이에 실어 보내면 회수 후 부활을 서버가 거부할 수 있다(§D6).
+
+        F2(채택마찰 2026-07-02): `ttl=` 로 *자기 페이스를 선언* — 이 agent 의 per-agent 생존창
+        (liveness_ttl). 인터랙티브 세션(verb 간 침묵 수십 분)이 claim 직후 한 번 선언하면 좀비
+        회수가 그 창을 존중한다. 미선언 agent 는 기본 agent_ttl(기계 물방울 crash-fast §D2 불변)."""
         with self._cs():
             ag = self.store.get_agent(agent_id)
             if ag is not None and ag["state"] == "RETIRED":
@@ -1030,6 +1035,8 @@ class Coordinator:
                 return {"ok": False, "fenced_out": True, "reason": "agent reclaimed",
                         "bail_epoch": ag["bail_epoch"]}
             self.store.upsert_agent(agent_id)
+            if ttl is not None:
+                self.store.set_agent_liveness_ttl(agent_id, float(ttl) if ttl else None)
             # D3(§1.2 / D2 §): heartbeat 한 번이 이 agent 의 모든 hb_bound flag_ephemeral lease 를
             # 갱신 — 건강한 producer 가 renew 깜빡해 자기 신호 플래그가 BROKEN 되는 일 방지.
             renewed = 0
@@ -1146,6 +1153,8 @@ class Coordinator:
                 dead = self._check_alive(agent_id, bail_epoch)
                 if dead:
                     return cache.set(dead)
+                if agent_id:
+                    self.store.upsert_agent(agent_id)   # F2: 활동=생존신호
                 bad = self._check_task_write_fence(task_id, agent_id, fence)
                 if bad:
                     self._emit("commit_rejected", task_id, reason=bad["reason"])
@@ -1200,6 +1209,8 @@ class Coordinator:
                 dead = self._check_alive(agent_id, bail_epoch)
                 if dead:
                     return cache.set(dead)
+                if agent_id:
+                    self.store.upsert_agent(agent_id)   # F2: 활동=생존신호
                 bad = self._check_task_write_fence(task_id, agent_id, fence)
                 if bad:
                     self._emit("finish_rejected", task_id, reason=bad["reason"])
@@ -1212,6 +1223,30 @@ class Coordinator:
                 self.store.set_flag(task_id, "done", set_by=t["agent_id"])
                 self._emit("task_finished", t["agent_id"], task=task_id)
                 return cache.set({"task_id": task_id, "state": "DONE"})
+
+    def cancel(self, task_id, *, reason="", request_id=None):
+        """F4(채택마찰 2026-07-02): **미시작** 태스크의 종결 verb — lease-only 흐름(declare+claim,
+        start 미경유)의 태스크가 PENDING 으로 영구 잔류하던 갭 봉합. FSM 의 기존 `abort` 전이
+        (source="*") 재사용이라 상태기계/TLA 모델 무변경 — PENDING/READY/BLOCKED → ABORTED(종결,
+        requeue 로 재개 가능). 시작된 태스크(IN_ORBIT 이후)는 거부 — 진행중 작업의 무단 증발 금지,
+        finish/bail 경유. 멱등: 이미 ABORTED 면 {ok, already}. 미존재는 fail-loud(캐시 안 함)."""
+        with self._cs():
+            with self._idem(request_id, task_id, "cancel", [task_id]) as cache:
+                if cache.hit:
+                    return cache.value
+                t = self.store.get_task(task_id)
+                if t is None:
+                    return {"ok": False, "reason": "no such task"}       # 캐시 금지 — 이후 declare 가능
+                if t["state"] == "ABORTED":
+                    return cache.set({"ok": True, "already": True, "state": "ABORTED"})
+                if t["state"] not in ("PENDING", "READY", "BLOCKED"):
+                    return {"ok": False,                                  # 캐시 금지 — finish 후 재시도 무해
+                            "reason": f"cancel 은 미시작 태스크 전용(state={t['state']}) — "
+                                      f"시작된 작업은 finish/bail 경유"}
+                s = fsm.advance("task", t["state"], "abort")
+                self.store.set_task(task_id, state=s)
+                self._emit("task_cancelled", task_id, task=task_id, reason=reason)
+                return cache.set({"ok": True, "state": s, "reason": reason})
 
     # ---- CLOUD CONNECT — split-phase A–B–C (§3.B/§D8/§D11) ----
     def connect(self, task_id, agent_id=None, fence=None, push=None, *, request_id=None,

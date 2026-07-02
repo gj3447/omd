@@ -69,7 +69,10 @@ CREATE TABLE IF NOT EXISTS agents (
   -- 증분5(§D6): 좀비 GC-pause 부활 방지. reclaim 이 단조 증가시키고, 변이는 caller가 든
   -- bail_epoch가 현재값과 일치하는지 본다. 재생성(같은 id 재upsert)해도 epoch는 보존 → 낡은
   -- epoch를 든 좀비는 FENCED_OUT. heartbeat 의 state 리셋(WORKING)으로는 못 우회한다.
-  bail_epoch INTEGER NOT NULL DEFAULT 0
+  bail_epoch INTEGER NOT NULL DEFAULT 0,
+  -- F2(채택마찰 2026-07-02): per-agent 생존창 — 인터랙티브 세션(verb 간 침묵 수십 분이 정상 페이스)
+  -- 이 heartbeat(ttl=)로 *명시 선언*. NULL=기본 agent_ttl(기계 물방울 crash-fast §D2 불변).
+  liveness_ttl REAL
 );
 CREATE TABLE IF NOT EXISTS flags (
   key TEXT PRIMARY KEY, value TEXT, set_by TEXT, set_at REAL,
@@ -137,6 +140,7 @@ INSERT OR IGNORE INTO meta(key,value) VALUES('fence','0');
 
 # 기존 DB(증분1·2 스키마)에도 증분3 컬럼을 멱등 추가 — fresh-DB는 위 CREATE로 이미 가짐.
 _MIGRATIONS = [
+    ("agents", "liveness_ttl", "REAL"),   # F2: per-agent 생존창(heartbeat(ttl=) 선언, NULL=기본)
     ("orbits", "kind", "TEXT NOT NULL DEFAULT 'orbit'"),
     ("orbits", "resource_key", "TEXT"),
     ("orbits", "merging", "INTEGER NOT NULL DEFAULT 0"),
@@ -549,9 +553,20 @@ class Store:
         self.db.execute(
             "UPDATE agents SET bail_epoch=bail_epoch+1 WHERE agent_id=?", (agent_id,))
 
-    def stale_agents(self, cutoff) -> list[dict]:
+    def set_agent_liveness_ttl(self, agent_id, ttl):
+        """F2: per-agent 생존창 선언(heartbeat(ttl=) 경유). None=기본 agent_ttl 복귀."""
+        self.db.execute("UPDATE agents SET liveness_ttl=? WHERE agent_id=?", (ttl, agent_id))
+
+    def stale_agents(self, now, default_ttl) -> list[dict]:
+        """좀비 후보 = 자기 생존창(liveness_ttl, 미선언=default_ttl)을 넘긴 heartbeat 침묵.
+
+        F2(채택마찰 2026-07-02): lease 는 liveness 계약이 아니다 — 죽은 agent 의 긴 lease 를
+        agent_ttl 로 빨리 회수하는 §D2 crash-fast 는 *불변*. 대신 인터랙티브 세션은 자기 페이스를
+        heartbeat(ttl=)로 명시 선언해 per-agent 창을 갖는다(선언 없으면 기계 물방울 기본)."""
         return _rows(self.db.execute(
-            "SELECT * FROM agents WHERE state!='RETIRED' AND last_heartbeat<?", (cutoff,)))
+            "SELECT * FROM agents WHERE state!='RETIRED' "
+            "AND last_heartbeat < (? - COALESCE(liveness_ttl, ?))",
+            (now, default_ttl)))
 
     def orbits_held_by_agent(self, agent_id) -> list[dict]:
         return _rows(self.db.execute(
