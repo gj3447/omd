@@ -737,10 +737,27 @@ FEEDBACK P2 + 현장실측(consumer_b user~200: adoption 0%·hot 30파일, env.p
 - 가드: `tests/test_p4_barrier_restart.py` 5종(전진수정/부분트립 BROKEN/ARMED 무해/수거+멱등/비-TRIPPED 거부).
   적합성 `barrier_restart_recovery` 를 must=True 로 승격(회귀가드).
 
+### ✅ 증분 12 — D14 멀티프로세스 HA integration 실측 (P6 실측 공백 폐쇄) — DONE
+
+FEEDBACK §P6 "D14 는 단일프로세스 테스트만 — 멀티프로세스/파티션 integration 실측 부재" 응답.
+코드 변경 없음(측정 증분): 기존 D14 기제가 **실제 OS 프로세스 경계**에서 서는지 실측 —
+`tests/test_p6_multiproc_ha.py` 3종, 실 subprocess 드라이버(stdin/stdout 1줄-응답 프로토콜):
+
+- **INV-P6-1 admission**: 살아있는 리더 옆 2호 *프로세스* 기동 = CoordinatorConflict 거부(rc 3).
+- **INV-P6-2 crash takeover**: 리더 SIGKILL(진짜 크래시, resign 없음) → TTL 경과 → 새 프로세스
+  takeover, epoch 단조 +1.
+- **INV-P6-3 GC-pause fence-out**(Kleppmann): 리더 SIGSTOP → TTL 경과 → takeover → SIGCONT 로
+  깨어난 좀비 리더의 heartbeat/claim 전부 FENCED, 새 리더 변이 정상 — split-brain 이중쓰기 봉쇄가
+  프로세스 경계를 넘어 실증. (SQLite WAL + BEGIN IMMEDIATE 의 cross-process 직렬화 확인.)
+
+**P6 잔여의 처분(정직)**: 단일 coordinator+SQLite 는 여전히 SPOF 이나 이는 §7 결정("단일 인스턴스
+강제 + `:memory:` 금지")의 *의도된* 설계 — 페일오버는 위 takeover 로 성립(수동/재기동 기반).
+`transitions` 라이브러리 유지 공백 리스크는 미해소로 남는다(교체는 별도 증분).
+
 ### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
 D13 git/FS 장애 분류 · D14 leader heartbeat 자동주기/페일오버 · periodic sweep(§7).
 (P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6, D4 = 증분7, D5 = 증분8, D12+D14 = 증분9,
-P2 shared 레인 = 증분10, §3.D 배리어 재기동+CONSUMED = 증분11 에서 닫힘.)
+P2 shared 레인 = 증분10, §3.D 배리어 재기동+CONSUMED = 증분11, D14 멀티프로세스 실측 = 증분12 에서 닫힘.)
 
 ---
 
