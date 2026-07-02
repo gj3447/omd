@@ -707,9 +707,25 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
 5. `_ghost_reads` 의 글로브 overlap 은 `sets_overlap`(보수적 — 거짓-양성 가능, soundness 우선).
    거짓-양성이면 불필요한 rebase 1회를 강제할 뿐 분열은 절대 안 남(안전측 실패).
 
+### ✅ 증분 10 — P2 shared 레인: hot 공유파일 3-way 응결 — DONE
+
+FEEDBACK P2 + 현장실측(jg_bpc kjra~200: adoption 0%·hot 30파일, env.py/modbus.py/business_logic.py
+실충돌 파일이 그대로 hot 상위) 응답. disjoint 는 그대로 1급시민 — **hot 파일만** 별도 레인.
+
+- **선언**: `declare(task, shared=[...])` (`tasks.shared` 컬럼) — next_task 가 shared HELD 와의
+  겹침은 허용(배타 write/read HELD 와 겹치면 여전히 대기).
+- **궤도**: `claim(agent, paths, mode="shared")` — shared↔shared 동시 HELD 공존(직렬화 마찰 제거),
+  shared↔write/read 는 여전히 충돌(배타 의미 보존). `WRITE_MODES=("write","shared")` 로 write-set
+  감사(§D10)/fence(D6)/해제/배리어 경로에서 write 동급.
+- **응결**: CLOUD CONNECT 의 git 3-way 가 다른 hunk 편집을 자동 병합. **같은 hunk 진짜 충돌 =
+  정상사건**: `reason="shared_conflict"` + `retryable` + rebase 힌트, DONE 롤백(CONNECTING 좌초/
+  경보 아님 — P3 부분 해소). shared 궤도 없는 task 의 충돌은 기존 '구조적 불가=경보' 의미론 불변.
+- 가드: `tests/test_p2_shared_lane.py` 5종(공존/배타보존/automerge/shared_conflict/경보 음성컨트롤).
+
 ### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
 §3.D 배리어 재기동 단위복구 · D13 git/FS 장애 분류 · D14 leader heartbeat 자동주기/페일오버.
-(P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6, D4 = 증분7, D5 = 증분8, D12+D14 = 증분9 에서 닫힘.)
+(P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6, D4 = 증분7, D5 = 증분8, D12+D14 = 증분9,
+P2 shared 레인 = 증분10 에서 닫힘.)
 
 ---
 

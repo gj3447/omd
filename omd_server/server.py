@@ -154,10 +154,12 @@ def build_server(db_path: str = "omd.db"):
     @mcp.tool()
     def declare(task: str, name: str = "", writes: list[str] | None = None,
                 reads: list[str] | None = None, deps: list[str] | None = None,
-                priority: int = 0) -> dict:
-        """작업의 write-set(궤도)/read-set/의존을 선언."""
+                priority: int = 0, shared: list[str] | None = None) -> dict:
+        """작업의 write-set(궤도)/read-set/의존을 선언. shared = hot 공유파일 glob(P2 레인):
+        배타 writes 와 달리 다른 task 의 shared 와 겹쳐도 병렬 진행 — claim 도 mode='shared' 로,
+        응결은 git 3-way(진짜 충돌 시 shared_conflict retryable + rebase 힌트)."""
         return omd.declare(task, name=name, writes=writes, reads=reads,
-                           deps=deps, priority=priority)
+                           deps=deps, priority=priority, shared=shared)
 
     @mcp.tool()
     def depend(task: str, after: str) -> dict:
