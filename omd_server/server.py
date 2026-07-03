@@ -4,6 +4,7 @@
 fastmcp 미설치 시 import만 가드 (core/cli/tests는 fastmcp 없이 동작).
 
 툴 표면:
+  about()                                   OMD 가 뭔지/뭐가 아닌지 + 표준 운행 루프 (오리엔테이션)
   claim(agent, paths, mode, ttl, task)      궤도 lease 획득 (입체 검사 → HELD or PENDING)
   release(orbit_id) / renew(orbit_id, ttl)
   declare(task, name, writes, reads, deps)  write-set(궤도) 선언
@@ -16,7 +17,40 @@ fastmcp 미설치 시 import만 가드 (core/cli/tests는 fastmcp 없이 동작)
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+
 from .core import Coordinator
+
+# 첫 접점(MCP `initialize`)에서 클라이언트/에이전트에 그대로 노출되는 자기소개.
+# 비어 있으면 에이전트가 OMD 를 'object-model/스키마/계약 정의물'로 오독한다
+# (호스트 프로젝트의 정의·계약 패러다임으로 빈칸을 채움). 그 오독을 구조적으로 차단한다.
+OMD_INSTRUCTIONS = """\
+OMD (Orbital Motion Droplet / 입체운행물방울) — a runtime COORDINATOR for running
+N coding agents in PARALLEL on ONE git repository, with merge conflicts prevented
+*in advance* by server-authoritative disjoint write-set leases + git-worktree
+isolation, then merged back via CLOUD CONNECT.
+
+WHAT IT IS *NOT*: OMD is NOT an object model, NOT a data schema, NOT an acceptance
+contract, and NOT an artifact you must define/author/adopt per project before using
+it. There is nothing to define first. If you were asked to "use/apply OMD on project
+X", that means "coordinate parallel dev on repo X with these tools" — it does NOT
+mean "author an OMD schema/contract and gate it through OOPTDD".
+
+DRIVER LOOP (per task; MCP verbs == CLI verbs):
+  declare(task, writes=[...], deps=[...])   # 1. register disjoint write-sets (orbits)
+  next(agent)                               # 2. get a safe disjoint READY task
+  start(task, agent)                        # 3. launch the agent's git worktree
+  claim(agent, paths, task=...)             # 4. lease the write-set (HELD / PENDING)
+  ...agent edits files only in its worktree...
+  commit(task, msg); finish(task)           # 5. commit + mark DONE
+  connect(task)                             # 6. CLOUD CONNECT = real git merge (fenced)
+
+SYNC PRIMITIVES: barrier_* (rendezvous before merge), flag_* (signals),
+sem_*/acquire (semaphores), heartbeat/sweep/bail (liveness & emergency escape).
+
+Call about() any time to re-read this orientation. Full design: README.md / CONCEPT.md.
+"""
 
 try:
     import anyio
@@ -36,13 +70,14 @@ async def _leader_heartbeat_loop(omd: Coordinator) -> None:
 def _coordinator_lifespan(omd: Coordinator):
     @lifespan
     async def coordinator_lifespan(server):
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(_leader_heartbeat_loop, omd)
-            try:
-                yield {"omd": omd}
-            finally:
-                tg.cancel_scope.cancel()
-                omd.resign()
+        heartbeat_task = asyncio.create_task(_leader_heartbeat_loop(omd))
+        try:
+            yield {"omd": omd}
+        finally:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+            omd.resign()
 
     return coordinator_lifespan
 
@@ -50,8 +85,35 @@ def _coordinator_lifespan(omd: Coordinator):
 def build_server(db_path: str = "omd.db"):
     if FastMCP is None:
         raise RuntimeError("fastmcp 미설치: pip install -e .[server]")
-    omd = Coordinator(db_path)
-    mcp = FastMCP("omd", lifespan=_coordinator_lifespan(omd))
+    # Codex starts stdio MCP servers per client/session. A process-wide singleton
+    # leader lease makes concurrent MCP clients fail before initialize; SQLite
+    # BEGIN IMMEDIATE still serializes cross-process mutations for this surface.
+    omd = Coordinator(db_path, enforce_single_coordinator=False)
+    mcp = FastMCP("omd", instructions=OMD_INSTRUCTIONS, lifespan=_coordinator_lifespan(omd))
+
+    @mcp.tool()
+    def about() -> dict:
+        """OMD 가 무엇이고(병렬 코딩 에이전트 코디네이터) 무엇이 아닌지(정의/스키마/계약이 아님),
+        그리고 표준 운행 루프(declare→next→start→claim→commit→finish→connect)를 돌려준다.
+        OMD 적용을 시작하기 전에/헷갈릴 때 이걸 먼저 호출할 것."""
+        return {
+            "name": "OMD — Orbital Motion Droplet / 입체운행물방울",
+            "is": "병렬 코딩 에이전트 코디네이터 (1 git repo 에서 N 에이전트를 서로소 "
+                  "write-set 으로 충돌 없이 병렬 운행 → CLOUD CONNECT 로 merge)",
+            "is_not": [
+                "object model 아님", "data schema 아님", "acceptance contract 아님",
+                "프로젝트마다 먼저 정의/채택해야 하는 정의물 아님 — 시작 전 작성할 게 없다",
+            ],
+            "driver_loop": [
+                "declare(task, writes=[...], deps=[...])",
+                "next(agent)", "start(task, agent)",
+                "claim(agent, paths, task=...)",
+                "commit(task, msg)", "finish(task)", "connect(task)",
+            ],
+            "sync_primitives": ["barrier_*", "flag_*", "sem_*/acquire",
+                                "heartbeat/sweep/bail"],
+            "docs": ["README.md", "CONCEPT.md", "SERVER_SPEC.md", "CONCURRENCY.md"],
+        }
 
     @mcp.tool()
     def claim(agent: str, paths: list[str], mode: str = "write", ttl: float = 600.0,
@@ -67,6 +129,13 @@ def build_server(db_path: str = "omd.db"):
                 request_id: str | None = None, bail_epoch: int | None = None) -> dict:
         """궤도 lease 반납. 소유+fence 일치해야(아무나 남의 궤도 해제 불가)."""
         return omd.release(orbit_id, agent, fence, request_id=request_id, bail_epoch=bail_epoch)
+
+    @mcp.tool()
+    def cancel(task: str, reason: str = "", request_id: str | None = None) -> dict:
+        """미시작 태스크(PENDING/READY/BLOCKED) 종결 — lease-only 흐름(declare+claim, start 미경유)
+        의 태스크를 PENDING 잔류 없이 닫는다(→ABORTED, requeue 로 재개 가능). 시작된 태스크는
+        거부(finish/bail 경유). 멱등(F4, 채택마찰 2026-07-02)."""
+        return omd.cancel(task, reason=reason, request_id=request_id)
 
     @mcp.tool()
     def renew(orbit_id: str, agent: str, fence: int, ttl: float = 600.0,
@@ -92,10 +161,12 @@ def build_server(db_path: str = "omd.db"):
     @mcp.tool()
     def declare(task: str, name: str = "", writes: list[str] | None = None,
                 reads: list[str] | None = None, deps: list[str] | None = None,
-                priority: int = 0) -> dict:
-        """작업의 write-set(궤도)/read-set/의존을 선언."""
+                priority: int = 0, shared: list[str] | None = None) -> dict:
+        """작업의 write-set(궤도)/read-set/의존을 선언. shared = hot 공유파일 glob(P2 레인):
+        배타 writes 와 달리 다른 task 의 shared 와 겹쳐도 병렬 진행 — claim 도 mode='shared' 로,
+        응결은 git 3-way(진짜 충돌 시 shared_conflict retryable + rebase 힌트)."""
         return omd.declare(task, name=name, writes=writes, reads=reads,
-                           deps=deps, priority=priority)
+                           deps=deps, priority=priority, shared=shared)
 
     @mcp.tool()
     def depend(task: str, after: str) -> dict:
@@ -129,10 +200,23 @@ def build_server(db_path: str = "omd.db"):
 
     @mcp.tool()
     def connect(task: str, agent: str | None = None, fence: int | None = None,
+                push: str | None = None,
                 request_id: str | None = None, bail_epoch: int | None = None) -> dict:
         """CLOUD CONNECT(응결=merge, split-phase). agent/fence를 주면 write-orbit fence==captured
-        까지 재검증(P0-4). 작업 중 lease 만료/ABA면 fencing으로 거부. merge_token으로 직렬화."""
-        return omd.connect(task, agent, fence, request_id=request_id, bail_epoch=bail_epoch)
+        까지 재검증(P0-4). 작업 중 lease 만료/ABA면 fencing으로 거부. merge_token으로 직렬화.
+        push=remote 면 merge 직후 통합브랜치를 그 remote 로 push(없으면 self.auto_push 상속)."""
+        return omd.connect(task, agent, fence, push=push,
+                           request_id=request_id, bail_epoch=bail_epoch)
+
+    @mcp.tool()
+    def complete_task(task: str, msg: str | None = None, agent: str | None = None,
+                      fence: int | None = None, push: str | None = None,
+                      request_id: str | None = None, bail_epoch: int | None = None) -> dict:
+        """P5 원샷(happy-path): (선택)commit → finish → connect(+push) 한 번에. verb 망각-스트랜드
+        (finish 빼면 IN_ORBIT 기아·connect 빼면 미통합) 방지. ok:True 는 오직 최종 state==MERGED;
+        어느 단계 거부든 {ok:False, stage:'commit'|'finish'|'connect', ...}로 fail-loud 전파."""
+        return omd.complete_task(task, msg, agent, fence, push=push,
+                                 request_id=request_id, bail_epoch=bail_epoch)
 
     @mcp.tool()
     def flag_set(key: str, value: str, agent: str | None = None,
@@ -225,9 +309,18 @@ def build_server(db_path: str = "omd.db"):
         return omd.barrier_status(name)
 
     @mcp.tool()
-    def heartbeat(agent: str) -> dict:
-        """물방울 생존 신호. 끊기면(agent_ttl 초과) 좀비 회수로 궤도/작업 반환."""
-        return omd.heartbeat(agent)
+    def barrier_consume(name: str, agent: str | None = None,
+                        request_id: str | None = None, bail_epoch: int | None = None) -> dict:
+        """TRIPPED 배리어 결과 수거(→CONSUMED 종단, 증분11) — 멤버별 merge_sha 동봉.
+        TRIPPED 에서만 유효; CONSUMED 재호출은 멱등 noop(결과 재동봉)."""
+        return omd.barrier_consume(name, agent, request_id=request_id, bail_epoch=bail_epoch)
+
+    @mcp.tool()
+    def heartbeat(agent: str, ttl: float | None = None) -> dict:
+        """물방울 생존 신호. 끊기면(생존창 초과) 좀비 회수로 궤도/작업 반환.
+        ttl= 로 *자기 페이스 선언*(per-agent 생존창) — 인터랙티브 세션은 claim 직후 한 번
+        heartbeat(agent, ttl=3600) 식으로 선언할 것(미선언=기계 물방울 crash-fast 기본)."""
+        return omd.heartbeat(agent, ttl=ttl)
 
     @mcp.tool()
     def sweep() -> dict:

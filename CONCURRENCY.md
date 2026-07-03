@@ -707,9 +707,78 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
 5. `_ghost_reads` 의 글로브 overlap 은 `sets_overlap`(보수적 — 거짓-양성 가능, soundness 우선).
    거짓-양성이면 불필요한 rebase 1회를 강제할 뿐 분열은 절대 안 남(안전측 실패).
 
+### ✅ 증분 10 — P2 shared 레인: hot 공유파일 3-way 응결 — DONE
+
+FEEDBACK P2 + 현장실측(consumer_b user~200: adoption 0%·hot 30파일, env.py/modbus.py/business_logic.py
+실충돌 파일이 그대로 hot 상위) 응답. disjoint 는 그대로 1급시민 — **hot 파일만** 별도 레인.
+
+- **선언**: `declare(task, shared=[...])` (`tasks.shared` 컬럼) — next_task 가 shared HELD 와의
+  겹침은 허용(배타 write/read HELD 와 겹치면 여전히 대기).
+- **궤도**: `claim(agent, paths, mode="shared")` — shared↔shared 동시 HELD 공존(직렬화 마찰 제거),
+  shared↔write/read 는 여전히 충돌(배타 의미 보존). `WRITE_MODES=("write","shared")` 로 write-set
+  감사(§D10)/fence(D6)/해제/배리어 경로에서 write 동급.
+- **응결**: CLOUD CONNECT 의 git 3-way 가 다른 hunk 편집을 자동 병합. **같은 hunk 진짜 충돌 =
+  정상사건**: `reason="shared_conflict"` + `retryable` + rebase 힌트, DONE 롤백(CONNECTING 좌초/
+  경보 아님 — P3 부분 해소). shared 궤도 없는 task 의 충돌은 기존 '구조적 불가=경보' 의미론 불변.
+- 가드: `tests/test_p2_shared_lane.py` 5종(공존/배타보존/automerge/shared_conflict/경보 음성컨트롤).
+
+### ✅ 증분 11 — §3.D 배리어-bound 재기동 단위복구 + TRIPPED→CONSUMED 수거 — DONE
+
+증분8 deviation 3·4(정직 표기 부채)를 닫는다.
+
+- **`_barrier_recover()`** (`_recover()` 말미, task-단위 조정 *후*): TRIPPING 잔해를 단위로 조정 —
+  전 멤버 MERGED(git 진실) → **TRIPPED 전진수정**; 일부만 MERGED → **BROKEN
+  (`coordinator_crash_partial_trip`)** fail-loud. "BROKEN 신호 없이 반쪽 MERGED"(§3.D 함정) 폐쇄.
+  MERGED 는 단조 사실로 유지(증분8 deviation 1과 동일 계약), 미응결 task 는 task-단위 복구가
+  재시도 가능 상태로 되돌림. ARMED/종단 배리어는 불가침.
+- **`barrier_consume(name, agent)`** (MCP 동반 노출): TRIPPED→CONSUMED 종단 + 멤버별 merge_sha
+  수거. 비-TRIPPED 거부(수거할 결과 없음), CONSUMED 재호출은 멱등 noop(결과 재동봉) — 같은
+  세대 이중 소비를 FSM 이 잡는다.
+- 가드: `tests/test_p4_barrier_restart.py` 5종(전진수정/부분트립 BROKEN/ARMED 무해/수거+멱등/비-TRIPPED 거부).
+  적합성 `barrier_restart_recovery` 를 must=True 로 승격(회귀가드).
+
+### ✅ 증분 12 — D14 멀티프로세스 HA integration 실측 (P6 실측 공백 폐쇄) — DONE
+
+FEEDBACK §P6 "D14 는 단일프로세스 테스트만 — 멀티프로세스/파티션 integration 실측 부재" 응답.
+코드 변경 없음(측정 증분): 기존 D14 기제가 **실제 OS 프로세스 경계**에서 서는지 실측 —
+`tests/test_p6_multiproc_ha.py` 3종, 실 subprocess 드라이버(stdin/stdout 1줄-응답 프로토콜):
+
+- **INV-P6-1 admission**: 살아있는 리더 옆 2호 *프로세스* 기동 = CoordinatorConflict 거부(rc 3).
+- **INV-P6-2 crash takeover**: 리더 SIGKILL(진짜 크래시, resign 없음) → TTL 경과 → 새 프로세스
+  takeover, epoch 단조 +1.
+- **INV-P6-3 GC-pause fence-out**(Kleppmann): 리더 SIGSTOP → TTL 경과 → takeover → SIGCONT 로
+  깨어난 좀비 리더의 heartbeat/claim 전부 FENCED, 새 리더 변이 정상 — split-brain 이중쓰기 봉쇄가
+  프로세스 경계를 넘어 실증. (SQLite WAL + BEGIN IMMEDIATE 의 cross-process 직렬화 확인.)
+
+**P6 잔여의 처분(정직)**: 단일 coordinator+SQLite 는 여전히 SPOF 이나 이는 §7 결정("단일 인스턴스
+강제 + `:memory:` 금지")의 *의도된* 설계 — 페일오버는 위 takeover 로 성립(수동/재기동 기반).
+`transitions` 라이브러리 유지 공백 리스크는 미해소로 남는다(교체는 별도 증분).
+
+### ✅ 증분 13 — P3 충돌 복구 UX: 진단 동봉(O1) + rerere 레인(O2) — DONE
+
+FEEDBACK §P3 잔여("경보 이후가 비어있다") 응답. 선행문헌: Zuul merge-conflict reporter(보고
+품질=UX 본체) · git rerere(동일충돌 기록해소 재사용) · jj first-class conflicts. '배타 충돌=경보'
+의미론은 불변 — 경보 *이후*를 채운다.
+
+- **O1 진단 동봉**: `GitMergeConflict`(충돌 경로 동봉) + `core._diagnose_conflict()` — merge
+  conflict 응답에 ①`conflict_files` ②`culprits`(통합측 first-parent 에서 충돌 경로를 건드린
+  원인 커밋, bypass_audit 분류로 우회 여부·작성자·제목까지) ③`hint`(rebase 복구 레시피).
+  shared_conflict 도 files/culprits 를 받는다(의미론 분리 불변). ⚠진단도 **first-parent 워크**
+  필수 — 전체 스캔은 머지에 흡수된 드롭릿 feature 커밋을 우회로 오탐(bypass_audit 와 동일 규율).
+- **O2 rerere 레인**: repo 바인딩 시 `rerere.enabled+autoUpdate`(멱등, rr-cache 는 전 worktree
+  공유 — 물방울 rebase 해소가 기록됨). `merge_into` 가 충돌 시 unmerged 0(기록해소가 전부
+  재적용됨)이면 merge 를 **완성**(--no-edit 로 OMD-Connect trailer 보존 → 재기동 probe 호환),
+  아니면 기존대로 abort+진단.
+- 가드: `tests/test_p3_conflict_ux.py` 4종(우회충돌 진단/shared 진단/rerere 활성/동일충돌 자동
+  재해소→connect 성공). 적합성 `conflict_recovery_ux` must=True.
+- **잔여(O3, 정직)**: resolve-태스크 자동 승격(jj 반영 — 충돌을 큐에 들어가는 정상 작업으로)은
+  미구현 — P1 채택 데이터로 충돌 빈도가 보인 뒤 판단.
+
 ### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
-§3.D 배리어 재기동 단위복구 · D13 git/FS 장애 분류 · D14 leader heartbeat 자동주기/페일오버.
-(P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6, D4 = 증분7, D5 = 증분8, D12+D14 = 증분9 에서 닫힘.)
+D13 git/FS 장애 분류 · D14 leader heartbeat 자동주기/페일오버 · periodic sweep(§7) · P3-O3 resolve-태스크 승격.
+(P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6, D4 = 증분7, D5 = 증분8, D12+D14 = 증분9,
+P2 shared 레인 = 증분10, §3.D 배리어 재기동+CONSUMED = 증분11, D14 멀티프로세스 실측 = 증분12,
+P3 충돌 복구 UX = 증분13 에서 닫힘.)
 
 ---
 
