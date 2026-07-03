@@ -15,8 +15,22 @@ class GitError(RuntimeError):
     pass
 
 
+class GitNothingToCommit(GitError):
+    """staged 변경이 없어 커밋할 게 없음 — 부분문자열/로케일 추측이 아니라 구조적 판별.
+    호출부가 '변경 없음 → skip' 을 정확히 분기하게 해 진짜 commit 실패와 안 섞이게 한다."""
+
+
 class GitTimeout(GitError):
     """merge 서브프로세스가 타임아웃(§E — 무한 hang 방지). abort 대상."""
+
+
+class GitMergeConflict(GitError):
+    """merge 가 내용 충돌로 실패(P3 증분13) — 충돌 경로 목록을 실어 호출부가 진단
+    (원인커밋 지목/복구 레시피)을 만들 수 있게 한다. GitError 하위라 기존 호출부 하위호환."""
+
+    def __init__(self, msg, conflicts=None):
+        super().__init__(msg)
+        self.conflicts = sorted(conflicts or [])
 
 
 class GitRepo:
@@ -66,8 +80,31 @@ class GitRepo:
         return p
 
     def commit_all(self, worktree: str, msg: str) -> str:
-        """worktree의 모든 변경을 스테이지+커밋. 빈 변경이면 GitError."""
+        """worktree의 모든 변경을 스테이지+커밋. 빈 변경이면 GitNothingToCommit(구조적 판별 —
+        `git status --porcelain` 빈값 = 커밋할 것 없음; 부분문자열/로케일 추측 안 함)."""
         self._git("add", "-A", cwd=worktree)
+        if not self._git("status", "--porcelain", cwd=worktree).strip():
+            raise GitNothingToCommit(f"nothing to commit in {worktree}")
+        self._git(*self._IDENT, "commit", "-m", msg, cwd=worktree)
+        return self._git("rev-parse", "HEAD", cwd=worktree)
+
+    # ---- P5 strict-writeset: 궤도-밖 경로를 commit 전에 staged 에서 제외(no wedge) ----
+    def stage_all(self, worktree: str) -> None:
+        self._git("add", "-A", cwd=worktree)
+
+    def staged_paths(self, worktree: str) -> list[str]:
+        out = self._git("diff", "--cached", "--name-only", cwd=worktree)
+        return [p for p in out.splitlines() if p.strip()]
+
+    def unstage(self, worktree: str, paths: list[str]) -> None:
+        """staged 에서 paths 만 빼고(working tree 변경은 보존). git restore --staged."""
+        if paths:
+            self._git("restore", "--staged", "--", *paths, cwd=worktree)
+
+    def commit_staged(self, worktree: str, msg: str) -> str:
+        """이미 staged 된 것만 커밋(add 없이). 빈 index 면 GitNothingToCommit."""
+        if not self.staged_paths(worktree):
+            raise GitNothingToCommit(f"nothing staged in {worktree}")
         self._git(*self._IDENT, "commit", "-m", msg, cwd=worktree)
         return self._git("rev-parse", "HEAD", cwd=worktree)
 
@@ -102,14 +139,78 @@ class GitRepo:
             self._git(*self._IDENT, "merge", "--no-ff", "-m", msg, branch,
                       cwd=wt, timeout=timeout)
         except GitError as e:
+            if isinstance(e, GitTimeout):
+                try:
+                    self._git("merge", "--abort", cwd=wt)
+                except GitError:
+                    pass
+                raise GitTimeout(f"merge timeout on {branch}: {e}")
+            # P3 증분13: 충돌 검사. rerere.autoUpdate 가 기록된 해소로 *전부* 해소했으면
+            # (unmerged 0 + MERGE_HEAD 존재) merge 를 완성한다 — --no-edit 이 MERGE_MSG
+            # (우리 msg + OMD-Connect trailer)를 그대로 써 재기동 trailer-probe 호환.
+            unmerged = self.unmerged_paths(wt)
+            in_merge = self._merge_in_progress(wt)
+            if in_merge and not unmerged:
+                self._git(*self._IDENT, "commit", "--no-edit", cwd=wt)
+                return self._git("rev-parse", "HEAD", cwd=wt)
             try:
                 self._git("merge", "--abort", cwd=wt)
             except GitError:
                 pass
-            if isinstance(e, GitTimeout):
-                raise GitTimeout(f"merge timeout on {branch}: {e}")
-            raise GitError(f"merge conflict on {branch}: {e}")
+            if in_merge:
+                raise GitMergeConflict(f"merge conflict on {branch}: {e}",
+                                       conflicts=unmerged)
+            raise GitError(f"merge failed on {branch}: {e}")
         return self._git("rev-parse", "HEAD", cwd=wt)
+
+    def unmerged_paths(self, worktree: str) -> list[str]:
+        """머지 진행중 worktree 의 미해소 충돌 경로들(구조적 판별 — diff-filter=U)."""
+        out = self._git("diff", "--name-only", "--diff-filter=U", cwd=worktree)
+        return [p for p in out.splitlines() if p.strip()]
+
+    def _merge_in_progress(self, worktree: str) -> bool:
+        try:
+            self._git("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=worktree)
+            return True
+        except GitError:
+            return False
+
+    def enable_rerere(self):
+        """P3 증분13(O2): rerere 활성(멱등, repo 수준 — 모든 worktree 가 rr-cache 공유).
+        물방울이 rebase 로 해소한 충돌이 기록되고, 동일충돌 재발 시(재시도/통합 머지) 자동
+        재적용된다. autoUpdate 로 해소 경로가 staged 까지 되어 merge_into 가 완성 가능."""
+        self._git("config", "rerere.enabled", "true")
+        self._git("config", "rerere.autoUpdate", "true")
+
+    def merge_base(self, a: str, b: str, cwd: str | None = None) -> str:
+        return self._git("merge-base", a, b, cwd=cwd)
+
+    def commits_touching(self, rng: str, paths: list[str], cwd: str | None = None) -> list[dict]:
+        """rng 의 **first-parent** 히스토리에서 paths 를 건드린 커밋들(진단용) —
+        sha/parents/author/subject/OMD-Connect trailer. first-parent 필수: 전체 스캔은
+        머지에 흡수된 드롭릿 feature 커밋을 우회로 오탐한다(bypass_audit 와 동일 규율).
+        --diff-merges=first-parent 로 머지커밋도 1친 대비 diff 로 경로 필터에 걸린다."""
+        fmt = "\x1e%H\x1f%P\x1f%an\x1f%s\x1f%(trailers:key=OMD-Connect,valueonly)"
+        out = self._git("log", "--first-parent", "--diff-merges=first-parent",
+                        f"--format={fmt}", rng, "--", *paths, cwd=cwd)
+        rows = []
+        for rec in out.split("\x1e"):
+            rec = rec.strip("\n")
+            if not rec.strip():
+                continue
+            sha, parents, author, subject, trailers = (rec.split("\x1f") + [""] * 5)[:5]
+            rows.append({"sha": sha, "parents": tuple(parents.split()),
+                         "author": author, "subject": subject,
+                         "trailers": tuple(v for v in trailers.splitlines() if v.strip())})
+        return rows
+
+    def push_integration(self, integration_worktree: str, integration_branch: str,
+                         remote: str, *, timeout: float | None = None) -> None:
+        """통합 worktree 에서 integration_branch 를 remote 로 push(연결=merge 직후 remote sync).
+        네트워크 I/O라 connect Phase B(락 밖)에서 호출. 실패(원격 이동·net)는 호출부가 fail-soft —
+        merge 는 이미 로컬 반영됨이라 connect 성공은 유지. 비fast-forward면 raise(강제 push 안 함)."""
+        wt = str(Path(integration_worktree).resolve())
+        self._git("push", remote, integration_branch, cwd=wt, timeout=timeout)
 
     def branch_in_integration(self, integration_worktree: str, integration_branch: str,
                               trailer: str) -> str | None:

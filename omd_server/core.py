@@ -35,16 +35,22 @@ import time
 import uuid
 from contextlib import contextmanager
 
-from . import fsm
+from . import bypass_audit, fsm
 from .disjoint import path_in_globs, sets_overlap
 from .events import NOOP
-from .gitio import GitError, GitRepo, GitTimeout
+from .gitio import GitError, GitMergeConflict, GitNothingToCommit, GitRepo, GitTimeout
 from .store import Store
 
 # Phase B(락밖 merge) 서브프로세스 타임아웃(§E — 무한 hang 방지). pin은 이보다 길게 잡아
 # 타임아웃→abort→rollback이 완료될 시간을 준다.
 MERGE_TIMEOUT_S = 120.0
 MERGE_PIN_GRACE_S = 60.0
+
+# P2 shared 레인: write-동급 궤도 mode. "shared" = hot 공유파일 전용 — 같은 경로에 shared↔shared
+# 동시 HELD 를 허용하고(직렬화 마찰 제거) 응결은 git 3-way 에 맡긴다. 진짜 충돌(같은 hunk)은
+# connect 에서 shared_conflict(정상사건·retryable)로 표면화. write-set 감사/fence/해제 경로에선
+# write 와 동급으로 취급돼 disjoint(write) 궤도의 배타 의미론은 불변.
+WRITE_MODES = ("write", "shared")
 
 # D3 단조 LATCH 랭크(§D3): done(1) < merged(2). 하향 set 은 거부, 동값 재발행은 멱등 no-op.
 # 0 = 랭크 없는 일반 LATCH(임의 값, 단조검사 안 함). 의존 해제는 =merged 에 건다(§3.H).
@@ -81,7 +87,11 @@ class Coordinator:
                  events=None, integration_branch: str | None = None,
                  merge_timeout: float | None = None, *,
                  coordinator_id: str | None = None, leader_ttl: float = LEADER_TTL_S,
-                 allow_memory_db: bool = False):
+                 allow_memory_db: bool = False,
+                 enforce_single_coordinator: bool = True,
+                 auto_push: str | None = None,
+                 idem_ttl: float | None = 3600.0,
+                 strict_writeset: bool = False):
         # §D14: `:memory:` 디폴트 금지 — 재기동마다 모든 fence/leader_epoch 가 0 으로 리셋되어
         # 낡은 토큰/잔여 merge 와 충돌(고스트 writer). 영속 DB 필수. 단위테스트는 allow_memory_db=
         # True 로 명시 opt-in(프로세스 1개, 재기동 없음 — fence 리셋 위험 없음).
@@ -93,6 +103,7 @@ class Coordinator:
         self.store = Store(db_path)
         self.coordinator_id = coordinator_id or f"coord-{uuid.uuid4().hex[:12]}"
         self.leader_ttl = leader_ttl
+        self.enforce_single_coordinator = enforce_single_coordinator
         self.leader_epoch = None  # 리더 lease 획득 후 채워짐(현 리더 세대)
         # heartbeat 만료 시 좀비 회수. 기본 ON(P0-7) — None=비활성. 끄면 죽은 물방울의
         # 궤도/작업이 영구 고아가 된다(사용자 핵심 우려). 권장 90s, renew는 TTL/3 주기.
@@ -102,9 +113,21 @@ class Coordinator:
         # §D14: 리더 lease 획득 — 살아있는 다른 코디네이터가 있으면 CoordinatorConflict 거부.
         # 이 호출 *전*엔 어떤 변이도(특히 _recover 의 git↔DB 조정) 하면 안 된다(writer 둘 방지).
         # _lock/events/store 가 필요하므로 그것들 뒤에 둔다.
-        self._acquire_leadership()
+        if self.enforce_single_coordinator:
+            self._acquire_leadership()
         self.merge_timeout = merge_timeout if merge_timeout is not None else MERGE_TIMEOUT_S
         self.git = GitRepo(repo) if repo else None
+        # 연결(connect=merge) 직후 통합 브랜치를 이 remote 로 push — 로컬 누적 divergence 방지
+        # (operator "커밋하면 바로 sync"의 OMD 내장판). None=off(기본·기존동작). env OMD_AUTO_PUSH 폴백.
+        # push 실패는 fail-soft(merge 는 로컬 반영됨) — connect 성공 유지.
+        self.auto_push = auto_push if auto_push is not None else (os.environ.get("OMD_AUTO_PUSH") or None)
+        # §D9 멱등 캐시 GC TTL(초). 기본 1h — 어떤 현실적 MCP 재시도 윈도우보다 길어 replay 안전.
+        # None=GC 안 함(기존동작). _sweep_inline 이 idem_ttl 지난 DONE 행 정리(무한누적 차단).
+        self.idem_ttl = idem_ttl
+        # P5 strict-writeset: True 면 commit-time 에 write-set 위반 즉시 거부+soft-reset(빠른 fail-loud).
+        # 기본 off(connect-time enforce 유지=하위호환). env OMD_STRICT_WRITESET 폴백(정확 truthy 파싱).
+        self.strict_writeset = bool(strict_writeset) or (
+            (os.environ.get("OMD_STRICT_WRITESET") or "").strip().lower() in ("1", "true", "yes", "on"))
         self.integration_branch = integration_branch
         self.integration_worktree = None
         self.merge_resource = "cloud:default"   # repo-wide merge_token 키(§D11)
@@ -116,6 +139,12 @@ class Coordinator:
             if self.integration_branch is None:
                 self.integration_branch = self.git.current_branch()
             self.integration_worktree = self.git.root.rstrip("/") + "-omd-integration"
+            # P3 증분13(O2): rerere 레인 — 물방울 rebase 해소가 기록되고 동일충돌 재발 시
+            # 자동 재적용(rr-cache 는 worktree 공유). fail-soft(rerere 불가여도 OMD 는 동작).
+            try:
+                self.git.enable_rerere()
+            except GitError:
+                pass
         # 재기동 복구(§D8, 멱등) — git↔DB 조정 + dangling merge_token abort.
         self._recover()
 
@@ -128,7 +157,8 @@ class Coordinator:
         leader_guard=False 는 리더십 *획득 중*(아직 epoch 미설정)에만 쓴다."""
         with self._lock:
             with self.store.tx():
-                if leader_guard and self.leader_epoch is not None:
+                if (self.enforce_single_coordinator and leader_guard
+                        and self.leader_epoch is not None):
                     self._assert_leader()
                 yield
 
@@ -215,10 +245,13 @@ class Coordinator:
 
     # ---- 내부 (모두 임계구역 안에서 호출됨) ----
     def _conflicts(self, pathspec, mode) -> list[str]:
-        """pathspec/mode가 충돌하는 활성 HELD 궤도 id들. read↔read는 공존."""
+        """pathspec/mode가 충돌하는 활성 HELD 궤도 id들. read↔read 공존; shared↔shared 공존
+        (P2 hot 공유파일 레인 — 응결은 3-way, 배타 write/read 와 겹치면 여전히 충돌)."""
         out = []
         for o in self.store.held_orbits():
             if mode == "read" and o["mode"] == "read":
+                continue
+            if mode == "shared" and o["mode"] == "shared":
                 continue
             if sets_overlap(pathspec, json.loads(o["pathspec"])):
                 out.append(o["orbit_id"])
@@ -352,14 +385,18 @@ class Coordinator:
         for b in self.store.all_barriers(states=("ARMED",)):
             self._barrier_eval(b["barrier_id"])
         self._promote_pending()
+        # §D9 멱등 캐시 GC: idem_ttl 지난 DONE 행 정리(무한누적 차단). INFLIGHT(진행중)은
+        # completed_at NULL 로 보존. now 는 위에서 이미 정의됨(시각 일관).
+        if self.idem_ttl:
+            self.store.gc_idem(now - self.idem_ttl)
 
     def _reclaim_zombies_inline(self):
-        """heartbeat 끊긴 물방울(involuntary) — 단일 회수 루틴으로 위임."""
+        """heartbeat 끊긴 물방울(involuntary) — 단일 회수 루틴으로 위임.
+        F2: 생존창은 per-agent(liveness_ttl 선언, 미선언=agent_ttl) — 판정은 store 쿼리가 원자."""
         if not self.agent_ttl:
             return []
-        cutoff = time.time() - self.agent_ttl
         out = []
-        for a in self.store.stale_agents(cutoff):
+        for a in self.store.stale_agents(time.time(), self.agent_ttl):
             self._reclaim_agent_inline(a["agent_id"], voluntary=False)
             out.append(a["agent_id"])
         return out
@@ -469,7 +506,8 @@ class Coordinator:
         if agent_id is not None and t["agent_id"] not in (agent_id, None):
             return {"ok": False, "reason": "not owner", "owner": t["agent_id"],
                     "fenced_out": True}
-        writes = [o for o in self.store.orbits_for_task(task_id) if o["mode"] == "write"]
+        writes = [o for o in self.store.orbits_for_task(task_id)
+                  if o["mode"] in WRITE_MODES]
         stale = [o["orbit_id"] for o in writes if o["state"] != "HELD"]
         if not stale:
             for o in writes:
@@ -636,7 +674,30 @@ class Coordinator:
                                      released_at=time.time())
                 self._emit("merge_token_reclaimed", mt["agent_id"],
                            orbit_id=mt["orbit_id"], reason="recover")
+            # §3.D 배리어-bound 단위복구(증분11) — task-단위 조정이 끝난 *뒤* 배리어를 단위로
+            # 조정한다(위에서 CONNECTING 이 전부 MERGED/DONE 으로 수렴했으므로 여기의 멤버
+            # 상태 = git 진실).
+            self._barrier_recover()
             self._promote_pending()
+
+    def _barrier_recover(self):
+        """§3.D: TRIPPING 중 크래시한 배리어를 *단위*로 조정(임계구역 안, _recover 말미).
+        전 멤버 MERGED = 트립이 사실상 완료 → TRIPPED 전진수정. 일부만 MERGED = 반쪽 트립 →
+        BROKEN(coordinator_crash_partial_trip) fail-loud — "BROKEN 신호 없이 반쪽 MERGED" 함정
+        폐쇄. MERGED 는 단조 사실이라 되돌리지 않고(§D5 deviation 1과 동일 계약), 미응결
+        task 는 task-단위 복구가 이미 재시도 가능 상태로 되돌려 놓았다. ARMED/종단은 불가침."""
+        for b in self.store.all_barriers(states=["TRIPPING"]):
+            parts = self.store.barrier_parties(b["barrier_id"], b["generation"])
+            tasks = [self.store.get_task(p["task_id"]) for p in parts]
+            if parts and all(t is not None and t["state"] == "MERGED" for t in tasks):
+                self.store.set_barrier(b["barrier_id"],
+                                       state=fsm.advance("barrier", "TRIPPING", "trip"))
+                self._emit("barrier_recovered", b["name"], barrier=b["name"],
+                           generation=b["generation"], outcome="tripped")
+            else:
+                self._break_barrier(b, reason="coordinator_crash_partial_trip")
+                self._emit("barrier_recovered", b["name"], barrier=b["name"],
+                           generation=b["generation"], outcome="broken")
 
     # ---- write-set 파일시스템 감사 (§D10, P0-11 = "최대 구멍") ----
     def _claimed_write_globs(self, task_id, writes) -> list[str]:
@@ -665,7 +726,7 @@ class Coordinator:
     def _release_task_write_orbits(self, task_id):
         """task의 HELD write-orbit 전부 해제 + unpin(merge_sha 기록 *후* 호출 — P0-6 순서)."""
         for o in self.store.orbits_for_task(task_id):
-            if o["mode"] == "write" and o["state"] == "HELD":
+            if o["mode"] in WRITE_MODES and o["state"] == "HELD":
                 self.store.set_orbit(o["orbit_id"],
                                      state=fsm.advance("orbit", "HELD", "release"),
                                      released_at=time.time(), merging=0, merge_deadline=None)
@@ -680,11 +741,12 @@ class Coordinator:
         if t:
             try:
                 globs.extend(json.loads(t["writes"] or "[]"))
+                globs.extend(json.loads(t["shared"] or "[]"))
             except (TypeError, ValueError):
                 pass
         # write-orbit pathspec(해제 직전에 부르므로 아직 잡을 수 있을 때 합집합) 도 포함.
         for o in self.store.orbits_for_task(task_id):
-            if o["mode"] == "write":
+            if o["mode"] in WRITE_MODES:
                 globs.extend(json.loads(o["pathspec"]))
         return list(dict.fromkeys(globs))  # 중복 제거(순서 보존)
 
@@ -789,7 +851,7 @@ class Coordinator:
                     return cache.set({"ok": False, "reason": "no such task"})
                 # 소유+fence: caller 가 이 task 의 HELD write-orbit 을 (agent,fence)로 쥐어야.
                 writes = [o for o in self.store.orbits_for_task(task_id)
-                          if o["mode"] == "write"]
+                          if o["mode"] in WRITE_MODES]
                 live = [o for o in writes if o["state"] == "HELD"]
                 if not live:
                     return cache.set({"ok": False, "reason": "no held write orbit for task",
@@ -812,7 +874,10 @@ class Coordinator:
                                   "stale": False})
 
     # ---- 공개 API (= MCP 툴 / CLI 동사) ----
-    def declare(self, task_id, *, name="", writes=None, reads=None, deps=None, priority=0):
+    def declare(self, task_id, *, name="", writes=None, reads=None, deps=None, priority=0,
+                shared=None):
+        """shared(P2 레인): hot 공유파일 glob — 배타 writes 와 달리 다른 task 의 shared 궤도와
+        겹쳐도 next_task/claim 을 막지 않는다(응결은 3-way, 충돌 시 shared_conflict retryable)."""
         with self._cs():
             # P0-10/§D7: deps가 의존 DAG에 사이클을 만들면 거부(그래프 불변) — 안 그러면
             # 상호의존(A after B, B after A)이 둘 다 영구 BLOCKED. self-dep 도 잡힌다.
@@ -824,7 +889,7 @@ class Coordinator:
                             "task_id": task_id}
             self.store.add_task(task_id=task_id, name=name, writes=writes or [],
                                 reads=reads or [], deps=deps or [], state="PENDING",
-                                priority=priority)
+                                priority=priority, shared=shared or [])
         return {"ok": True, "task_id": task_id, "state": "PENDING"}
 
     def depend(self, task_id, after):
@@ -957,6 +1022,7 @@ class Coordinator:
                 dead = self._check_alive(agent_id, bail_epoch)
                 if dead:
                     return cache.set(dead)
+                self.store.upsert_agent(agent_id)   # F2: 활동=생존신호(mutating verb 가 liveness touch)
                 o = self.store.get_orbit(orbit_id)
                 if not o:
                     return cache.set({"ok": False, "reason": "no such orbit"})
@@ -983,10 +1049,14 @@ class Coordinator:
                     return cache.value
                 return cache.set(self._reclaim_agent_inline(agent_id, voluntary=True))
 
-    def heartbeat(self, agent_id):
+    def heartbeat(self, agent_id, *, ttl=None):
         """물방울 생존 신호. §D6 표: 이미 회수(RETIRED)된 좀비에겐 `{fenced_out:true}` 회신 →
         좀비가 다음 heartbeat에서 자기 죽음을 안다(advisory). 살아있으면 현재 bail_epoch를 회신해
-        물방울이 이후 변이에 실어 보내면 회수 후 부활을 서버가 거부할 수 있다(§D6)."""
+        물방울이 이후 변이에 실어 보내면 회수 후 부활을 서버가 거부할 수 있다(§D6).
+
+        F2(채택마찰 2026-07-02): `ttl=` 로 *자기 페이스를 선언* — 이 agent 의 per-agent 생존창
+        (liveness_ttl). 인터랙티브 세션(verb 간 침묵 수십 분)이 claim 직후 한 번 선언하면 좀비
+        회수가 그 창을 존중한다. 미선언 agent 는 기본 agent_ttl(기계 물방울 crash-fast §D2 불변)."""
         with self._cs():
             ag = self.store.get_agent(agent_id)
             if ag is not None and ag["state"] == "RETIRED":
@@ -994,6 +1064,8 @@ class Coordinator:
                 return {"ok": False, "fenced_out": True, "reason": "agent reclaimed",
                         "bail_epoch": ag["bail_epoch"]}
             self.store.upsert_agent(agent_id)
+            if ttl is not None:
+                self.store.set_agent_liveness_ttl(agent_id, float(ttl) if ttl else None)
             # D3(§1.2 / D2 §): heartbeat 한 번이 이 agent 의 모든 hb_bound flag_ephemeral lease 를
             # 갱신 — 건강한 producer 가 renew 깜빡해 자기 신호 플래그가 BROKEN 되는 일 방지.
             renewed = 0
@@ -1031,7 +1103,9 @@ class Coordinator:
             return {"expired": sorted(before - after)}
 
     def next_task(self, agent_id):
-        """deps 충족 + write-set이 활성 HELD와 서로소인 작업 1개 → READY로 올려 반환."""
+        """deps 충족 + write-set이 활성 HELD와 서로소인 작업 1개 → READY로 올려 반환.
+        P2 레인: 선언 shared glob 은 shared HELD 궤도와의 겹침은 허용(공존) — 배타(write/read)
+        HELD 와 겹치면 여전히 대기."""
         with self._cs():
             self._sweep_inline()
             held = self.store.held_orbits()
@@ -1042,6 +1116,10 @@ class Coordinator:
                     continue
                 writes = json.loads(t["writes"])
                 if any(sets_overlap(writes, spec) for spec, _ in held_specs):
+                    continue
+                shared = json.loads(t["shared"] or "[]") if "shared" in t.keys() else []
+                if any(sets_overlap(shared, spec)
+                       for spec, m in held_specs if m != "shared"):
                     continue
                 if t["state"] != "READY":
                     self.store.set_task(t["task_id"],
@@ -1104,16 +1182,41 @@ class Coordinator:
                 dead = self._check_alive(agent_id, bail_epoch)
                 if dead:
                     return cache.set(dead)
+                if agent_id:
+                    self.store.upsert_agent(agent_id)   # F2: 활동=생존신호
                 bad = self._check_task_write_fence(task_id, agent_id, fence)
                 if bad:
                     self._emit("commit_rejected", task_id, reason=bad["reason"])
                     return cache.set(bad)
                 t = self.store.get_task(task_id)
+                writes = [o for o in self.store.orbits_for_task(task_id)
+                          if o["mode"] in WRITE_MODES and o["state"] == "HELD"]
+                write_globs = self._claimed_write_globs(task_id, writes)
+                if self.strict_writeset:
+                    # P5 strict: 궤도-밖 경로를 **commit 전에** staged 에서 제외 → 위반이 history
+                    # 진입 못 함(no wedge). 밖-경로는 working tree 에 보존(uncommitted) + 라우드
+                    # 리포트. in-orbit 변경이 하나도 없으면 ok:False(nothing_in_orbit). git add -A
+                    # 로 재staged 되어도 매 commit 마다 일관 제외 → livelock 0(기본 off=advisory).
+                    self.git.stage_all(t["worktree"])
+                    excluded = [p for p in self.git.staged_paths(t["worktree"])
+                                if not path_in_globs(p, write_globs)]
+                    if excluded:
+                        self.git.unstage(t["worktree"], excluded)
+                        self._emit("commit_excluded_out_of_orbit", task_id, excluded=excluded)
+                    try:
+                        sha = self.git.commit_staged(t["worktree"], msg)
+                    except GitNothingToCommit:
+                        return cache.set({"ok": False, "reason": "nothing_in_orbit",
+                                          "excluded": excluded, "claimed": write_globs,
+                                          "task_id": task_id})
+                    self._emit("task_committed", t["agent_id"], task=task_id, sha=sha)
+                    res = {"ok": True, "sha": sha}
+                    if excluded:
+                        res["excluded_out_of_orbit"] = excluded
+                    return cache.set(res)
+                # ---- advisory(기본) 경로 — 기존 동작 불변(commit 후 자문 감사, connect가 권위 거부) ----
                 sha = self.git.commit_all(t["worktree"], msg)
                 self._emit("task_committed", t["agent_id"], task=task_id, sha=sha)
-                writes = [o for o in self.store.orbits_for_task(task_id)
-                          if o["mode"] == "write" and o["state"] == "HELD"]
-                write_globs = self._claimed_write_globs(task_id, writes)
                 offending = self._writeset_audit(task_id, t["branch"], write_globs)
                 res = {"ok": True, "sha": sha}
                 if offending:
@@ -1135,6 +1238,8 @@ class Coordinator:
                 dead = self._check_alive(agent_id, bail_epoch)
                 if dead:
                     return cache.set(dead)
+                if agent_id:
+                    self.store.upsert_agent(agent_id)   # F2: 활동=생존신호
                 bad = self._check_task_write_fence(task_id, agent_id, fence)
                 if bad:
                     self._emit("finish_rejected", task_id, reason=bad["reason"])
@@ -1148,10 +1253,35 @@ class Coordinator:
                 self._emit("task_finished", t["agent_id"], task=task_id)
                 return cache.set({"task_id": task_id, "state": "DONE"})
 
+    def cancel(self, task_id, *, reason="", request_id=None):
+        """F4(채택마찰 2026-07-02): **미시작** 태스크의 종결 verb — lease-only 흐름(declare+claim,
+        start 미경유)의 태스크가 PENDING 으로 영구 잔류하던 갭 봉합. FSM 의 기존 `abort` 전이
+        (source="*") 재사용이라 상태기계/TLA 모델 무변경 — PENDING/READY/BLOCKED → ABORTED(종결,
+        requeue 로 재개 가능). 시작된 태스크(IN_ORBIT 이후)는 거부 — 진행중 작업의 무단 증발 금지,
+        finish/bail 경유. 멱등: 이미 ABORTED 면 {ok, already}. 미존재는 fail-loud(캐시 안 함)."""
+        with self._cs():
+            with self._idem(request_id, task_id, "cancel", [task_id]) as cache:
+                if cache.hit:
+                    return cache.value
+                t = self.store.get_task(task_id)
+                if t is None:
+                    return {"ok": False, "reason": "no such task"}       # 캐시 금지 — 이후 declare 가능
+                if t["state"] == "ABORTED":
+                    return cache.set({"ok": True, "already": True, "state": "ABORTED"})
+                if t["state"] not in ("PENDING", "READY", "BLOCKED"):
+                    return {"ok": False,                                  # 캐시 금지 — finish 후 재시도 무해
+                            "reason": f"cancel 은 미시작 태스크 전용(state={t['state']}) — "
+                                      f"시작된 작업은 finish/bail 경유"}
+                s = fsm.advance("task", t["state"], "abort")
+                self.store.set_task(task_id, state=s)
+                self._emit("task_cancelled", task_id, task=task_id, reason=reason)
+                return cache.set({"ok": True, "state": s, "reason": reason})
+
     # ---- CLOUD CONNECT — split-phase A–B–C (§3.B/§D8/§D11) ----
-    def connect(self, task_id, agent_id=None, fence=None, *, request_id=None,
+    def connect(self, task_id, agent_id=None, fence=None, push=None, *, request_id=None,
                 bail_epoch=None):
         """CLOUD CONNECT(응결=merge). **split-phase** — git merge가 락(_cs) **밖**에서 돈다:
+        push: per-call remote override(없으면 self.auto_push 상속). merge 직후 통합브랜치 push.
           A(락): write-orbit 재검증(P0-4 HELD∧fence==captured) + merge_token 획득 + →CONNECTING
                  + 궤도 pin(merging=1) + intent 영속 + 커밋.
           B(락밖): 전용 통합 worktree에서 merge --no-ff(타임아웃, §E). 충돌/타임아웃이면 abort.
@@ -1187,7 +1317,7 @@ class Coordinator:
                 return a
             # ----- Phase B: 락 밖(no _cs, no live tx) git merge -----
             token_id, intent = a["token_id"], a["intent"]
-            merge_sha, err = self._connect_phase_b(intent)
+            merge_sha, err = self._connect_phase_b(intent, push=push)
             # ----- Phase C: 락 안 — merge_sha 먼저 기록 후 해제(P0-6) -----
             res = self._connect_phase_c(task_id, token_id, intent, merge_sha, err)
             # §D9: 성공 종단만 캐시(merge conflict/timeout=retryable → 캐시 금지).
@@ -1197,6 +1327,40 @@ class Coordinator:
                                           self._arg_hash("connect", [task_id, fence]))
                     self.store.finish_idem(request_id, res)
             return res
+
+    def complete_task(self, task_id, msg=None, agent_id=None, fence=None, push=None,
+                      *, request_id=None, bail_epoch=None):
+        """P5 — happy-path 원샷: (선택)commit → finish → connect(+push). verb 망각-스트랜드
+        (finish 빼면 IN_ORBIT 기아·connect 빼면 미통합) 방지. INV: ok:True 는 **오직 최종
+        task state == MERGED** 일 때뿐 — 어느 단계 거부든 {ok:False, stage:'commit'|'finish'|
+        'connect', ...원본거부...}로 fail-loud 전파(거부 은폐 금지). 하위 verb 엔 request_id
+        suffix(:commit/:finish/:connect)로 idem PK 분리."""
+        def _rid(s):
+            return f"{request_id}:{s}" if request_id else None
+        committed = False
+        if msg is not None:
+            try:
+                cr = self.commit(task_id, msg, agent_id, fence,
+                                 request_id=_rid("commit"), bail_epoch=bail_epoch)
+            except GitNothingToCommit:
+                cr = {"ok": True, "noop": True}   # 변경 없음(구조적 판별) — commit skip
+            except (GitError, GitTimeout) as e:
+                return {"ok": False, "stage": "commit", "error": str(e)}   # 진짜 실패는 은폐 안 함
+            if cr.get("ok") is False:
+                return {**cr, "ok": False, "stage": "commit"}
+            committed = not cr.get("noop")
+        fr = self.finish(task_id, agent_id, fence,
+                         request_id=_rid("finish"), bail_epoch=bail_epoch)
+        if fr.get("ok") is False:   # finish 성공은 'ok' 키 없음(state=DONE); 거부만 ok=False
+            return {**fr, "ok": False, "stage": "finish"}
+        cn = self.connect(task_id, agent_id, fence, push=push,
+                          request_id=_rid("connect"), bail_epoch=bail_epoch)
+        st = self.store.get_task(task_id)
+        final = st["state"] if st else None
+        if cn.get("ok") and final == "MERGED":   # INV: ok ⟺ MERGED(store 권위 확인)
+            return {**cn, "ok": True, "stage": "connect", "state": "MERGED",
+                    "committed": committed}
+        return {**cn, "ok": False, "stage": "connect", "state": final}
 
     def _connect_phase_a(self, task_id, agent_id, fence, bail_epoch=None):
         """Phase A(임계구역): fence 재검증(P0-4) + merge_token 획득 + intent 영속 + pin + →CONNECTING."""
@@ -1213,7 +1377,8 @@ class Coordinator:
             if t["state"] == "MERGED":
                 return {"ok": True, "noop": True, "task_id": task_id, "state": "MERGED",
                         "merge_sha": t["merge_sha"]}
-            writes = [o for o in self.store.orbits_for_task(task_id) if o["mode"] == "write"]
+            writes = [o for o in self.store.orbits_for_task(task_id)
+                      if o["mode"] in WRITE_MODES]
             if not writes:
                 return {"ok": False, "reason": "no write orbit for task"}
             # P0-4: 모든 write-orbit이 HELD여야(만료/해제면 stale). + 호출자가 (agent,fence)를
@@ -1285,9 +1450,32 @@ class Coordinator:
                       "writes": [o["orbit_id"] for o in writes]}
             return {"ok": True, "token_id": token_id, "intent": intent}
 
-    def _connect_phase_b(self, intent):
+    def _diagnose_conflict(self, branch, conflict_files):
+        """P3 증분13(O1): 통합측에서 충돌 경로를 건드린 원인 커밋들을 bypass_audit 분류
+        (direct_commit/foreign_merge/forged_*/omd_connect)와 함께 지목 — '충돌의 범인'을
+        기계가 말한다. fail-soft: 진단 실패는 빈 목록(복구 응답 자체를 막지 않음)."""
+        if not self.git or not branch or not conflict_files:
+            return []
+        try:
+            wt = self._ensure_integration_wt()
+            mb = self.git.merge_base(branch, self.integration_branch, cwd=wt)
+            rows = self.git.commits_touching(f"{mb}..{self.integration_branch}",
+                                             conflict_files, cwd=wt)
+            out = []
+            for r in rows:
+                c = bypass_audit.Commit(sha=r["sha"], parents=r["parents"],
+                                        trailers=r["trailers"], author=r["author"],
+                                        subject=r["subject"])
+                out.append({"sha": r["sha"], "kind": bypass_audit.classify(c).value,
+                            "author": r["author"], "subject": r["subject"]})
+            return out
+        except GitError:
+            return []
+
+    def _connect_phase_b(self, intent, push=None):
         """Phase B(**락 밖** — live tx 없음): 전용 통합 worktree에서 merge --no-ff(타임아웃, §E).
-        절대 _cs()/store.tx()를 잡지 않는다 — 다른 코디네이터 변이가 이 동안 interleave 가능."""
+        절대 _cs()/store.tx()를 잡지 않는다 — 다른 코디네이터 변이가 이 동안 interleave 가능.
+        push: per-call remote override(complete_task 등). None 이면 self.auto_push 상속."""
         if not self.git:
             return None, None   # repo 미바인딩 — DB-only 응결(테스트/드라이런)
         task_id, branch = intent["task_id"], intent["branch"]
@@ -1296,6 +1484,17 @@ class Coordinator:
             msg = f"CLOUD CONNECT {task_id}\n\n{self._trailer(task_id)}"
             sha = self.git.merge_into(wt, self.integration_branch, branch, msg,
                                       timeout=self.merge_timeout)
+            # 연결=merge 직후 remote sync(operator "커밋하면 바로 sync"의 OMD 내장판).
+            # opt-in(push override > self.auto_push). fail-soft: push 실패해도 merge 는 로컬
+            # 반영됨이라 connect 는 성공 유지(다음 connect/수동 push 가 따라잡음). 강제 push 안 함.
+            remote = push if push is not None else self.auto_push
+            if remote:
+                try:
+                    self.git.push_integration(wt, self.integration_branch, remote,
+                                              timeout=self.merge_timeout)
+                    self._emit("connect_pushed", task_id, remote=remote, merge_sha=sha)
+                except (GitError, GitTimeout) as pe:
+                    self._emit("connect_push_failed", task_id, remote=remote, error=str(pe))
             return sha, None
         except (GitError, GitTimeout) as e:
             return None, e
@@ -1313,9 +1512,35 @@ class Coordinator:
                 self._release_merge_token_locked(token_id)
                 self._promote_pending()
                 reason = "merge timeout" if isinstance(err, GitTimeout) else "merge conflict"
-                self._emit("connect_aborted", task_id, reason=str(err))
-                return {"ok": False, "reason": f"{reason}: {err}", "task_id": task_id,
-                        "state": "DONE", "retryable": True}
+                out = {"ok": False, "task_id": task_id, "state": "DONE", "retryable": True}
+                # P3 증분13(O1): 충돌이면 진단 동봉 — 충돌 경로 + 통합측 원인 커밋
+                # (bypass_audit 분류: 우회 여부·작성자까지 지목). Zuul reporter 교훈:
+                # 실패는 유지하되 '왜/무엇 때문에'의 보고가 복구 UX 의 본체.
+                if isinstance(err, GitMergeConflict):
+                    out["conflict_files"] = err.conflicts
+                    out["culprits"] = self._diagnose_conflict(intent.get("branch"),
+                                                              err.conflicts)
+                # P2 shared 레인: shared 궤도를 쥔 task 의 merge conflict 는 불변식 버그가
+                # 아니라 **정상사건**(같은 hunk 동시편집) — 경보 대신 rebase 복구 힌트(P3).
+                # 배타(write-only) task 의 conflict 는 기존 '구조적 불가=경보' 의미론 유지.
+                shared = any(o["mode"] == "shared"
+                             for o in self.store.orbits_for_task(task_id))
+                if reason == "merge conflict" and shared:
+                    reason = "shared_conflict"
+                    out["hint"] = ("shared-lane 3-way conflict (정상사건) — worktree 브랜치를 "
+                                   "통합 tip 위로 rebase 해 충돌을 해소하고 connect 를 재시도")
+                    self._emit("connect_shared_conflict", task_id, error=str(err))
+                elif reason == "merge conflict":
+                    out["hint"] = ("배타 write-set 충돌 = out-of-band 우회가 통합을 가른 것"
+                                   "(culprits 로 원인 커밋 확인). worktree 브랜치를 통합 tip "
+                                   "위로 rebase 해 충돌을 해소(해소는 rerere 가 기록·재사용)하고 "
+                                   "connect 를 재시도")
+                    self._emit("connect_aborted", task_id, reason=str(err),
+                               conflicts=out.get("conflict_files", []))
+                else:
+                    self._emit("connect_aborted", task_id, reason=str(err))
+                out["reason"] = f"{reason}: {err}"
+                return out
             # 성공: P0-6 순서 — merge_sha 먼저 기록 → MERGED → write-orbit 해제(+unpin).
             self.store.set_task(task_id, merge_sha=merge_sha, merged_at=time.time())
             self.store.set_task(task_id, state=fsm.advance("task", "CONNECTING", "merged"))
@@ -1745,7 +1970,7 @@ class Coordinator:
         """이 task 의 HELD write-orbit 들의 capture fence(arrive 시점 기록 / trip 재검증 기준).
         write-orbit 이 하나도 HELD 가 아니면 None(=참가 자격 없음/사망)."""
         writes = [o for o in self.store.orbits_for_task(task_id)
-                  if o["mode"] == "write" and o["state"] == "HELD"]
+                  if o["mode"] in WRITE_MODES and o["state"] == "HELD"]
         if not writes:
             return None
         return max((o["fence"] for o in writes if o["fence"] is not None), default=None)
@@ -1984,7 +2209,8 @@ class Coordinator:
             if t["state"] == "MERGED":
                 return {"ok": True, "noop": True, "task_id": task_id, "state": "MERGED",
                         "merge_sha": t["merge_sha"]}
-            writes = [o for o in self.store.orbits_for_task(task_id) if o["mode"] == "write"]
+            writes = [o for o in self.store.orbits_for_task(task_id)
+                      if o["mode"] in WRITE_MODES]
             if not writes:
                 return {"ok": False, "reason": "no write orbit for task"}
             stale = [o["orbit_id"] for o in writes if o["state"] != "HELD"]
@@ -2049,6 +2275,39 @@ class Coordinator:
                                       "noop": True})
                 self._break_barrier(b, reason="aborted")
                 return cache.set({"ok": True, "state": "BROKEN", "name": name})
+
+    def barrier_consume(self, name, agent_id=None, *, request_id=None, bail_epoch=None):
+        """TRIPPED 배리어의 결과를 수거(§D5 CONSUMED 종단, 증분11) — 멤버별 merge_sha 동봉.
+        TRIPPED 에서만 유효(ARMED/TRIPPING=아직 결과 없음, BROKEN=수거할 성공 없음);
+        CONSUMED 재호출은 멱등 noop(결과 재동봉). 수거는 관측이 아니라 소비의 표식 —
+        같은 세대를 두 번 소비하는 파이프라인 버그를 FSM 이 잡아준다."""
+        with self._cs():
+            with self._idem(request_id, agent_id, "barrier_consume", [name]) as cache:
+                if cache.hit:
+                    return cache.value
+                dead = self._check_alive(agent_id, bail_epoch)
+                if dead:
+                    return cache.set(dead)
+                b = self.store.barrier_by_name(name)
+                if b is None:
+                    return cache.set({"ok": False, "reason": "no such barrier",
+                                      "name": name})
+                if b["state"] not in ("TRIPPED", "CONSUMED"):
+                    return cache.set({"ok": False, "state": b["state"], "name": name,
+                                      "reason": f"not TRIPPED: {b['state']} — 수거할 결과 없음"})
+                parts = self.store.barrier_parties(b["barrier_id"], b["generation"])
+                results = [{"task_id": p["task_id"],
+                            "merge_sha": (self.store.get_task(p["task_id"]) or {}).get("merge_sha")}
+                           for p in parts]
+                if b["state"] == "TRIPPED":
+                    self.store.set_barrier(b["barrier_id"],
+                                           state=fsm.advance("barrier", "TRIPPED", "consume"))
+                    self._emit("barrier_consumed", name, barrier=name,
+                               generation=b["generation"])
+                    return cache.set({"ok": True, "state": "CONSUMED", "name": name,
+                                      "generation": b["generation"], "results": results})
+                return cache.set({"ok": True, "state": "CONSUMED", "name": name, "noop": True,
+                                  "generation": b["generation"], "results": results})
 
     def barrier_status(self, name):
         """배리어 현황(상태/세대/도착/참가). 관측용 — 내부 sweep 으로 사망/타임아웃 반영."""

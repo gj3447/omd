@@ -57,6 +57,13 @@ jobs:
           pip install pytest hypothesis
       - name: Test
         run: pytest -q -rs
+      - name: Harness gates (P4 적합성=강제 회귀가드 / P1 우회·P2 hot=리포트)
+        run: |
+          # P4 적합성: must=True capability 회귀 시 NO_GO(빌드 실패) — 하네스가 사라지면 잡음
+          python -m omd_server.conformance || (echo "::error::OMD 하네스 적합성 회귀(필수 capability 소멸)"; exit 1)
+          # P1 우회 + P2 hot: adoption 0%/hot 파일은 정보성(블록 안 함) — 가시화만
+          SINCE=$(git rev-list --max-parents=0 HEAD | head -1)
+          python -m omd_server.harness --repo . --branch "${GITHUB_REF_NAME:-HEAD}" --since "$SINCE" --max-hot 999 || true
 
   tla:
     runs-on: ubuntu-latest
