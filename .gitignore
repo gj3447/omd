@@ -10,3 +10,4 @@ build/
 dist/
 .tla-tools/
 spec/states/
+.uv-cache/

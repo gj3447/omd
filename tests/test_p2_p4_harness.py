@@ -72,8 +72,10 @@ def test_conformance_built_capabilities_are_done():
 def test_conformance_reports_known_gaps_honestly():
     r = conformance.audit()
     gap_keys = {x["key"] for x in r["gaps"]}
-    # periodic_sweep 는 의도적 미구현(동시성 리스크) — 침묵 truncation 금지, 정직히 GAP 표기
-    assert "periodic_sweep" in gap_keys
+    # durable_engine(DBOS) 은 의도적 미채택(설계결정 — DB-backed FSM+_recover 로 크래시 복구 충분,
+    # 부채 아님) — 그래도 침묵 truncation 금지하고 정직히 표기(note 로 '의도적'임 명시).
+    # (periodic_sweep/read_coherence/crash_recovery 는 구현 완료 → DONE.)
+    assert "durable_engine" in gap_keys
     for g in r["gaps"]:
         assert g["note"], f"GAP {g['key']} 는 안내 note 필수"
 
