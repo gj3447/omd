@@ -1,7 +1,7 @@
 # OMD 현재 문제점 피드백 (2026-06-30)
 
 > operator 요청 "현재 omd 문제점 피드백". 실증 기반(코드+설계문서+실채택 조사 + 28-에이전트 audit).
-> 계기: 같은 날 consumer_b consumer_b 가 **OMD 를 우회**해 공유 `user` 직접커밋 → 로컬 +17 divergence 발생.
+> 계기: 같은 날 consumer-b consumer-b 가 **OMD 를 우회**해 공유 `<user>` 직접커밋 → 로컬 +17 divergence 발생.
 > ⚠️ 일부 audit 주장 교정: "auto_push 미테스트"는 **틀림** — `tests/test_auto_push.py` 3 passed (audit가 venv 없어 실행 못 함). 본 문서의 P/등급은 실행검증 반영본.
 
 ---
@@ -10,17 +10,17 @@
 
 OMD 의 "분열=0 사전보장"은 **에이전트가 opt-in 해야만** 성립한다(자발적·advisory). 그런데 **우회 감지·차단 메커니즘이 0** 이다.
 
-**실증 (오늘 consumer_b)**:
-- consumer_b/consumer_a 코드·워크플로에 OMD 호출 **0건**, OMD worktree 디렉토리(`*-omd-worktrees`/`*-omd-integration`) **0개** → 작업이 공유 dir 직행.
+**실증 (오늘 consumer-b)**:
+- consumer-b/consumer-a 코드·워크플로에 OMD 호출 **0건**, OMD worktree 디렉토리(`*-omd-worktrees`/`*-omd-integration`) **0개** → 작업이 공유 dir 직행.
 - `omd_mcp.db` = **6 task·Jun 28 에서 멈춤** → 오늘 daily 작업은 OMD 안 탐.
-- 결과: 세션들이 공유 `user` 직접커밋 → 로컬 +17 미푸시 divergence(우리가 손으로 정리).
+- 결과: 세션들이 공유 `<user>` 직접커밋 → 로컬 +17 미푸시 divergence(우리가 손으로 정리).
 - CONCEPT §1 "merge 충돌=0 사전보장" 은 **협력적 세계(선의)** 가정. 한 명만 우회해도 깨짐.
 
 **왜 중요**: *코드는 옳은데 아무도 안 쓴다.* OMD 의 모든 가치가 "에이전트가 declare 한다"는 전제에 100% 의존하는데 그 전제가 현장에서 안 지켜진다.
 
 **제안**:
 1. **기본 경로화** — 에이전트 부팅 훅이 자동으로 `declare`+worktree 격리(opt-out 이 아니라 opt-in 을 뒤집기). "그냥 쓰면 OMD 안에서" 되게.
-2. **우회 fail-loud** — 통합 브랜치 `pre-push`/CI 게이트가 *OMD merge-trailer(`CLOUD CONNECT <task>`) 없는* 커밋을 경고/거부. (오늘 우리가 consumer_b `.git/hooks/post-commit` 으로 만든 divergence-nudge 가 이 빈약판.)
+2. **우회 fail-loud** — 통합 브랜치 `pre-push`/CI 게이트가 *OMD merge-trailer(`CLOUD CONNECT <task>`) 없는* 커밋을 경고/거부. (오늘 우리가 consumer-b `.git/hooks/post-commit` 으로 만든 divergence-nudge 가 이 빈약판.)
 3. **discoverability** — repo CLAUDE.md/README 에 "이 repo 다중세션 작업은 OMD 필수" 를 hard prerequisite 로.
 
 ---

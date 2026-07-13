@@ -1,4 +1,4 @@
-"""P2 — shared(hot 공유파일) 3-way 레인. FEEDBACK P2 + 현장실측(consumer_b adoption 0%·hot 30파일) 응답.
+"""P2 — shared(hot 공유파일) 3-way 레인. FEEDBACK P2 + 현장실측(consumer-b adoption 0%·hot 30파일) 응답.
 
 INV-P2-LANE:
   ① mode="shared" 궤도는 같은 경로에 **동시 HELD 공존**(shared↔shared) — 직렬화 마찰 제거.

@@ -709,7 +709,7 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
 
 ### ✅ 증분 10 — P2 shared 레인: hot 공유파일 3-way 응결 — DONE
 
-FEEDBACK P2 + 현장실측(consumer_b user~200: adoption 0%·hot 30파일, env.py/modbus.py/business_logic.py
+FEEDBACK P2 + 현장실측(consumer-b <user>~200: adoption 0%·hot 30파일, env.py/modbus.py/business_logic.py
 실충돌 파일이 그대로 hot 상위) 응답. disjoint 는 그대로 1급시민 — **hot 파일만** 별도 레인.
 
 - **선언**: `declare(task, shared=[...])` (`tasks.shared` 컬럼) — next_task 가 shared HELD 와의
