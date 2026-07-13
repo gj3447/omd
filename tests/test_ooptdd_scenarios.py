@@ -17,8 +17,20 @@ def test_driver_emits_all_gate_events_under_cid():
     cid = "ooptdd-regression-cid"
     run(c, cid)
     got = {e["event"] for e in c.evs if e.get("cid") == cid}
-    for want in ("orbit_requested", "orbit_granted", "flag_set", "depend_rejected", "barrier_declared"):
+    for want in ("orbit_requested", "orbit_granted", "flag_set", "depend_rejected",
+                 "barrier_declared", "task_conditions"):
         assert want in got, f"gate event {want} 미방출 — spec/omd_concurrency_ooptdd.yaml 게이트와 drift"
+
+
+def test_task_conditions_deps_satisfied():
+    """REQ-TASK-CONDITIONS 의 where:{deps_satisfied:true} 게이트 — promote 된 task 의 직교 condition
+    관측이 cid 로 도착하고 deps_satisfied=True(vacuous over empty deps)로 value-pin(K8s-흡수)."""
+    c = _Collector()
+    cid = "ooptdd-cond-cid"
+    run(c, cid)
+    tc = [e for e in c.evs if e.get("cid") == cid and e["event"] == "task_conditions"]
+    assert tc and tc[0].get("deps_satisfied") is True, \
+        "task_conditions deps_satisfied=True 이어야 (직교 condition 관측 LTDD 증거)"
 
 
 def test_first_grant_fence_is_one():

@@ -41,4 +41,9 @@ def run(backend, cid: str) -> dict:
     omd.barrier_declare(cid, [cid], kind="connect", policy="break")
     driven += ["barrier_declared"]
 
+    # 5) K8s-흡수 직교 condition 관측 — task_conditions (cid=task_id). 위 declare(cid) 는 deps 무 →
+    #    deps_satisfied=True(vacuous) 로 value-pin(REQ-TASK-CONDITIONS). 관측 rollup, lifecycle 불변.
+    omd.task_conditions(cid)
+    driven += ["task_conditions"]
+
     return {"cid": cid, "driven": driven}
