@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 
 from .core import Coordinator
+from .events import Emitter
+from .sinks import JsonlSink
 
 # 첫 접점(MCP `initialize`)에서 클라이언트/에이전트에 그대로 노출되는 자기소개.
 # 비어 있으면 에이전트가 OMD 를 'object-model/스키마/계약 정의물'로 오독한다
@@ -88,7 +91,18 @@ def build_server(db_path: str = "omd.db"):
     # Codex starts stdio MCP servers per client/session. A process-wide singleton
     # leader lease makes concurrent MCP clients fail before initialize; SQLite
     # BEGIN IMMEDIATE still serializes cross-process mutations for this surface.
-    omd = Coordinator(db_path, enforce_single_coordinator=False)
+    # §D3/D4 백그라운드 sweep: env OMD_SWEEP_INTERVAL(초) 주면 켠다. 미설정=off(inline-only,
+    # 하위호환). 장수 stdio 서버가 유휴하다 처음 불릴 때 만료회수 spike 나던 것을 해소.
+    try:
+        _swp = float(os.environ.get("OMD_SWEEP_INTERVAL") or 0) or None
+    except ValueError:
+        _swp = None
+    # Q6 observability: env OMD_EVENT_LOG=<path> 주면 모든 OMD 동사 이벤트를 append-only JSONL
+    # 로 durable 기록(OpenObserve/vector 가 tail→ship). 미설정=NOOP(기존동작). fail-soft.
+    _evlog = os.environ.get("OMD_EVENT_LOG")
+    _events = Emitter(JsonlSink(_evlog)) if _evlog else None
+    omd = Coordinator(db_path, enforce_single_coordinator=False,
+                      sweep_interval=_swp, events=_events)
     mcp = FastMCP("omd", instructions=OMD_INSTRUCTIONS, lifespan=_coordinator_lifespan(omd))
 
     @mcp.tool()
@@ -110,6 +124,15 @@ def build_server(db_path: str = "omd.db"):
                 "claim(agent, paths, task=...)",
                 "commit(task, msg)", "finish(task)", "connect(task)",
             ],
+            "happy_path_oneshot": {
+                "note": "7-verb 시퀀스 대신 이 2개면 충분(망각-스트랜드 방지). 채택 자동화: "
+                        "부팅 시 begin() 한 번 → 자동 격리, 끝날 때 complete_task() 한 번.",
+                "begin(agent, task, writes)": "declare→deps게이트→claim→promote→start 원샷 "
+                                              "onboarding(worktree 자동 격리). 충돌 시 fail-loud.",
+                "complete_task(task, msg)": "commit→finish→connect(+push) 원샷 마감.",
+                "task_conditions(task)": "task 의 직교 condition(deps/held/heartbeat/merge_ready) "
+                                         "+ phase 관측(read-only).",
+            },
             "sync_primitives": ["barrier_*", "flag_*", "sem_*/acquire",
                                 "heartbeat/sweep/bail"],
             "docs": ["README.md", "CONCEPT.md", "SERVER_SPEC.md", "CONCURRENCY.md"],
@@ -180,9 +203,26 @@ def build_server(db_path: str = "omd.db"):
         return omd.next_task(agent)
 
     @mcp.tool()
+    def task_conditions(task: str) -> dict | None:
+        """task 의 K8s식 직교 condition(deps_satisfied/held/heartbeat_fresh/merge_ready) + phase
+        rollup 관측. 순수 read — lifecycle 전이 없음(fsm state 가 authoritative). 미존재 task=None."""
+        return omd.task_conditions(task)
+
+    @mcp.tool()
     def start(task: str, agent: str, request_id: str | None = None,
               bail_epoch: int | None = None) -> dict:
         return omd.start(task, agent, request_id=request_id, bail_epoch=bail_epoch)
+
+    @mcp.tool()
+    def begin(task: str, agent: str, writes: list[str], reads: list[str] | None = None,
+              shared: list[str] | None = None, deps: list[str] | None = None,
+              priority: int = 0, name: str = "", ttl: float = 600.0,
+              request_id: str | None = None, bail_epoch: int | None = None) -> dict:
+        """원샷 onboarding(declare→deps게이트→claim→promote→start). "그냥 begin 하면 OMD 안에서
+        격리" — 7-verb 앞단을 한 호출로. complete_task 의 start-side dual. fail-loud stage 전파."""
+        return omd.begin(task, agent, writes, reads=reads, shared=shared, deps=deps,
+                         priority=priority, name=name, ttl=ttl,
+                         request_id=request_id, bail_epoch=bail_epoch)
 
     @mcp.tool()
     def commit(task: str, msg: str, agent: str | None = None, fence: int | None = None,

@@ -9,7 +9,6 @@
 """
 from __future__ import annotations
 
-import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,28 +46,50 @@ CHECKS = [
           lambda r: (r / "omd_server" / "bypass_audit.py").exists()),
     Check("complete_task", "P5 원샷 wrapper(verb 망각-스트랜드 방지)", True,
           lambda r: "def complete_task" in _src(r, "omd_server/core.py")),
+    Check("begin_onboarding", "P1/P5 원샷 onboarding(declare→claim→start 접기 = 채택 자동화 enabler)", True,
+          lambda r: "def begin" in _src(r, "omd_server/core.py")
+          and 'stage": "claim"' in _src(r, "omd_server/core.py")),
+    Check("task_conditions", "K8s-흡수 직교 condition 관측(deps_satisfied SSOT 추출 + phase rollup)", True,
+          lambda r: (r / "omd_server" / "task_state.py").exists()
+          and "def task_conditions" in _src(r, "omd_server/core.py")),
     Check("hot_file_gate", "P2 hot/공유파일 경합 감지", True,
           lambda r: (r / "omd_server" / "hot_files.py").exists()),
+    Check("hot_file_suggest", "P2 Q8 감지→행동 루프: hot 파일 타깃 shared 추천(declare/begin 재사용)", True,
+          lambda r: "def suggest_shared_for_writes" in _src(r, "omd_server/hot_files.py")),
+    Check("event_sink", "Q6 observability — durable 이벤트 sink(JSONL audit trail, OMD↔shipping decouple)", True,
+          lambda r: (r / "omd_server" / "sinks.py").exists()
+          and "OMD_EVENT_LOG" in _src(r, "omd_server/server.py")),
+    Check("multiproc_ha", "P6 멀티프로세스 HA integration(리더 admission/SIGKILL takeover/GC-pause fence, subprocess)", True,
+          lambda r: (r / "tests" / "test_p6_multiproc_ha.py").exists()
+          and "subprocess" in _src(r, "tests/test_p6_multiproc_ha.py")
+          and "enforce_single_coordinator" in _src(r, "omd_server/core.py")),
     Check("conflict_recovery_ux", "P3 충돌 진단 동봉 + rerere 레인(증분13)", True,
           lambda r: "_diagnose_conflict" in _src(r, "omd_server/core.py")
           and "GitMergeConflict" in _src(r, "omd_server/gitio.py")
           and "def enable_rerere" in _src(r, "omd_server/gitio.py")),
     # ---- 알려진 잔여 GAP(must=False, 정직히 리포트) ----
-    Check("periodic_sweep", "주기적 백그라운드 sweep(§D3/D4: 현재 inline-only→유휴 후 spike)", False,
-          lambda r: bool(re.search(r"threading\.Thread|_sweep_thread|class .*SweepThread",
-                                   _src(r, "omd_server/core.py"))),
-          "만료 lease 회수가 동사 호출 시점에만(inline). 백그라운드 스레드는 동시성 리스크라 "
-          "미구현 — 도입 시 _cs 직렬화+shutdown join 으로 적대검증 필요."),
-    Check("read_coherence_enforce", "D12 read-set 코히런스 enforce(현재 commit 감사=advisory)", False,
-          lambda r: "read_coherence" in _src(r, "omd_server/core.py"),
-          "소비자가 옛 base 로 머지(phantom read)하는 것 차단이 자문(non-blocking). "
-          "blocking enforce 미구현 — 도입 시 read-gen CAS 게이트 필요."),
+    Check("periodic_sweep", "주기적 백그라운드 sweep(§D3/D4: opt-in sweep_interval, 유휴 spike 해소 + clean join)", True,
+          lambda r: "def _periodic_sweep_loop" in _src(r, "omd_server/core.py")
+          and "def close" in _src(r, "omd_server/core.py")
+          and "sweep_interval" in _src(r, "omd_server/core.py")),
+    Check("read_coherence_enforce", "D12 read-set 코히런스 blocking enforce(connect 유령읽기 차단, §D12 증분9)", True,
+          lambda r: "def _ghost_reads" in _src(r, "omd_server/core.py")
+          and 'reason="read_stale"' in _src(r, "omd_server/core.py")
+          and (r / "tests" / "test_d12_read_coherence.py").exists()),
     Check("barrier_restart_recovery", "§3.D 배리어-bound 재기동 단위복구 + CONSUMED 수거(증분11)", True,
           lambda r: "_barrier_recover" in _src(r, "omd_server/core.py")
-          and "def barrier_consume" in _src(r, "omd_server/core.py")),
-    Check("durable_fsm", "crash-durable FSM(SERVER_SPEC: 처음엔 미도입)", False,
-          lambda r: "durable" in _src(r, "omd_server/fsm.py").lower(),
-          "FSM 전이가 crash-durable 아님(deferred). 크래시 내성은 store 영속+sweep 회수에 의존."),
+          and "def barrier_consume" in _src(r, "omd_server/_barriers.py")),
+    Check("crash_recovery", "재기동 크래시 복구(_recover: DB-backed FSM state + git-진실 조정, §D8/P0-6)", True,
+          lambda r: "def _recover" in _src(r, "omd_server/core.py")
+          and (r / "tests" / "test_git_splitphase_stateful.py").exists()
+          and (r / "tests" / "test_stateful_persistent.py").exists()),
+    Check("durable_engine", "durable 실행 엔진(DBOS 체크포인트/resume) — 의도적 미채택(부채 아님)", False,
+          lambda r: "dbos" in _src(r, "omd_server/core.py").lower(),
+          "의도적 미채택 = 설계 결정(SERVER_SPEC §183 / CONCURRENCY §805), 미완성 부채 아님. "
+          "크래시 복구는 DB-backed FSM(SQLite 원자 tx) + _recover(재기동 git-진실 조정) + "
+          "crash-safe merge_token + 리더 takeover 로 이미 구현·테스트됨(test_git_splitphase_stateful"
+          "/test_stateful_persistent/test_p6_multiproc_ha/test_p4_barrier_restart, 10 pass). "
+          "장기 크래시-내성이 정말 필요해질 때만 DBOS Transact 를 optional 로 얹는다."),
 ]
 
 

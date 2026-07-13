@@ -35,26 +35,20 @@ import time
 import uuid
 from contextlib import contextmanager
 
-from . import bypass_audit, fsm
+from . import bypass_audit, fsm, task_state
 from .disjoint import path_in_globs, sets_overlap
 from .events import NOOP
 from .gitio import GitError, GitMergeConflict, GitNothingToCommit, GitRepo, GitTimeout
+from ._barriers import BarrierMixin
+from ._const import LATCH_RANK, MERGE_PIN_GRACE_S, WRITE_MODES
+from ._flags import FlagMixin
+from ._sems import SemMixin
 from .store import Store
 
 # Phase B(락밖 merge) 서브프로세스 타임아웃(§E — 무한 hang 방지). pin은 이보다 길게 잡아
-# 타임아웃→abort→rollback이 완료될 시간을 준다.
+# 타임아웃→abort→rollback이 완료될 시간을 준다. MERGE_PIN_GRACE_S/WRITE_MODES/LATCH_RANK 는
+# mixin 과 공유하므로 _const 로 이동(순환 import 회피, apt-cleanup Q7).
 MERGE_TIMEOUT_S = 120.0
-MERGE_PIN_GRACE_S = 60.0
-
-# P2 shared 레인: write-동급 궤도 mode. "shared" = hot 공유파일 전용 — 같은 경로에 shared↔shared
-# 동시 HELD 를 허용하고(직렬화 마찰 제거) 응결은 git 3-way 에 맡긴다. 진짜 충돌(같은 hunk)은
-# connect 에서 shared_conflict(정상사건·retryable)로 표면화. write-set 감사/fence/해제 경로에선
-# write 와 동급으로 취급돼 disjoint(write) 궤도의 배타 의미론은 불변.
-WRITE_MODES = ("write", "shared")
-
-# D3 단조 LATCH 랭크(§D3): done(1) < merged(2). 하향 set 은 거부, 동값 재발행은 멱등 no-op.
-# 0 = 랭크 없는 일반 LATCH(임의 값, 단조검사 안 함). 의존 해제는 =merged 에 건다(§3.H).
-LATCH_RANK = {"done": 1, "merged": 2}
 
 # D14 리더-lease(코디네이터 singleton). 기동 시 리더 lease 를 획득(또는 살아있는 리더 감지 시
 # 거부). last_heartbeat 가 이 TTL 을 넘으면 죽은 리더로 보고 takeover 가능(fence=epoch +1 로
@@ -81,7 +75,7 @@ class _IdemSlot:
         return value
 
 
-class Coordinator:
+class Coordinator(FlagMixin, SemMixin, BarrierMixin):
     def __init__(self, db_path: str = ":memory:", repo: str | None = None,
                  worktrees_dir: str | None = None, agent_ttl: float | None = 90.0,
                  events=None, integration_branch: str | None = None,
@@ -91,7 +85,8 @@ class Coordinator:
                  enforce_single_coordinator: bool = True,
                  auto_push: str | None = None,
                  idem_ttl: float | None = 3600.0,
-                 strict_writeset: bool = False):
+                 strict_writeset: bool = False,
+                 sweep_interval: float | None = None):
         # §D14: `:memory:` 디폴트 금지 — 재기동마다 모든 fence/leader_epoch 가 0 으로 리셋되어
         # 낡은 토큰/잔여 merge 와 충돌(고스트 writer). 영속 DB 필수. 단위테스트는 allow_memory_db=
         # True 로 명시 opt-in(프로세스 1개, 재기동 없음 — fence 리셋 위험 없음).
@@ -110,6 +105,12 @@ class Coordinator:
         self.agent_ttl = agent_ttl
         self.events = events or NOOP
         self._lock = threading.RLock()  # 프로세스내 단일 writer(actor 대용) — D1
+        # §D3/D4 주기적 백그라운드 sweep(opt-in). None/0=off(기본=inline-only, 하위호환). 켜면
+        # 만료 lease/permit/좀비 회수가 동사 호출과 무관하게 진행 → 유휴 후 첫 호출 spike 해소.
+        # 스레드 안전: 변이는 전부 _cs(RLock 직렬화) + store(check_same_thread=False, WAL).
+        self._sweep_interval = sweep_interval
+        self._sweep_stop = threading.Event()
+        self._sweep_thread = None
         # §D14: 리더 lease 획득 — 살아있는 다른 코디네이터가 있으면 CoordinatorConflict 거부.
         # 이 호출 *전*엔 어떤 변이도(특히 _recover 의 git↔DB 조정) 하면 안 된다(writer 둘 방지).
         # _lock/events/store 가 필요하므로 그것들 뒤에 둔다.
@@ -147,6 +148,41 @@ class Coordinator:
                 pass
         # 재기동 복구(§D8, 멱등) — git↔DB 조정 + dangling merge_token abort.
         self._recover()
+        # 리더십·복구가 끝난 *뒤*에만 백그라운드 sweep 을 발사(변이 전 writer-둘 방지).
+        if self._sweep_interval and self._sweep_interval > 0:
+            self._sweep_thread = threading.Thread(
+                target=self._periodic_sweep_loop, args=(self._sweep_interval,),
+                name=f"omd-sweep-{self.coordinator_id}", daemon=True)
+            self._sweep_thread.start()
+
+    def _periodic_sweep_loop(self, interval):
+        """만료 lease/permit/좀비를 주기적으로 회수(§D3/D4). Event.wait 로 자므로 stop 즉시 반응
+        (인터벌 안 기다림). sweep 실패가 스레드를 죽이면 안 됨 → catch 후 다음 주기 재시도.
+        리더십 상실(takeover 당한 좀비 리더)은 정지 — 좀비가 계속 변이하면 writer 둘."""
+        while not self._sweep_stop.wait(interval):
+            try:
+                self.sweep()
+            except CoordinatorConflict:
+                self._emit("sweep_stopped", self.coordinator_id, reason="not_leader")
+                return
+            except Exception as e:  # noqa: BLE001 — 스레드 생존 우선(silent skip 아님, emit)
+                self._emit("sweep_error", self.coordinator_id, error=repr(e))
+
+    def close(self):
+        """백그라운드 sweep 스레드를 멈추고 join(멱등 — 스레드 없으면 no-op). 프로세스 종료·테스트
+        정리용. store 커넥션은 닫지 않는다(다른 참조가 살아있을 수 있음)."""
+        self._sweep_stop.set()
+        th = self._sweep_thread
+        if th is not None and th.is_alive():
+            th.join(timeout=5.0)
+        self._sweep_thread = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
     # ---- 임계구역 / 이벤트 ----
     @contextmanager
@@ -1128,6 +1164,19 @@ class Coordinator:
                 return self.store.get_task(t["task_id"])
             return None
 
+    def task_conditions(self, task_id):
+        """task 의 K8s식 직교 condition(deps_satisfied/held/heartbeat_fresh/merge_ready)을 store-join
+        에서 파생 → 관측 이벤트 방출(cid=task_id). 순수 관측 read-verb — lifecycle 전이 없음.
+        derive_task_phase 는 fsm state 위의 rollup(authoritative 아님). 미존재 task 는 None."""
+        with self._cs():
+            t = self.store.get_task(task_id)
+            if t is None:
+                return None
+            c = task_state.task_conditions(t, self.store, time.time(), self.agent_ttl)
+            phase = task_state.derive_task_phase(c, t["state"])
+            self._emit("task_conditions", task_id, state=t["state"], phase=phase, **c)
+            return {"task_id": task_id, "state": t["state"], "phase": phase, **c}
+
     def start(self, task_id, agent_id, *, request_id=None, bail_epoch=None):
         """READY task에 agent 배정 → IN_ORBIT. repo 바인딩 시 물방울 worktree 발사.
         §D9 의미적 멱등: 이미 이 agent로 시작된(IN_ORBIT/이후 + worktree 존재) task 재시도는
@@ -1362,6 +1411,52 @@ class Coordinator:
                     "committed": committed}
         return {**cn, "ok": False, "stage": "connect", "state": final}
 
+    def begin(self, task_id, agent_id, writes, *, reads=None, shared=None, deps=None,
+              priority=0, name="", ttl=600.0, request_id=None, bail_epoch=None):
+        """P1/P5 — happy-path 원샷 onboarding: declare → deps 게이트 → claim(write-set lease)
+        → promote(READY) → start(물방울 worktree 발사). 7-verb 앞단을 한 호출로 접어 "그냥
+        begin 하면 OMD 안에서 격리" 되게 한다(채택 자동화 enabler; complete_task 의 start-side
+        dual). INV: ok:True ⟺ 최종 store state == IN_ORBIT. fail-loud — 어느 단계 거부든
+        {ok:False, stage:'declare'|'deps'|'claim'|'start', ...}로 전파(worktree 는 claim HELD
+        확인 *후* 에만 발사 → 충돌 시 낭비 0). request_id 는 하위 verb 에 suffix(:claim/:start)로
+        분리해 멱등 재시작 안전(재발사·중복 orbit 없음)."""
+        def _rid(s):
+            return f"{request_id}:{s}" if request_id else None
+        # 1) declare (task_id 키 upsert — 자연 멱등, 진행중 state 는 보존)
+        dc = self.declare(task_id, name=name, writes=writes, reads=reads, deps=deps,
+                          priority=priority, shared=shared)
+        if dc.get("ok") is False:
+            return {**dc, "ok": False, "stage": "declare"}
+        # 2) deps 게이트 — 미충족이면 claim/worktree 없이 정지(task_state SSOT 술어).
+        unmet = [d for d in (deps or [])
+                 if (self.store.get_task(d) or {}).get("state") != "MERGED"]
+        if unmet:
+            self._emit("begin_blocked", task_id, reason="deps", unmet=unmet)
+            return {"ok": False, "stage": "deps", "task_id": task_id, "unmet": unmet}
+        # 3) claim write-set (fail-fast — worktree 발사 전). 서로소 아니면 PENDING/DENIED 전파.
+        cl = self.claim(agent_id, writes, mode="write", ttl=ttl, task_id=task_id,
+                        request_id=_rid("claim"), bail_epoch=bail_epoch)
+        if cl.get("state") != "HELD":
+            self._emit("begin_blocked", task_id, reason="claim", state=cl.get("state"))
+            return {"ok": False, "stage": "claim", "task_id": task_id,
+                    "state": cl.get("state"), "conflicts": cl.get("conflicts", [])}
+        if shared:   # P2 레인 — 공유 glob 은 shared 모드로(공존 허용)
+            self.claim(agent_id, shared, mode="shared", ttl=ttl, task_id=task_id,
+                       request_id=_rid("claim-shared"), bail_epoch=bail_epoch)
+        # 4) promote → READY (PENDING/BLOCKED 만; 이미 진행중이면 skip → 멱등 재시작).
+        t = self.store.get_task(task_id)
+        if t["state"] in ("PENDING", "BLOCKED"):
+            with self._cs():
+                self.store.set_task(task_id, state=fsm.advance("task", t["state"], "ready"))
+        # 5) start (worktree 발사; IN_ORBIT 재시도는 start 가 자연 dedup).
+        st = self.start(task_id, agent_id, request_id=_rid("start"), bail_epoch=bail_epoch)
+        if st.get("ok") is False:
+            return {**st, "ok": False, "stage": "start"}
+        final = (self.store.get_task(task_id) or {}).get("state")
+        return {"ok": final == "IN_ORBIT", "stage": "started", "task_id": task_id,
+                "state": st.get("state"), "worktree": st.get("worktree"),
+                "branch": st.get("branch"), "fence": cl.get("fence")}
+
     def _connect_phase_a(self, task_id, agent_id, fence, bail_epoch=None):
         """Phase A(임계구역): fence 재검증(P0-4) + merge_token 획득 + intent 영속 + pin + →CONNECTING."""
         with self._cs():
@@ -1562,768 +1657,6 @@ class Coordinator:
             self._promote_pending()
             return {"ok": True, "task_id": task_id, "state": "MERGED", "merge_sha": merge_sha,
                     "gen": new_gen, "stale_reads": stale_reads}
-
-    # ---- D3 플래그: EPHEMERAL(=lease) vs LATCH(영속·단조) (§D3, §1.2, §3.H) ----
-    def _flag_satisfied(self, frow, want) -> bool:
-        """플래그가 want 를 만족하나(LIVE 여야). 정확 값일치 OR 단조 랭크 도달 —
-        want='done' 은 'merged'(상위 랭크)로도 만족된다(merged ⊃ done, §3.H 의존해제)."""
-        if frow is None or frow["status"] != "LIVE":
-            return False
-        if frow["value"] == want:
-            return True
-        want_rank = LATCH_RANK.get(want, 0)
-        return want_rank > 0 and frow["rank"] >= want_rank
-
-    def _flag_broken(self, frow) -> bool:
-        return frow is not None and frow["status"] == "BROKEN"
-
-    def _wake_flag_waiters(self, key):
-        """key 의 WAITING 대기자 중 만족/BROKEN 된 것을 깨운다(상태 전이만 — poll 이 읽음).
-        register→poll 패턴이라 서버가 블로킹하지 않는다. epoch 가 아니라 현재 상태로 판정."""
-        frow = self.store.get_flag_row(key)
-        for w in self.store.waiters_for_key(key, "WAITING"):
-            if self._flag_broken(frow):
-                self.store.set_flag_waiter(w["waiter_id"], state="BROKEN",
-                                           wake_reason="producer_dead")
-            elif self._flag_satisfied(frow, w["want_value"]):
-                self.store.set_flag_waiter(w["waiter_id"], state="SATISFIED",
-                                           wake_reason="satisfied")
-
-    def _break_ephemeral_flags_for_lease(self, lease_id, *, reason="producer_dead"):
-        """받쳐주는 flag_ephemeral lease 가 거둬질 때(reclaim/만료) 그 EPHEMERAL 플래그를
-        BROKEN 으로(자동 clear) + epoch +1 + 대기자 PRODUCER_DEAD 기상. 영구 hang 차단(§1.2)."""
-        for f in self.store.ephemeral_flags_for_lease(lease_id):
-            self.store.set_flag_status(f["key"], status="BROKEN", epoch=f["epoch"] + 1)
-            self._emit("flag_broken", f["owner_agent"] or f["key"], key=f["key"],
-                       reason=reason)
-            self._wake_flag_waiters(f["key"])
-
-    def flag_set(self, key, value, agent_id=None, *, flag_type=None, ttl=None,
-                 fence=None, request_id=None, bail_epoch=None):
-        """플래그 set — 두 종류(§D3):
-          LATCH(기본): 영속·단조 사실. done(1)<merged(2). 하향 set 거부('un-finish 불가'),
-            동값 재발행은 멱등 no-op. 소유 개념 없음(connect 의 'merged' latch 등). epoch 보존.
-          EPHEMERAL: 소유 신호(build_running 등). 소유 agent + lease(orbits.kind='flag_ephemeral',
-            owned+TTL). 보유자 사망 → reclaim/sweep 이 BROKEN(대기자 PRODUCER_DEAD). 같은 owner
-            만 재set 가능(owner CAS); BROKEN/CLEARED 면 새로 세움. set/clear 마다 epoch +1.
-        §D6: 회수된 좀비의 flag_set 차단(bail_epoch). EPHEMERAL 의 owner CAS 도 §D6 표의 보강.
-        §D9: request_id 멱등(성공만 캐시)."""
-        flag_type = (flag_type or "LATCH").upper()
-        with self._cs():
-            with self._idem(request_id, agent_id, "flag_set",
-                            [key, value, flag_type]) as cache:
-                if cache.hit:
-                    return cache.value
-                dead = self._check_alive(agent_id, bail_epoch)
-                if dead:
-                    return cache.set(dead)
-                frow = self.store.get_flag_row(key)
-                if flag_type == "EPHEMERAL":
-                    return cache.set(self._flag_set_ephemeral(key, value, agent_id,
-                                                              frow, ttl))
-                return cache.set(self._flag_set_latch(key, value, agent_id, frow))
-
-    def _flag_set_latch(self, key, value, agent_id, frow):
-        """LATCH set — 단조 강제(done<merged). 하향=에러, 동값=멱등 no-op, 상향/신규=set."""
-        new_rank = LATCH_RANK.get(value, 0)
-        if frow is not None and frow["flag_type"] == "EPHEMERAL":
-            return {"ok": False, "reason": "flag is EPHEMERAL, not LATCH", "key": key}
-        if frow is not None:
-            cur_rank = frow["rank"]
-            if frow["status"] == "LIVE" and frow["value"] == value:
-                return {"ok": True, "noop": True, "key": key, "value": value,
-                        "flag_type": "LATCH", "epoch": frow["epoch"]}
-            # 둘 다 랭크가 있고 하향이면 거부(단조 — un-finish 불가).
-            if new_rank > 0 and cur_rank > 0 and new_rank < cur_rank:
-                self._emit("flag_set_rejected", agent_id or key, key=key,
-                           reason="monotonic_downgrade", current=frow["value"], to=value)
-                return {"ok": False, "reason": "monotonic downgrade rejected",
-                        "key": key, "current": frow["value"], "current_rank": cur_rank,
-                        "to": value, "to_rank": new_rank}
-            epoch = frow["epoch"] + 1
-        else:
-            epoch = 0
-        rank = max(new_rank, frow["rank"] if frow else 0) if new_rank else (frow["rank"] if frow else 0)
-        self.store.upsert_flag(key, value=value, set_by=agent_id, flag_type="LATCH",
-                               rank=rank, status="LIVE", epoch=epoch)
-        self._emit("flag_set", agent_id or key, key=key, value=value, flag_type="LATCH")
-        self._wake_flag_waiters(key)
-        return {"ok": True, "key": key, "value": value, "flag_type": "LATCH",
-                "epoch": epoch, "rank": rank}
-
-    def _flag_set_ephemeral(self, key, value, agent_id, frow, ttl):
-        """EPHEMERAL set — 소유+TTL lease 로 받친다. 보유자 사망 시 reclaim/sweep 이 자동 BROKEN."""
-        if agent_id is None:
-            return {"ok": False, "reason": "EPHEMERAL flag requires owner agent", "key": key}
-        # owner 를 agent 로 등록 — bail/zombie-reclaim 이 이 agent 의 flag_ephemeral lease 를
-        # 찾아 거두려면 agents 행이 있어야 한다(안 그러면 reclaim 이 noop → 플래그 영구 잔존).
-        self.store.upsert_agent(agent_id)
-        if frow is not None and frow["flag_type"] == "LATCH":
-            return {"ok": False, "reason": "flag is LATCH, not EPHEMERAL", "key": key}
-        # owner CAS(§D6 보강): LIVE 면 같은 owner 만 재set. 타 agent 는 거부.
-        if frow is not None and frow["status"] == "LIVE" \
-                and frow["owner_agent"] not in (agent_id, None):
-            return {"ok": False, "reason": "not flag owner", "key": key,
-                    "owner": frow["owner_agent"]}
-        # 받쳐주는 lease: LIVE 면 재사용(같은 owner), 아니면 새로 발급.
-        lease_id = frow["lease_id"] if (frow and frow["status"] == "LIVE") else None
-        if lease_id is None:
-            fence = self.store.next_fence()
-            lease_id = self.store.add_orbit(
-                task_id=None, agent_id=agent_id, pathspec=[], mode="write",
-                state="HELD", fence=fence,
-                expires_at=time.time() + (ttl if ttl is not None else (self.agent_ttl or 90.0)),
-                reason=f"flag_ephemeral:{key}", kind="flag_ephemeral",
-                resource_key=key)
-        elif ttl is not None:
-            self.store.set_orbit(lease_id, expires_at=time.time() + ttl)
-        epoch = (frow["epoch"] + 1) if frow else 0
-        self.store.upsert_flag(key, value=value, set_by=agent_id, flag_type="EPHEMERAL",
-                               rank=0, status="LIVE", owner_agent=agent_id,
-                               lease_id=lease_id, epoch=epoch)
-        self._emit("flag_set", agent_id, key=key, value=value, flag_type="EPHEMERAL",
-                   lease_id=lease_id)
-        self._wake_flag_waiters(key)
-        return {"ok": True, "key": key, "value": value, "flag_type": "EPHEMERAL",
-                "epoch": epoch, "lease_id": lease_id}
-
-    def flag_clear(self, key, agent_id=None, *, request_id=None, bail_epoch=None):
-        """EPHEMERAL 플래그를 자발적으로 clear(작업 끝, 정상 해제). owner 만. 받쳐주는 lease 해제 +
-        status→CLEARED + epoch +1 + 대기자 기상(want 가 다른 값이면 계속 대기, 끊기진 않음 —
-        CLEARED 는 BROKEN 과 달리 '사실이 더 이상 참 아님'이지 'producer 사망'이 아니다).
-        LATCH 는 clear 불가(단조사실은 영속)."""
-        with self._cs():
-            with self._idem(request_id, agent_id, "flag_clear", [key]) as cache:
-                if cache.hit:
-                    return cache.value
-                dead = self._check_alive(agent_id, bail_epoch)
-                if dead:
-                    return cache.set(dead)
-                frow = self.store.get_flag_row(key)
-                if frow is None:
-                    return cache.set({"ok": True, "noop": True, "key": key})
-                if frow["flag_type"] != "EPHEMERAL":
-                    return cache.set({"ok": False, "reason": "LATCH flag cannot be cleared",
-                                      "key": key})
-                if frow["status"] != "LIVE":
-                    return cache.set({"ok": True, "noop": True, "key": key,
-                                      "status": frow["status"]})
-                if agent_id is not None and frow["owner_agent"] not in (agent_id, None):
-                    return cache.set({"ok": False, "reason": "not flag owner", "key": key,
-                                      "owner": frow["owner_agent"]})
-                if frow["lease_id"]:
-                    lo = self.store.get_orbit(frow["lease_id"])
-                    if lo and lo["state"] == "HELD":
-                        self.store.set_orbit(frow["lease_id"],
-                                             state=fsm.advance("orbit", "HELD", "release"),
-                                             released_at=time.time())
-                self.store.set_flag_status(key, status="CLEARED", epoch=frow["epoch"] + 1)
-                self._emit("flag_cleared", agent_id or key, key=key)
-                self._wake_flag_waiters(key)
-                return cache.set({"ok": True, "key": key, "status": "CLEARED"})
-
-    def flag_get(self, key):
-        frow = self.store.get_flag_row(key)
-        if frow is None:
-            return {"key": key, "value": None}
-        return {"key": key, "value": frow["value"], "flag_type": frow["flag_type"],
-                "status": frow["status"], "epoch": frow["epoch"], "rank": frow["rank"],
-                "owner": frow["owner_agent"]}
-
-    def flag_wait(self, key, want, timeout, agent_id=None):
-        """대기 등록(§D3, §1.2). **timeout 필수**(None 거부 — 영구 hang 방지). 서버는
-        블로킹하지 않는다(register→poll): 단일 스레드를 막으면 구름 전체가 직렬화됨.
-        이미 만족이면 즉시 SATISFIED, producer 사망(BROKEN)이면 즉시 BROKEN(PRODUCER_DEAD),
-        아니면 waiter_id 발급(클라가 flag_wait_poll 재호출). observed_epoch 로 ABA/유령기상 안전."""
-        if timeout is None:
-            return {"ok": False, "reason": "timeout required (no indefinite wait)", "key": key}
-        with self._cs():
-            frow = self.store.get_flag_row(key)
-            if self._flag_broken(frow):
-                return {"state": "BROKEN", "reason": "producer_dead", "key": key}
-            if self._flag_satisfied(frow, want):
-                return {"state": "SATISFIED", "key": key, "value": frow["value"]}
-            observed_epoch = frow["epoch"] if frow else -1
-            deadline = time.time() + timeout
-            wid = self.store.add_flag_waiter(agent_id, key, want, observed_epoch, deadline)
-            self._emit("flag_wait_registered", agent_id or key, key=key, want=want,
-                       waiter_id=wid)
-            return {"state": "WAITING", "waiter_id": wid, "key": key, "want": want,
-                    "deadline": deadline}
-
-    def flag_wait_poll(self, waiter_id):
-        """대기 폴(저렴·멱등, §D3). 재검사는 value 가 아니라 **epoch** 로 — set→clear→set 의
-        ABA 나 유령기상에 안전. 만족/BROKEN(producer_dead)/TIMEOUT/WAITING 중 하나를 회신.
-        클라는 SATISFIED/TIMEOUT/BROKEN 전부 처리해야(BROKEN 을 성공이나 hang 으로 오인 금지)."""
-        with self._cs():
-            w = self.store.get_flag_waiter(waiter_id)
-            if w is None:
-                return {"ok": False, "reason": "no such waiter", "waiter_id": waiter_id}
-            if w["state"] != "WAITING":
-                # reclaim/sweep/다른 poll 이 이미 전이시킴(SATISFIED/BROKEN). 종단 회신.
-                if w["state"] == "BROKEN":
-                    return {"state": "BROKEN", "reason": w["wake_reason"] or "producer_dead",
-                            "key": w["key"]}
-                return {"state": w["state"], "key": w["key"]}
-            self._sweep_inline()  # 만료된 flag_ephemeral lease 를 BROKEN 으로 반영(producer 사망)
-            frow = self.store.get_flag_row(w["key"])
-            if self._flag_broken(frow):
-                self.store.set_flag_waiter(waiter_id, state="BROKEN",
-                                           wake_reason="producer_dead")
-                return {"state": "BROKEN", "reason": "producer_dead", "key": w["key"]}
-            if self._flag_satisfied(frow, w["want_value"]):
-                self.store.set_flag_waiter(waiter_id, state="SATISFIED",
-                                           wake_reason="satisfied")
-                return {"state": "SATISFIED", "key": w["key"], "value": frow["value"]}
-            if time.time() >= w["deadline"]:
-                self.store.set_flag_waiter(waiter_id, state="TIMEOUT", wake_reason="timeout")
-                self._emit("flag_wait_timeout", w["agent_id"] or w["key"], key=w["key"])
-                return {"state": "TIMEOUT", "key": w["key"]}
-            return {"state": "WAITING", "waiter_id": waiter_id, "key": w["key"]}
-
-    # ---- D4 세마포어: permit=lease, 가용 = max − count(ACTIVE) (§D4, §D7, §G) ----
-    def _grant_permit(self, agent_id, sem_id, ttl):
-        """ACTIVE permit lease 를 발급(임계구역 안). fence 부여(소유+fenced lease). 가용 검사는
-        호출자(acquire/_promote_sem_waiters)가 먼저 한다 — 여기선 발급만."""
-        fence = self.store.next_fence()
-        pid = self.store.add_orbit(
-            task_id=None, agent_id=agent_id, pathspec=[], mode="write",
-            state="HELD", fence=fence,
-            expires_at=time.time() + (ttl if ttl is not None else (self.agent_ttl or 90.0)),
-            reason=f"sem_permit:{sem_id}", kind="sem_permit", resource_key=sem_id)
-        self._emit("sem_acquired", agent_id, permit_id=pid, sem=sem_id, fence=fence)
-        return {"ok": True, "state": "ACQUIRED", "permit_id": pid, "sem": sem_id,
-                "fence": fence}
-
-    def _has_earlier_waiter(self, sem_id, priority, agent_id) -> bool:
-        """no-overtaking(§D7): 이 (priority, agent) 보다 **먼저 줄선** 다른 대기자가 있나.
-        있으면 가용 슬롯이 있어도 양보(작은 acquire 스트림이 head 대기자를 영구 기아시키는 것 방지)."""
-        for w in self.store.waiting_sem_waiters(sem_id):  # 우선순위 DESC → enqueued_seq ASC
-            if w["agent_id"] == agent_id:
-                continue
-            if w["priority"] > priority:
-                return True
-            if w["priority"] == priority:
-                return True  # 같은 우선순위면 먼저 줄선(정렬상 앞) 자가 우선 — 양보
-        return False
-
-    def _promote_sem_waiters(self, sem_id):
-        """가용 슬롯이 생기면 줄선 순서(우선순위 DESC → FIFO)대로 head 대기자에게 permit 부여
-        (§D7 no-overtaking). 임계구역 안에서만. 멱등 reuse 도 존중(이미 보유한 대기자는 그대로)."""
-        sem = self.store.get_semaphore(sem_id)
-        if sem is None:
-            return
-        for w in self.store.waiting_sem_waiters(sem_id):
-            if self.store.count_active_permits(sem_id) >= sem["max_permits"]:
-                break  # 슬롯 소진 — 나머지는 계속 대기
-            existing = self.store.active_permit_for(sem_id, w["agent_id"])
-            if existing is not None:
-                # 이미 어떤 경로로 permit 을 받음 — 멱등 reuse, 대기자만 satisfied 처리.
-                self.store.set_sem_waiter(w["waiter_id"], state="GRANTED",
-                                          permit_id=existing["orbit_id"])
-                continue
-            g = self._grant_permit(w["agent_id"], sem_id, w["ttl"])
-            self.store.set_sem_waiter(w["waiter_id"], state="GRANTED",
-                                      permit_id=g["permit_id"])
-
-    def sem_declare(self, sem_id, max_permits):
-        """세마포어 선언/등록(멱등). max_permits 변경 시 갱신 — 슬롯이 늘면 대기자 promote."""
-        if max_permits < 1:
-            return {"ok": False, "reason": "max_permits must be >= 1", "sem": sem_id}
-        with self._cs():
-            self.store.add_semaphore(sem_id, max_permits)
-            self._emit("sem_declared", sem_id, sem=sem_id, max_permits=max_permits)
-            self._promote_sem_waiters(sem_id)  # max 증가 시 새 슬롯을 줄선 대기자에게
-            return {"ok": True, "sem": sem_id, "max_permits": max_permits}
-
-    def acquire(self, agent_id, sem_id, *, ttl=300.0, no_wait=False, priority=0,
-                request_id=None, bail_epoch=None):
-        """세마포어 permit 획득(§D4). 가용 = max − count(ACTIVE permit)(저장정수 아님 → 누수 0).
-          - 멱등 reuse: 이미 ACTIVE permit 을 쥐고 있으면 그대로 반환(재발급 안 함, MCP 재시도 안전).
-          - 가용 ∧ no-overtaking(§D7: 먼저 줄선 자 없음)이면 즉시 부여(ACQUIRED).
-          - 아니면: no_wait=True → FAIL(즉시 실패), no_wait=False → WAITING(waiter_id 발급, poll).
-        임계구역(D1)에서 check-then-grant 가 원자 → 초과배정 불가(두 acquirer 가 동시에 N-1 보고
-        둘 다 N+1번째 부여하는 레이스 차단). 보유자 사망 → reclaim/sweep 이 permit EXPIRE → 슬롯 복구."""
-        with self._cs():
-            args = [agent_id, sem_id, ttl, no_wait, priority]
-            with self._idem(request_id, agent_id, "acquire", args) as cache:
-                if cache.hit:
-                    return cache.value
-                self._sweep_inline()  # 죽은 보유자 permit 만료 반영 → 가용 최신화
-                dead = self._check_alive(agent_id, bail_epoch)
-                if dead:
-                    return cache.set(dead)
-                sem = self.store.get_semaphore(sem_id)
-                if sem is None:
-                    return cache.set({"ok": False, "reason": "no such semaphore",
-                                      "sem": sem_id})
-                self.store.upsert_agent(agent_id)
-                # 멱등 reuse — 이미 쥔 permit 이 있으면 그대로(재발급 금지). 재시도/중복 acquire 안전.
-                existing = self.store.active_permit_for(sem_id, agent_id)
-                if existing is not None:
-                    self._emit("sem_reuse", agent_id, permit_id=existing["orbit_id"],
-                               sem=sem_id)
-                    return cache.set({"ok": True, "state": "ACQUIRED",
-                                      "permit_id": existing["orbit_id"], "sem": sem_id,
-                                      "fence": existing["fence"], "reuse": True})
-                avail = sem["max_permits"] - self.store.count_active_permits(sem_id)
-                if avail >= 1 and not self._has_earlier_waiter(sem_id, priority, agent_id):
-                    return cache.set(self._grant_permit(agent_id, sem_id, ttl))
-                # 가용 없음(또는 먼저 줄선 자 있음).
-                if no_wait:
-                    self._emit("sem_acquire_failed", agent_id, sem=sem_id, reason="no_permits")
-                    # FAIL 은 캐시 금지(§3.C) — 슬롯이 나면 재시도가 성공해야.
-                    return cache.set({"ok": False, "state": "FAIL", "sem": sem_id,
-                                      "reason": "no permits available", "avail": max(avail, 0)})
-                # 대기 등록(register→poll, 비블로킹). timeout = ttl 만큼 대기(영구 hang 없음).
-                seq = self.store.next_seq()
-                deadline = time.time() + (ttl if ttl is not None else (self.agent_ttl or 90.0))
-                wid = self.store.add_sem_waiter(sem_id, agent_id, ttl, priority, seq, deadline)
-                self._emit("sem_wait_registered", agent_id, sem=sem_id, waiter_id=wid)
-                # WAITING 은 캐시 금지(상태가 곧 바뀜) — 비성공으로 _is_success 가 거른다.
-                return cache.set({"ok": True, "state": "WAITING", "waiter_id": wid,
-                                  "sem": sem_id, "deadline": deadline})
-
-    def acquire_poll(self, waiter_id):
-        """세마포어 대기 폴(저렴·멱등, register→poll). GRANTED(permit 부여됨)/TIMEOUT/CANCELLED/
-        WAITING 중 하나. poll 내부 sweep 이 죽은 보유자 permit 을 거둬 슬롯을 복구하고, head 면
-        부여받는다(no-overtaking)."""
-        with self._cs():
-            w = self.store.get_sem_waiter(waiter_id)
-            if w is None:
-                return {"ok": False, "reason": "no such waiter", "waiter_id": waiter_id}
-            if w["state"] == "GRANTED":
-                p = self.store.get_orbit(w["permit_id"]) if w["permit_id"] else None
-                return {"ok": True, "state": "ACQUIRED", "permit_id": w["permit_id"],
-                        "sem": w["sem_id"], "fence": p["fence"] if p else None}
-            if w["state"] != "WAITING":
-                return {"ok": w["state"] != "CANCELLED", "state": w["state"],
-                        "sem": w["sem_id"]}
-            self._sweep_inline()           # 죽은 보유자 permit 만료 → 슬롯 복구 + head promote
-            self._promote_sem_waiters(w["sem_id"])
-            w = self.store.get_sem_waiter(waiter_id)
-            if w["state"] == "GRANTED":
-                p = self.store.get_orbit(w["permit_id"]) if w["permit_id"] else None
-                return {"ok": True, "state": "ACQUIRED", "permit_id": w["permit_id"],
-                        "sem": w["sem_id"], "fence": p["fence"] if p else None}
-            if time.time() >= w["deadline"]:
-                self.store.set_sem_waiter(waiter_id, state="TIMEOUT")
-                self._emit("sem_wait_timeout", w["agent_id"], sem=w["sem_id"])
-                return {"ok": False, "state": "TIMEOUT", "sem": w["sem_id"]}
-            return {"ok": True, "state": "WAITING", "waiter_id": waiter_id,
-                    "sem": w["sem_id"]}
-
-    def sem_release(self, permit_id, agent_id, fence, *, request_id=None, bail_epoch=None):
-        """permit 반납(§D4). 소유+fence 일치해야 — 이중해제·재부여후해제 방지(§D6). 이미
-        RELEASED/EXPIRED 면 멱등 OK(MCP 재시도 안전). 반납 즉시 슬롯이 나면 줄선 대기자 promote."""
-        with self._cs():
-            with self._idem(request_id, agent_id, "sem_release",
-                            [permit_id, fence]) as cache:
-                if cache.hit:
-                    return cache.value
-                dead = self._check_alive(agent_id, bail_epoch)
-                if dead:
-                    return cache.set(dead)
-                p = self.store.get_orbit(permit_id)
-                if not p or p["kind"] != "sem_permit":
-                    return cache.set({"ok": False, "reason": "no such permit"})
-                if p["state"] in ("RELEASED", "EXPIRED"):
-                    return cache.set({"ok": True, "noop": True, "state": p["state"]})
-                if p["state"] != "HELD":
-                    return cache.set({"ok": False, "reason": f"not HELD: {p['state']}"})
-                bad = self._check_owner(p, agent_id, fence)  # owner∧fence (P0-3 유형)
-                if bad:
-                    return cache.set(bad)
-                self.store.set_orbit(permit_id,
-                                     state=fsm.advance("orbit", "HELD", "release"),
-                                     released_at=time.time())
-                self._emit("sem_released", agent_id, permit_id=permit_id,
-                           sem=p["resource_key"])
-                self._promote_sem_waiters(p["resource_key"])  # 빈 슬롯을 줄선 순서로(§D7)
-                return cache.set({"ok": True, "sem": p["resource_key"]})
-
-    def sem_status(self, sem_id):
-        """세마포어 현황(가용/활성/대기). 디버그·관측용(read-only)."""
-        with self._cs():
-            self._sweep_inline()
-            sem = self.store.get_semaphore(sem_id)
-            if sem is None:
-                return {"ok": False, "reason": "no such semaphore", "sem": sem_id}
-            active = self.store.count_active_permits(sem_id)
-            waiting = len(self.store.waiting_sem_waiters(sem_id))
-            return {"ok": True, "sem": sem_id, "max_permits": sem["max_permits"],
-                    "active": active, "available": max(sem["max_permits"] - active, 0),
-                    "waiting": waiting}
-
-    # ---- D5 배리어: 세대-스탬프 응결 랑데부 + BROKEN 종단 (§D5, §1.2, §3.D) ----
-    def _task_dependents(self, task_id) -> list[str]:
-        """이 task 를 deps(after)로 가진 다른 task 들 — shrink 가 안전한지(의존자 없음) 판정용."""
-        out = []
-        for t in self.store.all_tasks():
-            if t["task_id"] == task_id:
-                continue
-            if task_id in json.loads(t["deps"] or "[]"):
-                out.append(t["task_id"])
-        return out
-
-    def _party_write_fence(self, task_id):
-        """이 task 의 HELD write-orbit 들의 capture fence(arrive 시점 기록 / trip 재검증 기준).
-        write-orbit 이 하나도 HELD 가 아니면 None(=참가 자격 없음/사망)."""
-        writes = [o for o in self.store.orbits_for_task(task_id)
-                  if o["mode"] in WRITE_MODES and o["state"] == "HELD"]
-        if not writes:
-            return None
-        return max((o["fence"] for o in writes if o["fence"] is not None), default=None)
-
-    def _party_alive(self, party) -> bool:
-        """참가 task 가 아직 응결 가능한 살아있는 상태인가(도착 전/후 사망 판정, §D5).
-        참가자 생존 = lease(write-orbit) 생존(소유물=lease 라는 §0 모델). 죽음 =
-          (a) task 가 없어졌거나 ABORTED(reclaim 이 abort→requeue 했으면 새 PENDING 행이지만
-              agent_id=None — lease 도 함께 해제됨), 또는
-          (b) write-orbit 이 HELD 가 아님(lease 만료/해제 = 보유자 사망/탈출, MERGED 제외), 또는
-          (c) 도착했었는데 현재 write fence 가 도착 시점과 달라짐(ABA — 만료 후 타인에게 재부여)."""
-        t = self.store.get_task(party["task_id"])
-        if t is None or t["state"] == "ABORTED":
-            return False
-        if t["state"] == "MERGED":
-            return True  # 이미 응결 — trip 멱등(plan 에서 제외됨)
-        cur = self._party_write_fence(party["task_id"])
-        if cur is None:
-            return False  # HELD write-orbit 없음 = lease 가 거둬짐 = 참가자 사망/탈출
-        if party["arrived"] and party["arrive_fence"] is not None \
-                and t["state"] != "CONNECTING" and cur != party["arrive_fence"]:
-            return False  # 도착 후 lease 가 만료/재부여됨(ABA) → stale 도착 = 사망
-        return True
-
-    def _break_barrier(self, barrier, reason):
-        """배리어를 BROKEN 으로(도착해 있던 전원이 기상). 다음 세대 재무장은 declare 가 한다.
-        영구 hang 불가 — 깨진 순간 모든 참가자가 BROKEN 으로 관측한다(§1.2/§D5)."""
-        if barrier["state"] in ("BROKEN", "TRIPPED", "CONSUMED"):
-            return
-        self.store.set_barrier(barrier["barrier_id"],
-                               state=fsm.advance("barrier", barrier["state"], "break_"),
-                               break_reason=reason)
-        self._emit("barrier_broken", barrier["name"], barrier=barrier["name"],
-                   generation=barrier["generation"], reason=reason)
-
-    def _live_parties(self, barrier):
-        """(live, dead) 참가 분류 — reclaim/lease 만료가 멤버를 죽였는지 본다(멤버십=task 집합)."""
-        parties = self.store.barrier_parties(barrier["barrier_id"], barrier["generation"])
-        live, dead = [], []
-        for p in parties:
-            (live if self._party_alive(p) else dead).append(p)
-        return live, dead
-
-    def _barrier_eval(self, barrier_id, *, can_trip=False):
-        """배리어 평가(도착·sweep·reclaim 모두 호출, 임계구역 안). 죽은 참가자/타임아웃을
-        break/shrink 로 처리한다. `can_trip=True`(arrive 만)일 때, 남은 expected 전원이 도착했으면
-        fill(ARMED→TRIPPING)한 뒤 trip 할 task 목록(응결 plan)을 돌려준다 — 실제 merge(Phase B
-        락밖)는 arrive 가 돌린다. sweep/reclaim 은 `can_trip=False`(break/shrink 만; fill 하면
-        TRIPPING 이 driver 없이 고아가 됨). 트립 plan 이 없으면 None. **공개 connect() 를 부르지
-        않는다**(그 sweep 가 검증한 궤도를 재진입 만료시킴, §D5) — trip 은 _barrier_connect_one 으로."""
-        b = self.store.get_barrier(barrier_id)
-        if b is None or b["state"] not in ("ARMED",):
-            return None
-        live, dead = self._live_parties(b)
-        now = time.time()
-        # 1) 죽은 참가자 → policy. break=전원 깸 / shrink=죽은 멤버 제거(단 그 멤버 의존자 없을때만).
-        if dead:
-            if b["policy"] == "shrink" and all(not self._task_dependents(d["task_id"])
-                                               for d in dead):
-                for d in dead:
-                    self.store.del_barrier_party(barrier_id, b["generation"], d["task_id"])
-                    self._emit("barrier_shrink", b["name"], barrier=b["name"],
-                               dropped=d["task_id"])
-                self.store.set_barrier(barrier_id, parties=len(live))
-                b = self.store.get_barrier(barrier_id)
-                live, dead = self._live_parties(b)
-            else:
-                self._break_barrier(b, reason="participant_dead")
-                return None
-        # 2) 타임아웃: deadline 지났는데 미도착 있으면 break(영구 hang 방지).
-        if b["deadline_at"] is not None and now >= b["deadline_at"]:
-            if any(not p["arrived"] for p in live):
-                self._break_barrier(b, reason="timeout")
-                return None
-        # 3) 전원 도착? → fill 후 트립 plan 반환(arrive 만 — driver 가 있을 때).
-        if can_trip and live and all(p["arrived"] for p in live):
-            self.store.set_barrier(barrier_id,
-                                   state=fsm.advance("barrier", "ARMED", "fill"))
-            self._emit("barrier_tripping", b["name"], barrier=b["name"],
-                       generation=b["generation"], parties=len(live))
-            # 결정적 순서(task_id) — 도착 fence 와 함께. 이미 MERGED 면 plan 제외(멱등).
-            return [{"task_id": p["task_id"], "expected_fence": p["arrive_fence"]}
-                    for p in sorted(live, key=lambda x: x["task_id"])
-                    if (self.store.get_task(p["task_id"]) or {}).get("state") != "MERGED"]
-        return None
-
-    def barrier_declare(self, name, task_ids, *, kind="connect", policy="break",
-                        timeout=None):
-        """응결 랑데부 배리어 선언/재무장(§D5). 멤버십 = task 집합(reclaim 으로 task 가 requeue
-        되면 N 재계산). 같은 이름을 다시 declare 하면 **다음 세대**로 재무장(이전 세대가 종단
-        BROKEN/CONSUMED 일 때) — generation 스탬프가 ABA/유령 도착을 막는다. policy:
-          'break'  = 참가자 사망/타임아웃 시 전원 깸(BrokenBarrier 시맨틱, 기본).
-          'shrink' = 죽은 멤버를 빼고 진행(단 그 멤버에 의존하는 task 가 없을 때만)."""
-        if not task_ids:
-            return {"ok": False, "reason": "barrier needs >=1 task", "name": name}
-        if policy not in ("break", "shrink"):
-            return {"ok": False, "reason": "policy must be break|shrink", "name": name}
-        with self._cs():
-            prev = self.store.barrier_by_name(name)
-            if prev is not None and prev["state"] in ("ARMED", "TRIPPING"):
-                return {"ok": False, "reason": "barrier already active",
-                        "name": name, "state": prev["state"],
-                        "generation": prev["generation"]}
-            gen = (prev["generation"] + 1) if prev is not None else 0
-            bid = "bar-" + name + "-" + str(gen)
-            deadline = (time.time() + timeout) if timeout is not None else None
-            self.store.add_barrier(barrier_id=bid, name=name, kind=kind,
-                                   parties=len(set(task_ids)), generation=gen,
-                                   state="ARMED", policy=policy, deadline_at=deadline)
-            for tid in set(task_ids):
-                t = self.store.get_task(tid)
-                self.store.add_barrier_party(bid, gen, tid,
-                                             t["agent_id"] if t else None)
-            self._emit("barrier_declared", name, barrier=name, generation=gen,
-                       parties=len(set(task_ids)), policy=policy)
-            return {"ok": True, "name": name, "barrier_id": bid, "generation": gen,
-                    "parties": len(set(task_ids)), "state": "ARMED", "policy": policy}
-
-    def barrier_arrive(self, name, agent_id, task_id, *, fence=None, request_id=None,
-                       bail_epoch=None):
-        """참가자 도착(§D5). task 가 응결 준비됨(write-orbit HELD)을 표시하고 arrive_fence 를
-        기록. 전원 도착하면 배리어가 trip(전 task 를 결정적 순서로 응결=merge)하고 TRIPPED.
-        한 명이라도 사망/타임아웃이면 BROKEN(전원 기상). merge(Phase B)는 락 밖에서 돈다."""
-        # Phase A(락): 도착 기록 + eval → 트립 plan. merge 는 락 밖(아래).
-        plan = None
-        with self._cs():
-            with self._idem(request_id, agent_id, "barrier_arrive",
-                            [name, task_id, fence]) as cache:
-                if cache.hit:
-                    return cache.value
-                self._sweep_inline()
-                dead = self._check_alive(agent_id, bail_epoch)
-                if dead:
-                    return cache.set(dead)
-                b = self.store.barrier_by_name(name)
-                if b is None:
-                    return cache.set({"ok": False, "reason": "no such barrier",
-                                      "name": name})
-                if b["state"] == "BROKEN":
-                    return {"ok": False, "state": "BROKEN", "name": name,
-                            "reason": b["break_reason"] or "broken"}  # 캐시 금지(재무장 가능)
-                if b["state"] in ("TRIPPED", "CONSUMED"):
-                    return cache.set({"ok": True, "state": b["state"], "name": name,
-                                      "noop": True})
-                party = self.store.get_barrier_party(b["barrier_id"], b["generation"],
-                                                     task_id)
-                if party is None:
-                    return cache.set({"ok": False, "reason": "task not a barrier member",
-                                      "name": name, "task": task_id})
-                cap = self._party_write_fence(task_id)
-                if cap is None:
-                    return cache.set({"ok": False, "reason": "no HELD write orbit for task",
-                                      "name": name, "task": task_id})
-                if fence is not None and fence != cap:
-                    return {"ok": False, "fenced_out": True,
-                            "reason": "stale fence", "current": cap, "yours": fence}
-                self.store.set_barrier_party(b["barrier_id"], b["generation"], task_id,
-                                             arrived=1, arrive_fence=cap, agent_id=agent_id)
-                self._emit("barrier_arrived", name, barrier=name, task=task_id,
-                           generation=b["generation"], fence=cap)
-                plan = self._barrier_eval(b["barrier_id"], can_trip=True)
-                if plan is None:
-                    # 아직 미달(대기) 또는 BROKEN. 현재 상태 회신(register→poll 패턴).
-                    nb = self.store.get_barrier(b["barrier_id"])
-                    if nb["state"] == "BROKEN":
-                        return {"ok": False, "state": "BROKEN", "name": name,
-                                "reason": nb["break_reason"]}  # 캐시 금지
-                    parts = self.store.barrier_parties(b["barrier_id"], b["generation"])
-                    return cache.set({"ok": True, "state": nb["state"], "name": name,
-                                      "arrived": sum(p["arrived"] for p in parts),
-                                      "parties": len(parts)})
-                bid, gen = b["barrier_id"], b["generation"]
-        # Phase B/C(락밖 merge + 원자 commit): 트립 plan 의 각 task 를 결정적 순서로 응결.
-        return self._barrier_trip(bid, gen, name, plan, request_id, agent_id)
-
-    def _barrier_trip(self, barrier_id, generation, name, plan, request_id, agent_id):
-        """트립 실행(§D5): plan 의 각 task 를 _barrier_connect_one 으로 응결(공개 connect 아님).
-        하나라도 실패(fence stale/merge 충돌)면 배리어 BROKEN(policy break — 전원 깸) + 이미
-        응결된 것은 그대로(전진), 나머지는 멈춤. 전부 성공하면 TRIPPED."""
-        merged = []
-        for step in plan:
-            res = self._barrier_connect_one(step["task_id"], step["expected_fence"])
-            if not res.get("ok"):
-                with self._cs():
-                    b = self.store.get_barrier(barrier_id)
-                    if b and b["state"] in ("TRIPPING", "ARMED"):
-                        self._break_barrier(b, reason=f"trip_failed:{res.get('reason')}")
-                return {"ok": False, "state": "BROKEN", "name": name,
-                        "reason": f"trip failed on {step['task_id']}: {res.get('reason')}",
-                        "merged": merged}
-            merged.append(step["task_id"])
-        # 전 task 응결됨 → TRIPPED.
-        out = None
-        with self._cs():
-            b = self.store.get_barrier(barrier_id)
-            if b and b["state"] == "TRIPPING":
-                self.store.set_barrier(barrier_id,
-                                       state=fsm.advance("barrier", "TRIPPING", "trip"))
-                self._emit("barrier_tripped", name, barrier=name, generation=generation,
-                           merged=merged)
-            nb = self.store.get_barrier(barrier_id)
-            out = {"ok": True, "state": nb["state"], "name": name, "merged": merged,
-                   "generation": generation}
-            if request_id is not None and self._is_success(out):
-                self.store.begin_idem(request_id, agent_id, "barrier_arrive",
-                                      self._arg_hash("barrier_arrive", [name, None, None]))
-                self.store.finish_idem(request_id, out)
-        return out
-
-    def _barrier_connect_one(self, task_id, expected_fence):
-        """응결 trip 프리미티브(§D5) — 공개 connect() 를 재호출하지 않는다(그 Phase A 의
-        _sweep_inline 이 방금 검증한 궤도를 재진입 만료시킴). 대신 sweep 없는 Phase A'(fence==
-        expected_fence 재검증) + 공유 Phase B(락밖 merge) + Phase C 를 직접 돌린다."""
-        deadline = time.time() + max(self.merge_timeout, 5.0) + 10.0
-        while True:
-            a = self._barrier_connect_phase_a(task_id, expected_fence)
-            if not a["ok"]:
-                if a.get("retry") and time.time() < deadline:
-                    time.sleep(0.01)
-                    continue
-                return a
-            if a.get("noop"):
-                return a
-            token_id, intent = a["token_id"], a["intent"]
-            merge_sha, err = self._connect_phase_b(intent)
-            return self._connect_phase_c(task_id, token_id, intent, merge_sha, err)
-
-    def _barrier_connect_phase_a(self, task_id, expected_fence):
-        """Phase A'(임계구역, **sweep 없음**): write-orbit 이 HELD ∧ fence==expected_fence 재검증
-        (ABA 차단) + write-set 감사 + merge_token 획득 + →CONNECTING + pin + intent 영속.
-        _connect_phase_a 와 동일하되 _sweep_inline 을 부르지 않는다(§D5 핵심)."""
-        with self._cs():
-            t = self.store.get_task(task_id)
-            if t is None:
-                return {"ok": False, "reason": "no such task"}
-            if t["state"] == "MERGED":
-                return {"ok": True, "noop": True, "task_id": task_id, "state": "MERGED",
-                        "merge_sha": t["merge_sha"]}
-            writes = [o for o in self.store.orbits_for_task(task_id)
-                      if o["mode"] in WRITE_MODES]
-            if not writes:
-                return {"ok": False, "reason": "no write orbit for task"}
-            stale = [o["orbit_id"] for o in writes if o["state"] != "HELD"]
-            if not stale and expected_fence is not None:
-                cur = max((o["fence"] for o in writes if o["fence"] is not None),
-                          default=None)
-                if cur != expected_fence:
-                    stale = [o["orbit_id"] for o in writes]
-            if stale:
-                return {"ok": False, "fenced_out": True,
-                        "reason": "stale fence: lease changed since arrival",
-                        "stale": stale}
-            write_globs = self._claimed_write_globs(task_id, writes)
-            offending = self._writeset_audit(task_id, t["branch"], write_globs)
-            if offending:
-                return {"ok": False, "reason": "writeset_violation",
-                        "offending": offending, "task_id": task_id}
-            owner = t["agent_id"] or f"barrier:{task_id}"
-            token_id = self._acquire_merge_token_locked(owner)
-            if token_id is None:
-                return {"ok": False, "retry": True, "reason": "merge in progress"}
-            s = t["state"]
-            if s == "IN_ORBIT":
-                s = fsm.advance("task", s, "finish")
-            if s == "DONE":
-                s = fsm.advance("task", s, "connect")
-            elif s != "CONNECTING":
-                self._release_merge_token_locked(token_id)
-                return {"ok": False, "reason": f"task not connectable: {s}"}
-            cap_fence = max((o["fence"] for o in writes if o["fence"] is not None),
-                            default=None)
-            branch_tip = None
-            if self.git and t["branch"]:
-                branch_tip = self.git.branch_tip(t["branch"])
-            self.store.set_task(task_id, state=s, connect_fence=cap_fence,
-                                connect_intent_at=time.time(), branch_tip_sha=branch_tip)
-            mdeadline = time.time() + max(self.merge_timeout, 5.0) + MERGE_PIN_GRACE_S
-            for o in writes:
-                self.store.set_orbit(o["orbit_id"], merging=1, merge_deadline=mdeadline)
-            self._emit("connect_started", task_id, token_id=token_id, fence=cap_fence,
-                       via="barrier")
-            intent = {"task_id": task_id, "branch": t["branch"], "worktree": t["worktree"],
-                      "writes": [o["orbit_id"] for o in writes]}
-            return {"ok": True, "token_id": token_id, "intent": intent}
-
-    def barrier_abort(self, name, agent_id=None, *, request_id=None, bail_epoch=None):
-        """배리어를 강제로 깬다(§D5, Python Barrier.abort 시맨틱) — 도착해 있던 전원이 BROKEN
-        으로 기상. 미달 상태에서 한 참가자가 진행 불가를 깨달았을 때(영구 hang 방지)."""
-        with self._cs():
-            with self._idem(request_id, agent_id, "barrier_abort", [name]) as cache:
-                if cache.hit:
-                    return cache.value
-                dead = self._check_alive(agent_id, bail_epoch)
-                if dead:
-                    return cache.set(dead)
-                b = self.store.barrier_by_name(name)
-                if b is None:
-                    return cache.set({"ok": False, "reason": "no such barrier",
-                                      "name": name})
-                if b["state"] in ("BROKEN", "TRIPPED", "CONSUMED"):
-                    return cache.set({"ok": True, "state": b["state"], "name": name,
-                                      "noop": True})
-                self._break_barrier(b, reason="aborted")
-                return cache.set({"ok": True, "state": "BROKEN", "name": name})
-
-    def barrier_consume(self, name, agent_id=None, *, request_id=None, bail_epoch=None):
-        """TRIPPED 배리어의 결과를 수거(§D5 CONSUMED 종단, 증분11) — 멤버별 merge_sha 동봉.
-        TRIPPED 에서만 유효(ARMED/TRIPPING=아직 결과 없음, BROKEN=수거할 성공 없음);
-        CONSUMED 재호출은 멱등 noop(결과 재동봉). 수거는 관측이 아니라 소비의 표식 —
-        같은 세대를 두 번 소비하는 파이프라인 버그를 FSM 이 잡아준다."""
-        with self._cs():
-            with self._idem(request_id, agent_id, "barrier_consume", [name]) as cache:
-                if cache.hit:
-                    return cache.value
-                dead = self._check_alive(agent_id, bail_epoch)
-                if dead:
-                    return cache.set(dead)
-                b = self.store.barrier_by_name(name)
-                if b is None:
-                    return cache.set({"ok": False, "reason": "no such barrier",
-                                      "name": name})
-                if b["state"] not in ("TRIPPED", "CONSUMED"):
-                    return cache.set({"ok": False, "state": b["state"], "name": name,
-                                      "reason": f"not TRIPPED: {b['state']} — 수거할 결과 없음"})
-                parts = self.store.barrier_parties(b["barrier_id"], b["generation"])
-                results = [{"task_id": p["task_id"],
-                            "merge_sha": (self.store.get_task(p["task_id"]) or {}).get("merge_sha")}
-                           for p in parts]
-                if b["state"] == "TRIPPED":
-                    self.store.set_barrier(b["barrier_id"],
-                                           state=fsm.advance("barrier", "TRIPPED", "consume"))
-                    self._emit("barrier_consumed", name, barrier=name,
-                               generation=b["generation"])
-                    return cache.set({"ok": True, "state": "CONSUMED", "name": name,
-                                      "generation": b["generation"], "results": results})
-                return cache.set({"ok": True, "state": "CONSUMED", "name": name, "noop": True,
-                                  "generation": b["generation"], "results": results})
-
-    def barrier_status(self, name):
-        """배리어 현황(상태/세대/도착/참가). 관측용 — 내부 sweep 으로 사망/타임아웃 반영."""
-        with self._cs():
-            self._sweep_inline()
-            b = self.store.barrier_by_name(name)
-            if b is None:
-                return {"ok": False, "reason": "no such barrier", "name": name}
-            self._barrier_eval(b["barrier_id"])  # 사망/타임아웃을 BROKEN 으로 반영(미달이면 plan=None)
-            b = self.store.get_barrier(b["barrier_id"])
-            parts = self.store.barrier_parties(b["barrier_id"], b["generation"])
-            return {"ok": True, "name": name, "state": b["state"],
-                    "generation": b["generation"], "policy": b["policy"],
-                    "parties": len(parts),
-                    "arrived": sum(p["arrived"] for p in parts),
-                    "break_reason": b["break_reason"]}
 
     def status(self):
         self.sweep()
