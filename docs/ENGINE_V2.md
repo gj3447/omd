@@ -2,7 +2,9 @@
 
 Status: `0.1.0a1`, experimental, additive, and isolated from the legacy
 `Coordinator`. No active v1 lease or task is migrated into v2. The canary is
-authoritative only inside its local stdio + SQLite-file trust boundary.
+authoritative only inside its local stdio + SQLite-file trust boundary. An
+isolated repo-saga engine-library alpha now exists as a sibling, but has no
+authority adapter or transport and is absent from the lease MCP surface.
 
 ## Why v2 starts with a new kernel
 
@@ -21,12 +23,13 @@ raw request
   -> domain events + effect intentions
   -> SQLite BEGIN IMMEDIATE / revision CAS
   -> state + events + idempotency + outbox commit
-  -> future effect dispatcher after commit (absent in this milestone)
+  -> durable lease outbox (effect dispatcher remains absent)
 ```
 
-The first milestone contains lease coordination only. Git integration, task
-lifecycle, semaphores, barriers, and v1 compatibility are not hidden behind
-flags; they are absent from the lease-only type and MCP surface.
+The deployed canary milestone contains lease coordination only. Task lifecycle,
+semaphores, barriers, v1 compatibility, and repo publication are not hidden
+behind flags; they are absent from the lease-only type and exact six-tool MCP
+surface. The repo saga is an import-isolated library, not a seventh tool.
 
 ## Provenance and design lineage
 
@@ -45,11 +48,12 @@ source was copied from them.
 | Temporal `service/history/hsm/*` | `ad9949520c8e` | State transition output separated from durable tasks |
 | Temporal `service/matching/fairness.md` | `ad9949520c8e` | Stable ordering, no-barging, pinned progress, and fencing failure analysis |
 | SQLite `src/wal.c`, `test/wal*.test` | `02ea41d5241e` | One writer, WAL snapshots, busy-snapshot behavior, crash/fault tests |
-| Git `git-update-ref.adoc`, `git-merge-tree.adoc` | `e9019fcafe00` | Expected-old ref CAS and worktree-free merge-tree protocol for the future Git saga |
+| Git `git-update-ref.adoc`, `git-merge-tree.adoc` | `e9019fcafe00` | Expected-old ref CAS and worktree-free merge-tree protocol for the repo saga |
 | LangGraph checkpoint conformance | `bdb323ef` | Persistence conformance shape only; its shared-connection/finally-commit wrapper was rejected |
 
-Git is GPLv2. The future integration adapter will invoke Git as a CLI and will
-not copy Git implementation code.
+Git is GPLv2. The repo engine invokes Git as a CLI and does not copy Git
+implementation code. The durable authority and transport adapters remain
+future work.
 
 ## Decision areas
 
@@ -296,7 +300,9 @@ The v2 suite includes:
 - in-process and real stdio MCP capability-surface checks;
 - domain/idempotency corruption quarantine counterexamples;
 - fresh-process legacy import isolation;
-- an actual PEP 517 wheel-content smoke build.
+- an actual PEP 517 wheel-content smoke build, including the repo subpackage;
+- isolated repo-saga crash recovery, authority, immutable-tree policy, Git
+  execution, SHA-1/SHA-256, live repository-drift, and packaging gates.
 
 Run:
 
@@ -316,13 +322,16 @@ merge-token state. Safe adoption order is:
 2. compare v1/v2 behavior without granting authority to v2;
 3. admit only new claim-sets into a canary domain;
 4. drain v1 active leases before any authority switch;
-5. build the repo daemon and Git integration saga separately.
+5. keep the implemented repo engine isolated while building the real durable
+   authority adapter and transport, then pass the production acceptance gates.
 
-The Git saga must capture immutable source and target OIDs, build a candidate
-tree with `git merge-tree --write-tree`, create a commit with `commit-tree`,
-audit the immutable post-tree delta, update the target ref with expected-old
-CAS, persist a sink receipt, and recover forward from durable intent. It must
-not be added to the lease-only stdio process.
+The engine-library implementation captures immutable source and target OIDs,
+builds a candidate tree with `git merge-tree --write-tree`, creates a
+deterministic `commit-tree` candidate, audits the immutable post-tree delta,
+updates one target ref with expected-old CAS, persists sink state, and recovers
+forward from durable intent. Its exact boundary and remaining NO-GO conditions
+are in [REPO_SAGA_V2.md](REPO_SAGA_V2.md). It must not be added to the
+lease-only stdio process.
 
 This DellTower-lineage branch is internal/non-publishable until the user selects
 an explicit project license. Its ancestry must never be pushed directly onto

@@ -78,7 +78,7 @@ print(f"WHEEL_PATH={wheel_name}")
 
     expected = {
         path.relative_to(ROOT).as_posix()
-        for path in (ROOT / "omd_server" / "v2").glob("*.py")
+        for path in (ROOT / "omd_server" / "v2").rglob("*.py")
     }
     assert expected
     assert expected <= names
