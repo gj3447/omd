@@ -1,18 +1,20 @@
 [project]
 name = "omd"
-version = "0.0.1"
+version = "0.1.0a1"
 description = "OMD — 입체운행물방울(Orbital Motion Droplet) 멀티에이전트 병렬 개발 코디네이터"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["transitions>=0.9"]
 
 [project.optional-dependencies]
-server = ["fastmcp>=2.0"]
+server = ["fastmcp>=3.4.4,<4"]
 # ooptdd(LTDD): 동사별 구조화 이벤트를 store에서 도착-검증하는 게이트. 이 워크스페이스에선
 # `uv pip install -e ../ooptdd` 로 editable 설치한다(자매 레포).
-dev = ["pytest>=8", "hypothesis>=6.100", "ooptdd>=0.4"]
+dev = ["pytest>=8", "hypothesis>=6.100", "ooptdd>=0.4", "setuptools>=68"]
 
 [project.scripts]
 omd = "omd_server.cli:main"
+omd-v2-lease = "omd_server.v2.server:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -26,5 +28,5 @@ backend = "memory"
 service = "omd.tests"
 verify = "warn"     # 관측은 보고만(빌드 verdict를 뒤집지 않음)
 
-[tool.setuptools]
-packages = ["omd_server"]
+[tool.setuptools.packages.find]
+include = ["omd_server*"]

@@ -4,10 +4,37 @@
 서로소(=입체) write-set ⇒ 무충돌 응결(merge) ⇒ 분열(악)=0.
 """
 
-from .core import Coordinator, CoordinatorConflict
-from .disjoint import globs_overlap, sets_overlap, glob_prefix
-from .events import Emitter
+_LAZY_EXPORTS = {
+    "Coordinator": ("core", "Coordinator"),
+    "CoordinatorConflict": ("core", "CoordinatorConflict"),
+    "Emitter": ("events", "Emitter"),
+    "globs_overlap": ("disjoint", "globs_overlap"),
+    "sets_overlap": ("disjoint", "sets_overlap"),
+    "glob_prefix": ("disjoint", "glob_prefix"),
+}
 
-__all__ = ["Coordinator", "CoordinatorConflict", "Emitter",
-           "globs_overlap", "sets_overlap", "glob_prefix"]
-__version__ = "0.0.1"
+__all__ = list(_LAZY_EXPORTS)
+__version__ = "0.1.0a1"
+
+
+def __getattr__(name: str):
+    """Load the legacy public API only when a caller asks for it.
+
+    Keeping these imports lazy lets the lease-only v2 profile start without
+    importing the legacy coordinator, FSM, or Git integration graph.
+    """
+
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    from importlib import import_module
+
+    module_name, attribute_name = target
+    value = getattr(import_module(f".{module_name}", __name__), attribute_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
