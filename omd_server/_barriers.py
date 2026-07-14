@@ -242,7 +242,8 @@ class BarrierMixin:
         """응결 trip 프리미티브(§D5) — 공개 connect() 를 재호출하지 않는다(그 Phase A 의
         _sweep_inline 이 방금 검증한 궤도를 재진입 만료시킴). 대신 sweep 없는 Phase A'(fence==
         expected_fence 재검증) + 공유 Phase B(락밖 merge) + Phase C 를 직접 돌린다."""
-        deadline = time.time() + max(self.merge_timeout, 5.0) + 10.0
+        check_budget = self.integration_check_timeout if self.integration_check else 0.0
+        deadline = time.time() + max(self.merge_timeout, 5.0) + check_budget + 10.0
         while True:
             a = self._barrier_connect_phase_a(task_id, expected_fence)
             if not a["ok"]:
@@ -301,17 +302,23 @@ class BarrierMixin:
             cap_fence = max((o["fence"] for o in writes if o["fence"] is not None),
                             default=None)
             branch_tip = None
+            integration_base = None
             if self.git and t["branch"]:
                 branch_tip = self.git.branch_tip(t["branch"])
+                integration_base = self.git.branch_tip(self.integration_branch)
             self.store.set_task(task_id, state=s, connect_fence=cap_fence,
-                                connect_intent_at=time.time(), branch_tip_sha=branch_tip)
-            mdeadline = time.time() + max(self.merge_timeout, 5.0) + MERGE_PIN_GRACE_S
+                                connect_intent_at=time.time(), branch_tip_sha=branch_tip,
+                                integration_base_sha=integration_base)
+            check_budget = self.integration_check_timeout if self.integration_check else 0.0
+            mdeadline = (time.time() + max(self.merge_timeout, 5.0)
+                         + check_budget + MERGE_PIN_GRACE_S)
             for o in writes:
                 self.store.set_orbit(o["orbit_id"], merging=1, merge_deadline=mdeadline)
             self._emit("connect_started", task_id, token_id=token_id, fence=cap_fence,
                        via="barrier")
             intent = {"task_id": task_id, "branch": t["branch"], "worktree": t["worktree"],
-                      "writes": [o["orbit_id"] for o in writes]}
+                      "writes": [o["orbit_id"] for o in writes],
+                      "integration_base_sha": integration_base}
             return {"ok": True, "token_id": token_id, "intent": intent}
 
     def barrier_abort(self, name, agent_id=None, *, request_id=None, bail_epoch=None):
@@ -382,4 +389,3 @@ class BarrierMixin:
                     "parties": len(parts),
                     "arrived": sum(p["arrived"] for p in parts),
                     "break_reason": b["break_reason"]}
-

@@ -10,19 +10,20 @@ N개의 코딩 에이전트(물방울)를 **입체(서로소 write-set 궤도)**
 - [`CONCEPT.md`](./CONCEPT.md) — 컨셉·은유·아키텍처·선행연구 & 차별점(Longinus 바인딩)
 - [`SERVER_SPEC.md`](./SERVER_SPEC.md) — 데이터 모델·상태머신(Orbit/Task/Agent/Barrier)·SINGULON 불변식·OSS 검증(ABC)·추천 스택
 - [`CONCURRENCY.md`](./CONCURRENCY.md) — **동시성·실패모드 정밀 설계** (긴급 탈출·고아 lease/플래그·데드락/기아·크래시 복구·14차원 + 교차작용 A–H + P0/P1/P2 로드맵)
+- [`docs/OMD_DEMPSEY_ROLL.md`](./docs/OMD_DEMPSEY_ROLL.md) — 서로소 궤도·merge fence 운영 규율 초안 (`PRELIMINARY` / `VerdictPending`)
 
 ## 캐논 계층
 `사도 OMC(입체운행구름) → 군단장 OMD → 군단(병렬 에이전트 물방울들)`
 
 ## 상태
-**프로토타입 동작 — 3겹 검증(green).** ① **`pytest`** (171 passed, 9 skipped — 선택적 deps 부재 시 server/LTDD 테스트는 skip) · ② **TLA+ 모델 체크** (`spec/*.tla` 3종 — leader·lease·connect — CI `tla` 잡에서 TLC) · ③ **Hypothesis stateful** (lease/fence 코어를 무작위 연산열로 흔드는 2종 — in-memory + 영속 SQLite/WAL 재시작 내구성). 구현됨: 입체 glob 교집합 · SQLite lease+fence · Orbit/Task FSM · SINGULON 2지점 강제 · 실물 git worktree+CLOUD CONNECT(merge)+fencing · 좀비 회수 · 데드락 wait-for 사이클 감지 · 우선순위 promote · FastMCP 13툴 · CLI · **P0 동시성 11/11 + D1–D14 하드닝**.
+**프로토타입 동작 — 3겹 검증(green).** ① **`pytest`** (350 passed — dev+server extras가 설치된 2026-07-13 로컬 full suite) · ② **TLA+ 모델 체크** (`spec/*.tla` 3종 — leader·lease·connect — CI `tla` 잡에서 TLC) · ③ **Hypothesis stateful** (lease/fence 코어를 무작위 연산열로 흔드는 2종 — in-memory + 영속 SQLite/WAL 재시작 내구성). 구현됨: 입체 glob 교집합 · SQLite lease+fence · Orbit/Task FSM · SINGULON 2지점 강제 · 실물 git worktree+CLOUD CONNECT(merge)+fencing · **green-only pre-commit integration gate** · 유계 liveness · 좀비 회수 · 데드락 wait-for 사이클 감지 · 우선순위 promote · FastMCP 35툴 · CLI parity · **P0 동시성 11/11 + D1–D14 하드닝**.
 
 > ⚠ **검증 범위(정직한 표기).** TLA+ 모델은 **bounded·abstract** 다 — 작은 상수 공간(예: `Tasks = {t1, t2}`)에서만 망라 탐색하고, git split-phase·실시간·크래시 타이밍을 추상화한다. Hypothesis stateful 은 **단일 프로세스 in-proc** 모델(실제 멀티프로세스/멀티노드 레이스 그 자체가 아니라 코어 불변식의 모델). 즉 "model check + stateful + pytest green" 은 *설계 수준* 보증이지 분산 배포의 전수 보증은 아니다. 동시성·실패모드 전수 분석과 로드맵은 [`CONCURRENCY.md`](./CONCURRENCY.md). (예: 좀비 회수는 `agent_ttl` 을 켜야 동작, 기본 비활성.)
 
 ## Quickstart
 ```bash
 pip install -e .            # 코어 + transitions   (서버: -e '.[server]')
-pytest -q                   # 171 passed, 9 skipped (server/LTDD 선택 deps 부재 시 skip)
+pytest -q                   # dev+server extras 설치 환경: 350 passed (2026-07-13)
 
 # CLI (MCP 툴과 동일 동사)
 omd declare auth --writes 'src/auth/**'
@@ -38,10 +39,25 @@ python -m omd_server.server omd.db
 ```
 ```python
 from omd_server import Coordinator
-omd = Coordinator(repo="/path/to/repo")       # 실물 git 연동
-omd.declare("A", writes=["a/**"]); omd.next_task("agA")
-s = omd.start("A", "agA")                      # 물방울 worktree 발사
-# ... s["worktree"] 에서 작업 ...
-omd.commit("A", "feat: a"); omd.finish("A")
-omd.connect("A")                               # CLOUD CONNECT = 실제 merge (fencing 검증)
+
+omd = Coordinator(
+    "/path/to/repo/.omd.db",                   # fence가 재기동을 넘어 보존되는 영속 DB
+    repo="/path/to/repo",
+    integration_check=("make", "verify"),      # operator 고정 argv; connect caller 입력 아님
+    integration_check_timeout=1800,
+    require_integration_check=True,
+)
+s = omd.begin(
+    "A", "agA", writes=["a/**"],
+    ttl=3600, liveness_ttl=1800,                # 유계 silence window (반복 fake heartbeat 아님)
+)
+# ... s["worktree"] 안에서만 편집 ...
+omd.commit("A", "feat: a", "agA", s["fence"])
+omd.finish("A", "agA", s["fence"])
+omd.connect("A", "agA", s["fence"])
+# 후보 merge에서 make verify가 green일 때만 commit→MERGED. red면 main 불변+DONE 재시도.
 ```
+
+`writes`와 `shared`는 한 task 안에서도 서로소여야 한다. 현재 glob 문법은
+`parent/** EXCEPT parent/hot.py`를 표현하지 않으므로, hot 파일을 shared로 옮길 때는 원래
+exclusive glob도 함께 더 작은 서로소 단위로 재분할한다.

@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   connect_fence INTEGER,        -- Phase A에서 capture한 write-orbit fence(P0-4 재검증 기준)
   connect_intent_at REAL,       -- intent 영속 타임스탬프(복구가 CONNECTING 식별)
   branch_tip_sha TEXT,          -- merge 직전 task 브랜치 tip(복구 trailer-probe 보조)
+  integration_base_sha TEXT,    -- Q11 후보 merge 전 통합 HEAD(rollback proof/recovery 기준)
   merge_sha TEXT,               -- 응결된 merge 커밋(MERGED 증거, P0-6: release 전에 기록)
   merged_at REAL,
   -- 증분9(§D12): consumer 가 자기 read-set 을 마지막으로 통합과 동기화한 generation. claim(read)
@@ -149,6 +150,7 @@ _MIGRATIONS = [
     ("tasks", "connect_fence", "INTEGER"),
     ("tasks", "connect_intent_at", "REAL"),
     ("tasks", "branch_tip_sha", "TEXT"),
+    ("tasks", "integration_base_sha", "TEXT"),
     ("tasks", "merge_sha", "TEXT"),
     ("tasks", "merged_at", "REAL"),
     # 증분5(§D6/§D9)
@@ -395,13 +397,15 @@ class Store:
 
     def set_task(self, task_id, *, state=..., agent_id=..., worktree=..., branch=...,
                  connect_fence=..., connect_intent_at=..., branch_tip_sha=...,
-                 merge_sha=..., merged_at=..., read_synced_gen=...):
+                 integration_base_sha=..., merge_sha=..., merged_at=...,
+                 read_synced_gen=...):
         sets, args = [], []
         for col, val in (("state", state), ("agent_id", agent_id),
                          ("worktree", worktree), ("branch", branch),
                          ("connect_fence", connect_fence),
                          ("connect_intent_at", connect_intent_at),
                          ("branch_tip_sha", branch_tip_sha),
+                         ("integration_base_sha", integration_base_sha),
                          ("merge_sha", merge_sha), ("merged_at", merged_at),
                          ("read_synced_gen", read_synced_gen)):
             if val is not ...:

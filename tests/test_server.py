@@ -3,8 +3,105 @@
 import sys
 import sqlite3
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
+
+
+def test_leader_heartbeat_loop_is_noop_without_singleton_enforcement():
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server.server import _leader_heartbeat_loop
+
+    class _NonEnforcedCoordinator:
+        enforce_single_coordinator = False
+
+        def coordinator_heartbeat(self):
+            raise AssertionError("non-enforced coordinator has no leader lease")
+
+    anyio.run(_leader_heartbeat_loop, _NonEnforcedCoordinator())
+
+
+def test_leader_heartbeat_loop_stops_when_leadership_is_lost(monkeypatch):
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server.core import CoordinatorConflict
+    from omd_server import server as server_module
+
+    calls = []
+
+    async def no_wait(_interval):
+        return None
+
+    def fenced_heartbeat():
+        calls.append("heartbeat")
+        raise CoordinatorConflict("lost leadership")
+
+    monkeypatch.setattr(server_module.anyio, "sleep", no_wait)
+    omd = SimpleNamespace(
+        enforce_single_coordinator=True,
+        leader_ttl=30.0,
+        coordinator_heartbeat=fenced_heartbeat,
+    )
+    anyio.run(server_module._leader_heartbeat_loop, omd)
+    assert calls == ["heartbeat"]
+
+
+def test_coordinator_lifespan_resigns_only_when_singleton_enforced():
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server.server import _coordinator_lifespan
+
+    class _Coordinator:
+        leader_ttl = 30.0
+
+        def __init__(self, enforced):
+            self.enforce_single_coordinator = enforced
+            self.resign_calls = 0
+
+        def coordinator_heartbeat(self):
+            return {"ok": True}
+
+        def resign(self):
+            self.resign_calls += 1
+            return {"ok": True}
+
+    async def enter_and_exit(omd):
+        async with _coordinator_lifespan(omd)(None) as state:
+            assert state == {"omd": omd}
+
+    non_enforced = _Coordinator(False)
+    anyio.run(enter_and_exit, non_enforced)
+    assert non_enforced.resign_calls == 0
+
+    enforced = _Coordinator(True)
+    anyio.run(enter_and_exit, enforced)
+    assert enforced.resign_calls == 1
+
+
+def test_begin_tool_exposes_and_forwards_liveness_ttl(tmp_path, monkeypatch):
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server.core import Coordinator
+    from omd_server.server import build_server
+
+    mcp = build_server(str(tmp_path / "s.db"))
+    observed = {}
+
+    def fake_begin(self, task, agent, writes, **kwargs):
+        observed.update(task=task, agent=agent, writes=writes, **kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(Coordinator, "begin", fake_begin)
+
+    async def inspect_and_call():
+        tool = next(t for t in await mcp.list_tools() if t.name == "begin")
+        assert "liveness_ttl" in tool.parameters["properties"]
+        result = tool.fn(task="T", agent="ag", writes=["src/**"], liveness_ttl=90.0)
+        assert result == {"ok": True}
+
+    anyio.run(inspect_and_call)
+    assert observed["liveness_ttl"] == 90.0
 
 
 def test_server_builds(tmp_path):

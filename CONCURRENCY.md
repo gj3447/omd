@@ -535,7 +535,8 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
   1. **EPHEMERAL set 은 agent 를 자동 upsert** — 안 그러면 `bail`/좀비회수가 `agents` 행을 못 찾아 noop → 플래그 영구 잔존(바로 해소하려던 버그). 즉 flag_set(EPHEMERAL)은 owner 를 살아있는 agent 로 등록하는 부작용이 있다(의도된 계약).
   2. **`flag_set` 의 bail_epoch CAS 는 부분** — 회수된 좀비(RETIRED/ZOMBIE/BAILING) 차단은 `_check_alive` 로 항상 ON 이지만, EPHEMERAL 의 §D6 "epoch CAS" 는 **owner CAS + lease fence 만료**로 대체 강제(별도 flag epoch 를 변이마다 caller 가 들고 오게 하진 않음 — orbit lease 가 이미 fence/owner 가드를 받으므로 이중화 불필요). LATCH 는 소유 개념 자체가 없어(§D3) owner/epoch CAS 비대상.
   3. **CLEARED ≠ BROKEN**: 자발 clear 는 '사실이 더는 참 아님'(producer 정상 종료)이라 대기자를 PRODUCER_DEAD 로 깨우지 않는다 — want 가 다른 값이면 계속 WAITING(타임아웃까지). 오직 보유자 **사망**(reclaim/TTL)만 BROKEN/PRODUCER_DEAD. 영구 hang 은 사망 경로가 BROKEN 으로 닫으므로 없음.
-  4. **periodic sweep 없음**(현 inline only, §7 미해결) — flag_ephemeral lease TTL 만료의 BROKEN 반영은 누군가 `flag_wait_poll`/`sweep`/`next_task`/`claim` 등 inline-sweep 동사를 호출할 때 일어난다. 대기자가 poll 하면 반드시 반영되므로(poll 이 sweep 함) 대기 측엔 영구 hang 없음. 백그라운드 tick 은 P2.
+  4. **당시 periodic sweep 없음** — 현재는 `sweep_interval`/`OMD_SWEEP_INTERVAL` opt-in
+     background tick으로 해소됐다. 기본값은 여전히 inline-only(하위호환).
 - **남은 부채**: P0 전부 닫힘(증분1~4). 미구현 = **D4 세마포어** · **D5 배리어** · D12 read-set 코히런스 · D14 HA 입장 — 전부 설계만(P1/P2). (D3 = 증분6, D6 잔여+D9 = 증분5, P0-1~11 = 증분1~4.)
 
 ### ✅ 증분 7 — D4 크래시 안전 세마포어: permit=lease, 가용 = max − count(ACTIVE) — DONE
@@ -566,7 +567,7 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
 - **deviation/한계(정직 표기)**:
   1. **promote 는 eager(release/sweep/declare 마다 즉시 head 부여)** — 그래서 '빈 슬롯 + 대기자' 상태가 정상 경로엔 거의 안 생기고, `_has_earlier_waiter` 가드는 *defense-in-depth*(직접 acquire 의 큐 점프 차단)다. 그 이빨은 territory 테스트(store 직접 상태 주입)로 실증. eager-promote 자체가 1차 기아 방지.
   2. **대기 deadline = ttl**(별도 wait-timeout 인자 없음) — `acquire` 의 `ttl` 이 'permit 보유 TTL'이자 '대기 타임아웃'을 겸한다. 명세(§D4 의사코드)는 `ttl`만 받으므로 따랐다. 더 세분이 필요하면 P2(별도 `wait_timeout`).
-  3. **periodic sweep 없음**(증분6과 동일, §7 미해결) — sem_permit TTL 만료의 슬롯 복구는 누군가 inline-sweep 동사(acquire/acquire_poll/sem_status/sweep 등)를 호출할 때 일어난다. 대기자가 poll 하면 반드시 반영되므로 대기 측엔 영구 hang 없음. 백그라운드 tick 은 P2.
+  3. **당시 periodic sweep 없음** — 증분6과 동일하게 현재 opt-in background tick으로 해소.
   4. **permit 은 fence 를 받지만 strict-fence 재검증 동사는 release 뿐** — acquire/reuse 는 owner 기준(같은 agent). renew 전용 동사는 안 만들고 heartbeat 로 TTL 연장(§D2 의 'heartbeat 한 번이 모든 hb_bound lease 갱신' 패턴). permit 개별 renew 가 필요하면 P2.
 - **남은 부채**: P0 전부 닫힘(증분1~4). 미구현 = **D5 배리어**(세대-스탬프+BROKEN) · D12 read-set 코히런스 · D14 HA 입장 — 전부 설계만(P1/P2). (D4 = 증분7, D3 = 증분6, D6 잔여+D9 = 증분5 에서 닫힘.)
 
@@ -634,7 +635,7 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
      배리어 BROKEN 신호로 호출자에게 반쪽 적용을 알린다). 정직: "전부-아니면-전무" 원자 트립은 아니다 —
      merge 의 비가역성 때문(D8 도 개별 task 단위로 git 진실과 조정). 응결 순서 결정성 + merge_token 으로
      index 오염은 막지만, k번째에서 깨지면 1..k-1 은 응결됨.
-  2. **periodic sweep 없음**(증분6/7 과 동일, §7 미해결) — 타임아웃/사망의 BROKEN 반영은 누군가
+  2. **당시 periodic sweep 없음**(현재 opt-in background tick으로 해소) — 그 시점에는 누군가
      inline-sweep 동사(barrier_arrive/barrier_status/sweep/next_task 등)를 호출할 때 일어난다. 대기 참가자가
      status/arrive 하면 반드시 반영되므로 영구 hang 없음. 백그라운드 tick 은 P2.
   3. **CONSUMED 전이는 정의만**(FSM 에 trip→consume 있음) — 결과 수거 동사는 미구현(현재 TRIPPED 가
@@ -701,9 +702,9 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
    강제한다. "알림만"(soft) 옵션은 미구현.
 3. **D14 는 단일 인스턴스 강제(거부)** 만 — 리더-lease **페일오버**(통합 머지 조정까지)는 §7 대로
    범위 밖. takeover 는 "죽은 리더 자리를 새 리더가 인계" 까지(진행중 작업의 무중단 인계 아님).
-4. **leader heartbeat 자동 주기 미구현** — `coordinator_heartbeat()` 동사만 노출. 운영 시 서버가
-   ttl/3 주기로 호출해야(현 server.py 는 호출 루프 없음 — 단일 프로세스 데모는 takeover 없어 무해,
-   장수 HA 운영엔 주기 호출 추가 필요). 정직히 P1.
+4. **당시 leader heartbeat 자동 주기 미구현** — 현재 `server.py` lifespan이 leader enforcement
+   모드에서 ttl/3 keepalive를 실행하고, takeover로 fence-out되면 루프를 종결한다. 여러 stdio MCP
+   client를 허용하려고 enforcement를 끈 surface는 애초 leader lease가 없으므로 heartbeat도 no-op.
 5. `_ghost_reads` 의 글로브 overlap 은 `sets_overlap`(보수적 — 거짓-양성 가능, soundness 우선).
    거짓-양성이면 불필요한 rebase 1회를 강제할 뿐 분열은 절대 안 남(안전측 실패).
 
@@ -774,22 +775,52 @@ FEEDBACK §P3 잔여("경보 이후가 비어있다") 응답. 선행문헌: Zuul
 - **잔여(O3, 정직)**: resolve-태스크 자동 승격(jj 반영 — 충돌을 큐에 들어가는 정상 작업으로)은
   미구현 — P1 채택 데이터로 충돌 빈도가 보인 뒤 판단.
 
-### ⬜ 다음 증분 후보 (설계는 CONCURRENCY 완료, 구현 대기)
-D13 git/FS 장애 분류 · D14 leader heartbeat 자동주기/페일오버 · periodic sweep(§7) · P3-O3 resolve-태스크 승격.
+### ✅ 증분 14 — runtime guardrails Q10: batch begin + bounded liveness — DONE
+
+- `writes/shared`를 같은 임계구역에서 전부 preflight한 뒤 claim한다. 뒤쪽 shared 충돌을 무시하고
+  worktree를 발사하던 partial acquisition을 폐쇄했다. 현재 glob 대수에 exclusion이 없으므로 한
+  task 안의 `writes/shared` 중첩은 `write_shared_overlap`으로 선언 단계에서 거부한다.
+- 다중 write-like lease의 외부 task fence를 배리어와 같은
+  `max(individual fences)`로 통일했다. `begin()`은 개별 `orbits[]`와 `bail_epoch`도 반환한다.
+- `begin(liveness_ttl=...)`은 orbit TTL 이하의 유계 silence window만 한 번 선언한다. 생략 시 기존
+  crash-fast 유지. NaN/inf/0/음수는 거부하며, heartbeat는 일반 write-orbit를 암묵 갱신하지 않는다.
+- CLI에 `begin/task-conditions/complete-task/cancel/barrier-consume/shared/push/heartbeat --ttl`을
+  배선하고 매 호출 후 leader lease를 반납해 연속 CLI 실행의 TTL 정지를 제거했다.
+- 단일 broken event sink fail-soft, `REQ-TASK-CONDITIONS`, server leader heartbeat lifecycle도 닫힘.
+
+### ✅ 증분 15 — runtime guardrails Q11: green-only pre-commit integration gate — DONE
+
+- 신뢰된 operator가 `Coordinator(integration_check=(...))`로 고정한 argv만 실행한다. connect/MCP
+  caller가 임의 command를 넘기는 surface는 없다. `shell=False`, timeout, stream별 bounded output.
+- 통합 worktree에서 `merge --no-ff --no-commit`으로 후보 tree를 만들고 검사한다. HEAD/index/tracked
+  tree 불변을 재검증한 뒤 green만 commit하고, 그 후에만 push→DB `MERGED`로 전진한다.
+- red/timeout은 `merge --abort` 후 pre-merge HEAD·MERGE_HEAD 부재·clean tracked tree를 모두 증명한
+  경우에만 `DONE` 재시도로 돌아간다. 증명 불가면 `CONNECTING`+token+무기한 pin을 보존하는
+  `integration_rollback_failed` fail-stop; destructive reset으로 증거를 지우지 않는다.
+- pre-merge integration SHA를 DB에 영속해 재기동도 같은 rollback proof를 수행한다. commit 뒤
+  Phase C 전 크래시는 기존 trailer-probe로 `MERGED` 전진수정한다.
+- 긴 검사 동안 coordinator-owned bounded pin이 zombie reclaim을 미루며, 일반 connect와 barrier
+  trip이 동일 Phase B gate를 공유한다. red barrier member는 전체 barrier를 `BROKEN`으로 깨운다.
+
+### ⬜ 다음 증분 후보
+D13 git/FS 장애 분류 · P3-O3 resolve-태스크 승격 · Contract dual declare-time gate
+(`docs/OMD_DEMPSEY_ROLL.md`의 `PRELIMINARY/VerdictPending`, 사용자 verdict 전 강제 금지).
 (P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6, D4 = 증분7, D5 = 증분8, D12+D14 = 증분9,
 P2 shared 레인 = 증분10, §3.D 배리어 재기동+CONSUMED = 증분11, D14 멀티프로세스 실측 = 증분12,
-P3 충돌 복구 UX = 증분13 에서 닫힘.)
+P3 충돌 복구 UX = 증분13, runtime guardrails = 증분14~15 에서 닫힘.)
 
 ---
 
 ## 6. 물방울(에이전트) 계약 요약
 
-1. **renew 주기 = lease_ttl/3**(etcd 관용). `heartbeat(agent)` 한 번이 모든 hb_bound lease 갱신.
+1. **renew 주기 = lease_ttl/3**(etcd 관용). `heartbeat(agent)`는 flag/permit 같은 hb_bound lease만
+   갱신하며 일반 read/write/shared orbit은 반드시 `(orbit_id,fence)`로 명시적 `renew`한다.
 2. **자기 탈출(긴급)**: 회복 불가 시 종료 전 `bail(agent)` (멱등). 도중 죽어도 sweeper가 마저 정리.
 3. **fence 복종**: 어떤 호출이든 `{fenced_out:true}` 또는 heartbeat가 그렇게 답하면 → **LOST 상태**: 쓰기·커밋·connect 즉시 중단, 종료/재생성. **서버가 생존을 판정한다.**
 4. **자기 의심**: renew/heartbeat가 실패(타임아웃/네트워크)하면 추방 가능성 → renew 성공으로 fence 재확인 전까지 **쓰기 일시정지**. 가정만으로 재개 금지.
 5. **worktree FS 에러(ENOENT 등)=추방 확정** → abort. worktree 스스로 재생성 금지.
-6. **궤도 획득은 all-or-none 선호**: 전체 write-set을 한 번에 `claim_set`(데드락-free). 증분이면 `CANON_ORDER`. `{deadlock:true}`면 전부 release 후 재시도.
+6. **궤도 획득은 all-or-none**: 정상 onboarding은 `begin()` batch preflight를 쓴다. 저수준
+   `claim`을 직접 조합한다면 canonical order와 부분획득 rollback을 caller가 책임진다.
 7. **wait는 timeout 필수**: `flag_wait` register→poll. `SATISFIED`/`TIMEOUT`/`BROKEN(producer_dead)` 전부 처리(BROKEN을 성공이나 hang으로 오인 금지).
 8. **의존 해제는 `=done` 아니라 `=merged`** 대기(§3.H).
 9. **connect는 멱등**: 재시도 안전(이미 머지됐으면 재머지 없이 `MERGED` 회신). 재기동 후 `server_epoch` 바뀌면 즉시 renew 한 번.
@@ -801,7 +832,8 @@ P3 충돌 복구 UX = 증분13 에서 닫힘.)
 - **D14 HA 입장 확정**: 단일 인스턴스 강제(거부) vs 리더-lease 페일오버 — 후자는 통합 머지 조정까지 필요(범위 큼). 우선 *단일 인스턴스 강제 + `:memory:` 금지*.
 - **D10 강제 방식**: sparse-checkout(완전 격리, 비용↑) vs pre-connect diff 감사(저렴, 사후) 중 v1 선택. (감사 우선 권장.)
 - **D12 read-set 코히런스**의 정확한 무효화 정책(전 consumer 강제 rebase vs 알림만).
-- **periodic sweep** 도입 여부(현재 inline only) — D1 throughput 예산(reads를 WAL 리더로, sweep/promote/barrier-reconcile을 유계 주기 tick으로) 과 함께.
+- **periodic sweep 기본값 정책** — 구현은 `sweep_interval`/`OMD_SWEEP_INTERVAL` opt-in. 기본을
+  inline-only에서 always-on으로 바꿀지는 workload/throughput 측정 뒤 결정.
 - **durable 엔진**(DBOS) 채택은 여전히 선택(현 설계는 DB-backed FSM + git-진실 복구로 충분; 장기 크래시-내성이 정말 필요해지면).
 - glob char-class 정밀 교집합(현 `disjoint.py`는 보수적 True — soundness 유지, 병렬도만 손해).
 
