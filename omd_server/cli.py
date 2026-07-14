@@ -34,14 +34,23 @@ def main(argv=None):
 
     d = sub.add_parser("declare"); d.add_argument("task"); d.add_argument("--name", default="")
     d.add_argument("--writes", nargs="*", default=[]); d.add_argument("--reads", nargs="*", default=[])
-    d.add_argument("--deps", nargs="*", default=[]); d.add_argument("--priority", type=int, default=0)
+    d.add_argument("--shared", nargs="*", default=[]); d.add_argument("--deps", nargs="*", default=[])
+    d.add_argument("--priority", type=int, default=0)
 
     # depend: task가 after 다음에 오도록 의존 엣지 추가 — 사이클이면 거부(P0-10).
     dep = sub.add_parser("depend"); dep.add_argument("task"); dep.add_argument("after")
 
     n = sub.add_parser("next"); n.add_argument("agent")
+    tc = sub.add_parser("task-conditions"); tc.add_argument("task")
     st = sub.add_parser("start"); st.add_argument("task"); st.add_argument("agent")
     st.add_argument("--request-id"); st.add_argument("--bail-epoch", type=int)
+    bg = sub.add_parser("begin"); bg.add_argument("task"); bg.add_argument("agent")
+    bg.add_argument("--writes", nargs="+", required=True)
+    bg.add_argument("--reads", nargs="*", default=[]); bg.add_argument("--shared", nargs="*", default=[])
+    bg.add_argument("--deps", nargs="*", default=[]); bg.add_argument("--priority", type=int, default=0)
+    bg.add_argument("--name", default=""); bg.add_argument("--ttl", type=float, default=600.0)
+    bg.add_argument("--liveness-ttl", type=float)
+    bg.add_argument("--request-id"); bg.add_argument("--bail-epoch", type=int)
     cm = sub.add_parser("commit"); cm.add_argument("task"); cm.add_argument("msg")
     cm.add_argument("--agent"); cm.add_argument("--fence", type=int)
     cm.add_argument("--request-id"); cm.add_argument("--bail-epoch", type=int)
@@ -50,8 +59,14 @@ def main(argv=None):
     fi.add_argument("--request-id"); fi.add_argument("--bail-epoch", type=int)
     cn = sub.add_parser("connect"); cn.add_argument("task")
     cn.add_argument("--agent"); cn.add_argument("--fence", type=int)
+    cn.add_argument("--push")
     cn.add_argument("--request-id"); cn.add_argument("--bail-epoch", type=int)
-    hb = sub.add_parser("heartbeat"); hb.add_argument("agent")
+    ct = sub.add_parser("complete-task"); ct.add_argument("task"); ct.add_argument("msg", nargs="?")
+    ct.add_argument("--agent"); ct.add_argument("--fence", type=int); ct.add_argument("--push")
+    ct.add_argument("--request-id"); ct.add_argument("--bail-epoch", type=int)
+    ca = sub.add_parser("cancel"); ca.add_argument("task"); ca.add_argument("--reason", default="")
+    ca.add_argument("--request-id")
+    hb = sub.add_parser("heartbeat"); hb.add_argument("agent"); hb.add_argument("--ttl", type=float)
 
     # D4 세마포어: permit=lease, 가용=max−count(ACTIVE), no-overtaking.
     sd = sub.add_parser("sem-declare"); sd.add_argument("sem")
@@ -88,6 +103,8 @@ def main(argv=None):
     bab = sub.add_parser("barrier-abort"); bab.add_argument("name"); bab.add_argument("--agent")
     bab.add_argument("--request-id"); bab.add_argument("--bail-epoch", type=int)
     bs = sub.add_parser("barrier-status"); bs.add_argument("name")
+    bc = sub.add_parser("barrier-consume"); bc.add_argument("name"); bc.add_argument("--agent")
+    bc.add_argument("--request-id"); bc.add_argument("--bail-epoch", type=int)
 
     sub.add_parser("sweep")
     sub.add_parser("status")
@@ -96,59 +113,80 @@ def main(argv=None):
     omd = Coordinator(a.db)
     rid = lambda: getattr(a, "request_id", None)
     be = lambda: getattr(a, "bail_epoch", None)
-    out = {
-        "claim": lambda: omd.claim(a.agent, a.paths, a.mode, ttl=a.ttl, task_id=a.task,
-                                   priority=a.priority, request_id=rid(), bail_epoch=be()),
-        "release": lambda: omd.release(a.orbit_id, a.agent, a.fence,
-                                       request_id=rid(), bail_epoch=be()),
-        "renew": lambda: omd.renew(a.orbit_id, a.agent, a.fence, a.ttl,
-                                   request_id=rid(), bail_epoch=be()),
-        "read-refresh": lambda: omd.read_refresh(a.task, a.agent, a.fence,
-                                                 request_id=rid(), bail_epoch=be()),
-        "bail": lambda: omd.bail(a.agent, request_id=rid()),
-        "declare": lambda: omd.declare(a.task, name=a.name, writes=a.writes,
-                                       reads=a.reads, deps=a.deps, priority=a.priority),
-        "depend": lambda: omd.depend(a.task, a.after),
-        "next": lambda: omd.next_task(a.agent),
-        "start": lambda: omd.start(a.task, a.agent, request_id=rid(), bail_epoch=be()),
-        "commit": lambda: omd.commit(a.task, a.msg, getattr(a, "agent", None),
-                                     getattr(a, "fence", None),
-                                     request_id=rid(), bail_epoch=be()),
-        "finish": lambda: omd.finish(a.task, getattr(a, "agent", None),
-                                     getattr(a, "fence", None),
-                                     request_id=rid(), bail_epoch=be()),
-        "connect": lambda: omd.connect(a.task, getattr(a, "agent", None),
-                                       getattr(a, "fence", None),
-                                       request_id=rid(), bail_epoch=be()),
-        "heartbeat": lambda: omd.heartbeat(a.agent),
-        "sem-declare": lambda: omd.sem_declare(a.sem, a.max_permits),
-        "acquire": lambda: omd.acquire(a.agent, a.sem, ttl=a.ttl, no_wait=a.no_wait,
+    try:
+        out = {
+            "claim": lambda: omd.claim(a.agent, a.paths, a.mode, ttl=a.ttl, task_id=a.task,
                                        priority=a.priority, request_id=rid(), bail_epoch=be()),
-        "acquire-poll": lambda: omd.acquire_poll(a.waiter_id),
-        "sem-release": lambda: omd.sem_release(a.permit_id, a.agent, a.fence,
-                                               request_id=rid(), bail_epoch=be()),
-        "sem-status": lambda: omd.sem_status(a.sem),
-        "flag-set": lambda: omd.flag_set(a.key, a.value, getattr(a, "agent", None),
-                                         flag_type=a.flag_type, ttl=a.ttl,
-                                         request_id=rid(), bail_epoch=be()),
-        "flag-clear": lambda: omd.flag_clear(a.key, getattr(a, "agent", None),
-                                             request_id=rid(), bail_epoch=be()),
-        "flag-get": lambda: omd.flag_get(a.key),
-        "flag-wait": lambda: omd.flag_wait(a.key, a.want, a.timeout,
-                                           getattr(a, "agent", None)),
-        "flag-wait-poll": lambda: omd.flag_wait_poll(a.waiter_id),
-        "barrier-declare": lambda: omd.barrier_declare(a.name, a.task_ids, kind=a.kind,
-                                                       policy=a.policy, timeout=a.timeout),
-        "barrier-arrive": lambda: omd.barrier_arrive(a.name, a.agent, a.task,
-                                                     fence=getattr(a, "fence", None),
+            "release": lambda: omd.release(a.orbit_id, a.agent, a.fence,
+                                           request_id=rid(), bail_epoch=be()),
+            "renew": lambda: omd.renew(a.orbit_id, a.agent, a.fence, a.ttl,
+                                       request_id=rid(), bail_epoch=be()),
+            "read-refresh": lambda: omd.read_refresh(a.task, a.agent, a.fence,
                                                      request_id=rid(), bail_epoch=be()),
-        "barrier-abort": lambda: omd.barrier_abort(a.name, getattr(a, "agent", None),
+            "bail": lambda: omd.bail(a.agent, request_id=rid()),
+            "declare": lambda: omd.declare(a.task, name=a.name, writes=a.writes,
+                                           reads=a.reads, deps=a.deps, priority=a.priority,
+                                           shared=a.shared),
+            "depend": lambda: omd.depend(a.task, a.after),
+            "next": lambda: omd.next_task(a.agent),
+            "task-conditions": lambda: omd.task_conditions(a.task),
+            "start": lambda: omd.start(a.task, a.agent, request_id=rid(), bail_epoch=be()),
+            "begin": lambda: omd.begin(
+                a.task, a.agent, a.writes, reads=a.reads, shared=a.shared, deps=a.deps,
+                priority=a.priority, name=a.name, ttl=a.ttl, liveness_ttl=a.liveness_ttl,
+                request_id=rid(), bail_epoch=be(),
+            ),
+            "commit": lambda: omd.commit(a.task, a.msg, getattr(a, "agent", None),
+                                         getattr(a, "fence", None),
+                                         request_id=rid(), bail_epoch=be()),
+            "finish": lambda: omd.finish(a.task, getattr(a, "agent", None),
+                                         getattr(a, "fence", None),
+                                         request_id=rid(), bail_epoch=be()),
+            "connect": lambda: omd.connect(a.task, getattr(a, "agent", None),
+                                           getattr(a, "fence", None), push=a.push,
+                                           request_id=rid(), bail_epoch=be()),
+            "complete-task": lambda: omd.complete_task(
+                a.task, a.msg, getattr(a, "agent", None), getattr(a, "fence", None),
+                push=a.push, request_id=rid(), bail_epoch=be(),
+            ),
+            "cancel": lambda: omd.cancel(a.task, reason=a.reason, request_id=rid()),
+            "heartbeat": lambda: omd.heartbeat(a.agent, ttl=a.ttl),
+            "sem-declare": lambda: omd.sem_declare(a.sem, a.max_permits),
+            "acquire": lambda: omd.acquire(a.agent, a.sem, ttl=a.ttl, no_wait=a.no_wait,
+                                           priority=a.priority, request_id=rid(), bail_epoch=be()),
+            "acquire-poll": lambda: omd.acquire_poll(a.waiter_id),
+            "sem-release": lambda: omd.sem_release(a.permit_id, a.agent, a.fence,
                                                    request_id=rid(), bail_epoch=be()),
-        "barrier-status": lambda: omd.barrier_status(a.name),
-        "sweep": lambda: omd.sweep(),
-        "status": lambda: omd.status(),
-    }[a.cmd]()
-    print(json.dumps(out, ensure_ascii=False, indent=2))
+            "sem-status": lambda: omd.sem_status(a.sem),
+            "flag-set": lambda: omd.flag_set(a.key, a.value, getattr(a, "agent", None),
+                                             flag_type=a.flag_type, ttl=a.ttl,
+                                             request_id=rid(), bail_epoch=be()),
+            "flag-clear": lambda: omd.flag_clear(a.key, getattr(a, "agent", None),
+                                                 request_id=rid(), bail_epoch=be()),
+            "flag-get": lambda: omd.flag_get(a.key),
+            "flag-wait": lambda: omd.flag_wait(a.key, a.want, a.timeout,
+                                               getattr(a, "agent", None)),
+            "flag-wait-poll": lambda: omd.flag_wait_poll(a.waiter_id),
+            "barrier-declare": lambda: omd.barrier_declare(a.name, a.task_ids, kind=a.kind,
+                                                           policy=a.policy, timeout=a.timeout),
+            "barrier-arrive": lambda: omd.barrier_arrive(a.name, a.agent, a.task,
+                                                         fence=getattr(a, "fence", None),
+                                                         request_id=rid(), bail_epoch=be()),
+            "barrier-abort": lambda: omd.barrier_abort(a.name, getattr(a, "agent", None),
+                                                       request_id=rid(), bail_epoch=be()),
+            "barrier-status": lambda: omd.barrier_status(a.name),
+            "barrier-consume": lambda: omd.barrier_consume(
+                a.name, getattr(a, "agent", None), request_id=rid(), bail_epoch=be(),
+            ),
+            "sweep": lambda: omd.sweep(),
+            "status": lambda: omd.status(),
+        }[a.cmd]()
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    finally:
+        try:
+            omd.resign()
+        finally:
+            omd.close()
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -38,7 +39,18 @@ from contextlib import contextmanager
 from . import bypass_audit, fsm, task_state
 from .disjoint import path_in_globs, sets_overlap
 from .events import NOOP
-from .gitio import GitError, GitMergeConflict, GitNothingToCommit, GitRepo, GitTimeout
+from .gitio import (
+    GitError,
+    GitIntegrationCheckError,
+    GitIntegrationCheckTimeout,
+    GitIntegrationMutation,
+    GitIntegrationPreconditionError,
+    GitMergeConflict,
+    GitNothingToCommit,
+    GitRepo,
+    GitRollbackError,
+    GitTimeout,
+)
 from ._barriers import BarrierMixin
 from ._const import LATCH_RANK, MERGE_PIN_GRACE_S, WRITE_MODES
 from ._flags import FlagMixin
@@ -86,7 +98,38 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                  auto_push: str | None = None,
                  idem_ttl: float | None = 3600.0,
                  strict_writeset: bool = False,
-                 sweep_interval: float | None = None):
+                 sweep_interval: float | None = None,
+                 integration_check=None,
+                 integration_check_timeout: float = 300.0,
+                 integration_check_output_limit: int = 16_384,
+                 require_integration_check: bool = False):
+        # Q11: 검사 명령은 MCP caller가 connect 때 보내는 원격 명령이 아니라, 신뢰된 operator가
+        # 기동 시 고정하는 argv다. shell 문자열은 받지 않는다.
+        if integration_check is not None:
+            if isinstance(integration_check, (str, bytes)):
+                raise ValueError(
+                    "integration_check must be a non-empty argv sequence, not a shell string"
+                )
+            try:
+                integration_check = tuple(integration_check)
+            except TypeError as exc:
+                raise ValueError("integration_check must be a non-empty argv sequence") from exc
+            if not integration_check or not all(isinstance(arg, str) for arg in integration_check):
+                raise ValueError("integration_check must contain only argv strings")
+            if repo is None:
+                raise ValueError("integration_check requires a git repo")
+        if require_integration_check and integration_check is None:
+            raise ValueError("require_integration_check=True requires integration_check argv")
+        try:
+            integration_check_timeout = float(integration_check_timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("integration_check_timeout must be finite and positive") from exc
+        if not math.isfinite(integration_check_timeout) or integration_check_timeout <= 0:
+            raise ValueError("integration_check_timeout must be finite and positive")
+        if (not isinstance(integration_check_output_limit, int)
+                or isinstance(integration_check_output_limit, bool)
+                or integration_check_output_limit <= 0):
+            raise ValueError("integration_check_output_limit must be a positive integer")
         # §D14: `:memory:` 디폴트 금지 — 재기동마다 모든 fence/leader_epoch 가 0 으로 리셋되어
         # 낡은 토큰/잔여 merge 와 충돌(고스트 writer). 영속 DB 필수. 단위테스트는 allow_memory_db=
         # True 로 명시 opt-in(프로세스 1개, 재기동 없음 — fence 리셋 위험 없음).
@@ -117,6 +160,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         if self.enforce_single_coordinator:
             self._acquire_leadership()
         self.merge_timeout = merge_timeout if merge_timeout is not None else MERGE_TIMEOUT_S
+        self.integration_check = integration_check
+        self.integration_check_timeout = integration_check_timeout
+        self.integration_check_output_limit = integration_check_output_limit
+        self.require_integration_check = bool(require_integration_check)
         self.git = GitRepo(repo) if repo else None
         # 연결(connect=merge) 직후 통합 브랜치를 이 remote 로 push — 로컬 누적 divergence 방지
         # (operator "커밋하면 바로 sync"의 OMD 내장판). None=off(기본·기존동작). env OMD_AUTO_PUSH 폴백.
@@ -432,7 +479,21 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         if not self.agent_ttl:
             return []
         out = []
-        for a in self.store.stale_agents(time.time(), self.agent_ttl):
+        now = time.time()
+        for a in self.store.stale_agents(now, self.agent_ttl):
+            # Phase B merge/check subprocess는 coordinator가 직접 관측하고 write-orbit에 유계 pin을
+            # 박는다. 그 한가운데서 heartbeat만 보고 회수하면 checker와 abort가 동시에 달린다.
+            active_connect_pin = any(
+                t["state"] == "CONNECTING" and any(
+                    o["merging"] and (
+                        o["merge_deadline"] is None or o["merge_deadline"] > now
+                    )
+                    for o in self.store.pinned_orbits_for_task(t["task_id"])
+                )
+                for t in self.store.tasks_for_agent(a["agent_id"])
+            )
+            if active_connect_pin:
+                continue
             self._reclaim_agent_inline(a["agent_id"], voluntary=False)
             out.append(a["agent_id"])
         return out
@@ -531,7 +592,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
 
     def _check_task_write_fence(self, task_id, agent_id, fence):
         """finish/commit/connect의 D6 가드(opt-in): caller가 (agent,fence)를 주면
-        task.owner==agent ∧ 모든 write-orbit HELD ∧ fence==f 여야 한다. 통과면 None,
+        task.owner==agent ∧ 모든 write-orbit HELD ∧ fence==task_fence 여야 한다. 다중
+        write/shared orbit의 task_fence는 배리어와 동일하게 max(individual fences). 통과면 None,
         아니면 fenced_out 거부 dict. 작업 중 lease가 만료/재부여(ABA)됐으면 여기서 잡힌다.
         (agent/fence 둘 다 None이면 검사 skip — 증분2까지의 무인자 호출 하위호환.)"""
         if agent_id is None and fence is None:
@@ -549,8 +611,11 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             for o in writes:
                 if agent_id is not None and o["agent_id"] != agent_id:
                     stale.append(o["orbit_id"])
-                elif fence is not None and o["fence"] != fence:
-                    stale.append(o["orbit_id"])
+            task_fence = max(
+                (o["fence"] for o in writes if o["fence"] is not None), default=None
+            )
+            if fence is not None and fence != task_fence:
+                stale.extend(o["orbit_id"] for o in writes if o["orbit_id"] not in stale)
         if stale:
             return {"ok": False, "fenced_out": True,
                     "reason": "stale fence: write lease expired/released during work",
@@ -593,7 +658,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             return False
         if res.get("fenced_out") or res.get("deadlock") or res.get("retry"):
             return False
-        if res.get("state") in ("DENIED",):
+        if res.get("state") in ("DENIED", "PENDING"):
             return False
         return True
 
@@ -686,18 +751,28 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                                         merged_at=time.time())
                     self._release_task_write_orbits(t["task_id"])
                     self.store.set_task(t["task_id"],
-                                        state=fsm.advance("task", "CONNECTING", "merged"))
+                                        state=fsm.advance("task", "CONNECTING", "merged"),
+                                        connect_intent_at=None, integration_base_sha=None)
                     self.store.set_flag(t["task_id"], "merged")
                     if self.git and t["worktree"]:
                         self.git.remove_worktree(t["worktree"])
                     self._emit("connect_recovered", t["task_id"], merge_sha=merged_sha,
                                outcome="merged")
                 else:
-                    # git상 미머지 → rollback(재시도가능). 궤도 unpin(merging=0).
+                    # checked merge는 영속한 pre-merge HEAD로 abort+검증한다. 실패하면
+                    # Coordinator 기동을 fail-stop해 DB/token/pin과 증거를 보존한다.
+                    integration_base = t.get("integration_base_sha")
+                    if self.git and wt and integration_base:
+                        self.git.abort_merge_verified(wt, integration_base)
+                    elif self.git and wt and self.git.has_merge_in_progress(wt):
+                        # Q11 이전 legacy intent에는 base SHA가 없어 기존 복구를 보존한다.
+                        self.git.abort_merge(wt)
+                    # 검증된 미머지 → rollback(재시도가능). 궤도 unpin(merging=0).
                     for o in self.store.pinned_orbits_for_task(t["task_id"]):
                         self.store.set_orbit(o["orbit_id"], merging=0, merge_deadline=None)
                     self.store.set_task(t["task_id"],
-                                        state=fsm.advance("task", "CONNECTING", "rollback"))
+                                        state=fsm.advance("task", "CONNECTING", "rollback"),
+                                        connect_intent_at=None, integration_base_sha=None)
                     self._emit("connect_recovered", t["task_id"], outcome="rollback")
             # dangling merge_token: 재기동 시점에 HELD인 토큰은 정의상 dangling이다 —
             # merge_token은 connect Phase B 동안만 잠깐 보유되고, 그 Phase는 프로세스에 묶여
@@ -913,8 +988,32 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
     def declare(self, task_id, *, name="", writes=None, reads=None, deps=None, priority=0,
                 shared=None):
         """shared(P2 레인): hot 공유파일 glob — 배타 writes 와 달리 다른 task 의 shared 궤도와
-        겹쳐도 next_task/claim 을 막지 않는다(응결은 3-way, 충돌 시 shared_conflict retryable)."""
+        겹쳐도 next_task/claim 을 막지 않는다(응결은 3-way, 충돌 시 shared_conflict retryable).
+        단 한 task 안의 writes/shared 는 서로소여야 한다. 현재 glob 문법은 부모 glob에서 shared
+        하위 경로를 빼는 EXCEPT를 표현하지 못하므로 중첩을 허용하면 같은 task의 배타 lease가
+        자기 shared lease를 막는다. 조용한 오분류 대신 선언 단계에서 fail-loud 한다."""
+        writes = list(writes or [])
+        reads = list(reads or [])
+        deps = list(deps or [])
+        shared = list(shared or [])
         with self._cs():
+            overlaps = [
+                {"write": write_glob, "shared": shared_glob}
+                for write_glob in writes
+                for shared_glob in shared
+                if sets_overlap([write_glob], [shared_glob])
+            ]
+            if overlaps:
+                self._emit("declare_rejected", task_id,
+                           reason="write_shared_overlap", overlaps=overlaps)
+                return {
+                    "ok": False,
+                    "reason": "write_shared_overlap",
+                    "task_id": task_id,
+                    "overlaps": overlaps,
+                    "hint": "partition writes and shared into disjoint globs; "
+                            "shared is not an implicit exclusion from writes",
+                }
             # P0-10/§D7: deps가 의존 DAG에 사이클을 만들면 거부(그래프 불변) — 안 그러면
             # 상호의존(A after B, B after A)이 둘 다 영구 BLOCKED. self-dep 도 잡힌다.
             if deps:
@@ -923,9 +1022,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     self._emit("declare_rejected", task_id, reason="dep_cycle", cycle=cyc)
                     return {"ok": False, "reason": "dep_cycle", "cycle": cyc,
                             "task_id": task_id}
-            self.store.add_task(task_id=task_id, name=name, writes=writes or [],
-                                reads=reads or [], deps=deps or [], state="PENDING",
-                                priority=priority, shared=shared or [])
+            self.store.add_task(task_id=task_id, name=name, writes=writes,
+                                reads=reads, deps=deps, state="PENDING",
+                                priority=priority, shared=shared)
         return {"ok": True, "task_id": task_id, "state": "PENDING"}
 
     def depend(self, task_id, after):
@@ -1093,6 +1192,15 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         F2(채택마찰 2026-07-02): `ttl=` 로 *자기 페이스를 선언* — 이 agent 의 per-agent 생존창
         (liveness_ttl). 인터랙티브 세션(verb 간 침묵 수십 분)이 claim 직후 한 번 선언하면 좀비
         회수가 그 창을 존중한다. 미선언 agent 는 기본 agent_ttl(기계 물방울 crash-fast §D2 불변)."""
+        if ttl is not None:
+            try:
+                ttl = float(ttl)
+            except (TypeError, ValueError):
+                return {"ok": False, "reason": "invalid_liveness_ttl",
+                        "liveness_ttl": ttl}
+            if not math.isfinite(ttl) or ttl <= 0:
+                return {"ok": False, "reason": "invalid_liveness_ttl",
+                        "liveness_ttl": ttl}
         with self._cs():
             ag = self.store.get_agent(agent_id)
             if ag is not None and ag["state"] == "RETIRED":
@@ -1101,7 +1209,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                         "bail_epoch": ag["bail_epoch"]}
             self.store.upsert_agent(agent_id)
             if ttl is not None:
-                self.store.set_agent_liveness_ttl(agent_id, float(ttl) if ttl else None)
+                self.store.set_agent_liveness_ttl(agent_id, ttl)
             # D3(§1.2 / D2 §): heartbeat 한 번이 이 agent 의 모든 hb_bound flag_ephemeral lease 를
             # 갱신 — 건강한 producer 가 renew 깜빡해 자기 신호 플래그가 BROKEN 되는 일 방지.
             renewed = 0
@@ -1412,16 +1520,45 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         return {**cn, "ok": False, "stage": "connect", "state": final}
 
     def begin(self, task_id, agent_id, writes, *, reads=None, shared=None, deps=None,
-              priority=0, name="", ttl=600.0, request_id=None, bail_epoch=None):
+              priority=0, name="", ttl=600.0, liveness_ttl=None,
+              request_id=None, bail_epoch=None):
         """P1/P5 — happy-path 원샷 onboarding: declare → deps 게이트 → claim(write-set lease)
         → promote(READY) → start(물방울 worktree 발사). 7-verb 앞단을 한 호출로 접어 "그냥
         begin 하면 OMD 안에서 격리" 되게 한다(채택 자동화 enabler; complete_task 의 start-side
         dual). INV: ok:True ⟺ 최종 store state == IN_ORBIT. fail-loud — 어느 단계 거부든
         {ok:False, stage:'declare'|'deps'|'claim'|'start', ...}로 전파(worktree 는 claim HELD
         확인 *후* 에만 발사 → 충돌 시 낭비 0). request_id 는 하위 verb 에 suffix(:claim/:start)로
-        분리해 멱등 재시작 안전(재발사·중복 orbit 없음)."""
+        분리해 멱등 재시작 안전(재발사·중복 orbit 없음).
+
+        liveness_ttl은 detached keeper가 생존을 위조하는 대신 이 agent가 무응답일 수 있는 *유계*
+        창을 한 번 선언한다. orbit ttl보다 길 수 없고, 생략하면 기존 agent_ttl crash-fast가 유지된다.
+        성공 응답은 각 orbit_id/fence를 돌려줘 caller가 명시적 fenced renew를 할 수 있게 한다."""
         def _rid(s):
             return f"{request_id}:{s}" if request_id else None
+        # 0) TTL 계약 — NaN/inf/0/음수는 영원한 또는 즉시 stale lease를 조용히 만들므로 거부.
+        try:
+            ttl = float(ttl)
+        except (TypeError, ValueError):
+            return {"ok": False, "stage": "validate", "reason": "invalid_ttl",
+                    "ttl": ttl}
+        if not math.isfinite(ttl) or ttl <= 0:
+            return {"ok": False, "stage": "validate", "reason": "invalid_ttl",
+                    "ttl": ttl}
+        if liveness_ttl is not None:
+            try:
+                liveness_ttl = float(liveness_ttl)
+            except (TypeError, ValueError):
+                return {"ok": False, "stage": "validate",
+                        "reason": "invalid_liveness_ttl",
+                        "liveness_ttl": liveness_ttl}
+            if not math.isfinite(liveness_ttl) or liveness_ttl <= 0:
+                return {"ok": False, "stage": "validate",
+                        "reason": "invalid_liveness_ttl",
+                        "liveness_ttl": liveness_ttl}
+            if liveness_ttl > ttl:
+                return {"ok": False, "stage": "validate",
+                        "reason": "liveness_exceeds_orbit_ttl",
+                        "ttl": ttl, "liveness_ttl": liveness_ttl}
         # 1) declare (task_id 키 upsert — 자연 멱등, 진행중 state 는 보존)
         dc = self.declare(task_id, name=name, writes=writes, reads=reads, deps=deps,
                           priority=priority, shared=shared)
@@ -1433,16 +1570,62 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         if unmet:
             self._emit("begin_blocked", task_id, reason="deps", unmet=unmet)
             return {"ok": False, "stage": "deps", "task_id": task_id, "unmet": unmet}
-        # 3) claim write-set (fail-fast — worktree 발사 전). 서로소 아니면 PENDING/DENIED 전파.
-        cl = self.claim(agent_id, writes, mode="write", ttl=ttl, task_id=task_id,
-                        request_id=_rid("claim"), bail_epoch=bail_epoch)
-        if cl.get("state") != "HELD":
-            self._emit("begin_blocked", task_id, reason="claim", state=cl.get("state"))
-            return {"ok": False, "stage": "claim", "task_id": task_id,
-                    "state": cl.get("state"), "conflicts": cl.get("conflicts", [])}
-        if shared:   # P2 레인 — 공유 glob 은 shared 모드로(공존 허용)
-            self.claim(agent_id, shared, mode="shared", ttl=ttl, task_id=task_id,
-                       request_id=_rid("claim-shared"), bail_epoch=bail_epoch)
+        # 2.5) 선택적 silence window를 claim의 inline sweep *전에* 선언한다. 반복 heartbeat가
+        # 아니라 서버가 만료를 판정할 수 있는 단일 유계 계약이며, 실패하면 lease를 잡지 않는다.
+        if liveness_ttl is not None:
+            hb = self.heartbeat(agent_id, ttl=liveness_ttl)
+            if hb.get("ok") is False:
+                return {**hb, "ok": False, "stage": "liveness", "task_id": task_id}
+        # 3) write/shared batch claim (fail-fast — worktree 발사 전).
+        # 먼저 같은 임계구역에서 *전부* preflight해, 뒤쪽 shared가 충돌할 때 앞쪽 exclusive
+        # HELD만 남는 partial acquisition을 막는다. 충돌한 클래스 하나만 PENDING으로 등록해
+        # promote→begin 재시도가 자연스럽게 이어진다. writes/shared 자체 중첩은 declare가 거부.
+        specs = []
+        if writes:
+            specs.append(("write", list(writes), "claim"))
+        if shared:
+            specs.append(("shared", list(shared), "claim-shared"))
+        claims = {}
+        with self._cs():
+            self._sweep_inline()
+            for mode, paths, rid_suffix in specs:
+                dup = self.store.orbit_by_intent(
+                    self._intent_key(agent_id, paths, mode, task_id)
+                )
+                if dup is not None and dup["agent_id"] == agent_id:
+                    if dup["state"] != "HELD":
+                        self._emit("begin_blocked", task_id, reason="claim",
+                                   mode=mode, state=dup["state"])
+                        return {"ok": False, "stage": "claim", "task_id": task_id,
+                                "mode": mode, "orbit_id": dup["orbit_id"],
+                                "state": dup["state"], "conflicts": []}
+                    continue
+                conflicts = self._conflicts(paths, mode)
+                if conflicts:
+                    pending = self.claim(
+                        agent_id, paths, mode=mode, ttl=ttl, task_id=task_id,
+                        request_id=_rid(rid_suffix), bail_epoch=bail_epoch,
+                    )
+                    self._emit("begin_blocked", task_id, reason="claim", mode=mode,
+                               state=pending.get("state"))
+                    return {"ok": False, "stage": "claim", "task_id": task_id,
+                            "mode": mode, "orbit_id": pending.get("orbit_id"),
+                            "state": pending.get("state"),
+                            "conflicts": pending.get("conflicts", conflicts)}
+            # 전 클래스가 지금 grant 가능하거나 이미 HELD임을 확인한 뒤 같은 tx에서 획득.
+            for mode, paths, rid_suffix in specs:
+                claimed = self.claim(
+                    agent_id, paths, mode=mode, ttl=ttl, task_id=task_id,
+                    request_id=_rid(rid_suffix), bail_epoch=bail_epoch,
+                )
+                if claimed.get("state") != "HELD":  # preflight 아래서는 방어적 불변식 가드
+                    self._emit("begin_blocked", task_id, reason="claim", mode=mode,
+                               state=claimed.get("state"))
+                    return {"ok": False, "stage": "claim", "task_id": task_id,
+                            "mode": mode, "orbit_id": claimed.get("orbit_id"),
+                            "state": claimed.get("state"),
+                            "conflicts": claimed.get("conflicts", [])}
+                claims[mode] = claimed
         # 4) promote → READY (PENDING/BLOCKED 만; 이미 진행중이면 skip → 멱등 재시작).
         t = self.store.get_task(task_id)
         if t["state"] in ("PENDING", "BLOCKED"):
@@ -1453,9 +1636,31 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         if st.get("ok") is False:
             return {**st, "ok": False, "stage": "start"}
         final = (self.store.get_task(task_id) or {}).get("state")
+        fences = {mode: claimed.get("fence") for mode, claimed in claims.items()}
+        task_fence = max((f for f in fences.values() if f is not None), default=None)
+        orbit_descriptors = []
+        for mode, claimed in claims.items():
+            row = self.store.get_orbit(claimed["orbit_id"])
+            orbit_descriptors.append({
+                "orbit_id": claimed["orbit_id"],
+                "mode": mode,
+                "paths": json.loads(row["pathspec"]) if row else [],
+                "state": row["state"] if row else claimed.get("state"),
+                "fence": row["fence"] if row else claimed.get("fence"),
+                "expires_at": row["expires_at"] if row else None,
+            })
+        primary = next(
+            (o for o in orbit_descriptors if o["fence"] == task_fence),
+            orbit_descriptors[0] if orbit_descriptors else None,
+        )
+        agent = self.store.get_agent(agent_id)
         return {"ok": final == "IN_ORBIT", "stage": "started", "task_id": task_id,
                 "state": st.get("state"), "worktree": st.get("worktree"),
-                "branch": st.get("branch"), "fence": cl.get("fence")}
+                "branch": st.get("branch"), "fence": task_fence, "fences": fences,
+                "orbit_id": primary["orbit_id"] if primary else None,
+                "orbits": orbit_descriptors,
+                "bail_epoch": agent["bail_epoch"] if agent else None,
+                "liveness_ttl": liveness_ttl}
 
     def _connect_phase_a(self, task_id, agent_id, fence, bail_epoch=None):
         """Phase A(임계구역): fence 재검증(P0-4) + merge_token 획득 + intent 영속 + pin + →CONNECTING."""
@@ -1477,14 +1682,17 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             if not writes:
                 return {"ok": False, "reason": "no write orbit for task"}
             # P0-4: 모든 write-orbit이 HELD여야(만료/해제면 stale). + 호출자가 (agent,fence)를
-            # 줬으면 owner∧fence==captured 까지 — ABA(만료 후 재부여)를 fence 동일성으로 잡는다.
+            # 줬으면 owner∧fence==task_fence(max individual fences) — ABA를 동일성으로 잡는다.
             stale = [o["orbit_id"] for o in writes if o["state"] != "HELD"]
             if not stale and (agent_id is not None or fence is not None):
                 for o in writes:
                     if agent_id is not None and o["agent_id"] != agent_id:
                         stale.append(o["orbit_id"])
-                    elif fence is not None and o["fence"] != fence:
-                        stale.append(o["orbit_id"])
+                task_fence = max(
+                    (o["fence"] for o in writes if o["fence"] is not None), default=None
+                )
+                if fence is not None and fence != task_fence:
+                    stale.extend(o["orbit_id"] for o in writes if o["orbit_id"] not in stale)
             if stale:
                 self._emit("connect_rejected", task_id, reason="stale_fence", stale=stale)
                 return {"ok": False, "fenced_out": True,
@@ -1532,17 +1740,23 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 return {"ok": False, "reason": f"task not connectable: {s}"}
             cap_fence = max((o["fence"] for o in writes if o["fence"] is not None), default=None)
             branch_tip = None
+            integration_base = None
             if self.git and t["branch"]:
                 branch_tip = self.git.branch_tip(t["branch"])
+                integration_base = self.git.branch_tip(self.integration_branch)
             self.store.set_task(task_id, state=s, connect_fence=cap_fence,
-                                connect_intent_at=time.time(), branch_tip_sha=branch_tip)
+                                connect_intent_at=time.time(), branch_tip_sha=branch_tip,
+                                integration_base_sha=integration_base)
             # 궤도 pin(merging=1) — sweep/reclaim이 응결중 궤도를 건드리지 않게(§E, 유계).
-            deadline = time.time() + max(self.merge_timeout, 5.0) + MERGE_PIN_GRACE_S
+            check_budget = self.integration_check_timeout if self.integration_check else 0.0
+            deadline = (time.time() + max(self.merge_timeout, 5.0)
+                        + check_budget + MERGE_PIN_GRACE_S)
             for o in writes:
                 self.store.set_orbit(o["orbit_id"], merging=1, merge_deadline=deadline)
             self._emit("connect_started", task_id, token_id=token_id, fence=cap_fence)
             intent = {"task_id": task_id, "branch": t["branch"], "worktree": t["worktree"],
-                      "writes": [o["orbit_id"] for o in writes]}
+                      "writes": [o["orbit_id"] for o in writes],
+                      "integration_base_sha": integration_base}
             return {"ok": True, "token_id": token_id, "intent": intent}
 
     def _diagnose_conflict(self, branch, conflict_files):
@@ -1578,7 +1792,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             wt = self._ensure_integration_wt()
             msg = f"CLOUD CONNECT {task_id}\n\n{self._trailer(task_id)}"
             sha = self.git.merge_into(wt, self.integration_branch, branch, msg,
-                                      timeout=self.merge_timeout)
+                                      timeout=self.merge_timeout,
+                                      check_argv=self.integration_check,
+                                      check_timeout=self.integration_check_timeout,
+                                      check_output_limit=self.integration_check_output_limit)
             # 연결=merge 직후 remote sync(operator "커밋하면 바로 sync"의 OMD 내장판).
             # opt-in(push override > self.auto_push). fail-soft: push 실패해도 merge 는 로컬
             # 반영됨이라 connect 는 성공 유지(다음 connect/수동 push 가 따라잡음). 강제 push 안 함.
@@ -1599,15 +1816,49 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         해제; 실패면 CONNECTING→DONE rollback(재시도가능). 어느 쪽이든 merge_token 반납 + unpin."""
         with self._cs():
             if err is not None:
+                # checker가 tracked tree를 바꿔 merge --abort 뒤 원상복구를 증명하지 못한 경우는
+                # 자동 DONE rollback 금지. CONNECTING+token+pin을 보존해 증거를 조사하게 한다.
+                if isinstance(err, GitRollbackError):
+                    for o in self.store.pinned_orbits_for_task(task_id):
+                        self.store.set_orbit(o["orbit_id"], merge_deadline=None)
+                    self._emit("connect_fail_stopped", task_id,
+                               reason="integration_rollback_failed",
+                               problems=list(err.problems))
+                    return {
+                        "ok": False,
+                        "task_id": task_id,
+                        "state": "CONNECTING",
+                        "retryable": False,
+                        "reason": "integration_rollback_failed",
+                        "error": str(err),
+                        "problems": list(err.problems),
+                    }
                 # Phase B 실패 → rollback(재시도가능). 궤도 unpin + 토큰 반납.
                 for o in self.store.pinned_orbits_for_task(task_id):
                     self.store.set_orbit(o["orbit_id"], merging=0, merge_deadline=None)
                 self.store.set_task(task_id, state=fsm.advance("task", "CONNECTING", "rollback"),
-                                    connect_intent_at=None)
+                                    connect_intent_at=None, integration_base_sha=None)
                 self._release_merge_token_locked(token_id)
                 self._promote_pending()
-                reason = "merge timeout" if isinstance(err, GitTimeout) else "merge conflict"
+                if isinstance(err, GitIntegrationCheckTimeout):
+                    reason = "integration_check_timeout"
+                elif isinstance(err, GitIntegrationMutation):
+                    reason = "integration_check_mutation"
+                elif isinstance(err, GitIntegrationCheckError):
+                    reason = "integration_check_failed"
+                elif isinstance(err, GitIntegrationPreconditionError):
+                    reason = "integration_precondition_failed"
+                else:
+                    reason = "merge timeout" if isinstance(err, GitTimeout) else "merge conflict"
                 out = {"ok": False, "task_id": task_id, "state": "DONE", "retryable": True}
+                if isinstance(err, GitIntegrationCheckError):
+                    out.update({
+                        "check_returncode": err.returncode,
+                        "check_stdout": err.stdout,
+                        "check_stderr": err.stderr,
+                    })
+                    if isinstance(err, GitIntegrationMutation):
+                        out["mutations"] = list(err.mutations)
                 # P3 증분13(O1): 충돌이면 진단 동봉 — 충돌 경로 + 통합측 원인 커밋
                 # (bypass_audit 분류: 우회 여부·작성자까지 지목). Zuul reporter 교훈:
                 # 실패는 유지하되 '왜/무엇 때문에'의 보고가 복구 UX 의 본체.
@@ -1632,13 +1883,21 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                                    "connect 를 재시도")
                     self._emit("connect_aborted", task_id, reason=str(err),
                                conflicts=out.get("conflict_files", []))
-                else:
+                elif reason == "merge timeout":
                     self._emit("connect_aborted", task_id, reason=str(err))
-                out["reason"] = f"{reason}: {err}"
+                else:
+                    self._emit("connect_gate_rejected", task_id, reason=reason,
+                               error=str(err))
+                if reason.startswith("integration_"):
+                    out["reason"] = reason
+                    out["error"] = str(err)
+                else:
+                    out["reason"] = f"{reason}: {err}"
                 return out
             # 성공: P0-6 순서 — merge_sha 먼저 기록 → MERGED → write-orbit 해제(+unpin).
             self.store.set_task(task_id, merge_sha=merge_sha, merged_at=time.time())
-            self.store.set_task(task_id, state=fsm.advance("task", "CONNECTING", "merged"))
+            self.store.set_task(task_id, state=fsm.advance("task", "CONNECTING", "merged"),
+                                connect_intent_at=None, integration_base_sha=None)
             # §D12: 통합 generation 전진 + 겹치는 live read-궤도 stale 표시(write-orbit 해제
             # **전** — pathspec 이 아직 잡힐 때 글로브를 모은다).
             new_gen = self.store.bump_integration_gen()

@@ -15,7 +15,10 @@ from __future__ import annotations
 
 
 class Emitter:
-    """backend로 구조화 이벤트를 ship. backend=None이면 no-op(프로덕션 기본은 주입)."""
+    """backend로 구조화 이벤트를 ship. backend=None이면 no-op(프로덕션 기본은 주입).
+
+    관측 backend 오류는 항상 fail-soft 처리해 coordination 결과에 개입시키지 않는다.
+    """
 
     def __init__(self, backend=None, *, service: str = "omd"):
         self.backend = backend
@@ -28,7 +31,10 @@ class Emitter:
             "cid": cid, "correlation_id": cid, "cycle_id": cid,
             "service": self.service, "event": event, **attrs,
         }
-        self.backend.ship([env])
+        try:
+            self.backend.ship([env])
+        except Exception:  # noqa: BLE001 — observability must never block coordination
+            pass
 
 
 #: 주입 안 됐을 때의 무비용 기본값.

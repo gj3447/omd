@@ -59,6 +59,19 @@ requirements:
       symbol: _flag_set_latch
       must_emit: flag_set
 
+  - id: REQ-TASK-CONDITIONS
+    kind: feature
+    description: >
+      task 상태는 직교 condition으로 관측되며, 의존이 모두 충족된 task 는
+      task_conditions 이벤트에 deps_satisfied=true 를 내보낸다.
+    gate:
+      - {event: task_conditions, where: {deps_satisfied: true}, op: ">=", count: 1}
+    longinus:
+      kg_anchor: ref_site:omd:core:task_conditions
+      source: omd_server/core.py
+      symbol: task_conditions
+      must_emit: task_conditions
+
   - id: REQ-DEADLOCK-REJECT
     kind: feature
     description: >

@@ -1,5 +1,5 @@
 """hot_files 감지→행동 루프(P2 Q8). suggest_shared_for_writes = task 의 배타 write-set 중
-hot 파일만 골라 shared 후보로 — declare/begin 시 `shared=`로 바로 쓴다(직렬화 마찰 회복).
+hot 파일만 골라 shared *재분할 후보*로 돌린다. caller는 원래 writes를 서로소로 다시 나눠야 한다.
 필터링(내 신규 로직)은 unit 으로, 집계는 실물 git repo 로 검증."""
 import subprocess
 from pathlib import Path

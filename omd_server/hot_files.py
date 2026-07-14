@@ -70,9 +70,11 @@ def hot_file_audit(repo: str, since_ref: str | None = None, *,
 def suggest_shared_for_writes(repo: str, writes, since_ref: str | None = None, *,
                               threshold: int = 3, top_n: int = 30) -> list:
     """task 의 배타 write-set(writes globs) 중 *hot*(여러 커밋/저자가 동시수정) 파일만 골라 shared
-    레인 후보로 돌려준다 — 감지→행동 루프 닫기(P2). declare/begin 시 `shared=suggest_shared_for_writes
-    (repo, writes)` 로 넘기면 그 파일들이 배타(직렬화) 대신 shared(3-way merge)로 선언돼 병렬도를
-    회복한다. writes 와 안 겹치는 hot 파일은 이 task 와 무관하므로 제외(전역 나열이 아니라 타깃 추천)."""
+    레인 **재분할 후보**로 돌려준다 — 감지→행동 루프 닫기(P2). 반환값을 shared=에 넣을 때는
+    원래 writes에서도 그 경로를 덮는 glob을 더 작은 서로소 glob들로 분할해야 한다. 현재 glob
+    문법에는 ``parent/** EXCEPT parent/hot.py``가 없으므로 writes/shared 중첩 선언은 fail-loud
+    거부된다. writes와 안 겹치는 hot 파일은 이 task와 무관하므로 제외한다(전역 나열이 아니라
+    타깃 추천)."""
     report = hot_file_audit(repo, since_ref, threshold=threshold, top_n=top_n)
     return [h.path for h in report.hot if path_in_globs(h.path, writes)]
 

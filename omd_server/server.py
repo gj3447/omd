@@ -21,7 +21,7 @@ import asyncio
 import contextlib
 import os
 
-from .core import Coordinator
+from .core import Coordinator, CoordinatorConflict
 from .events import Emitter
 from .sinks import JsonlSink
 
@@ -64,23 +64,38 @@ except ImportError:  # 서버 extra 미설치
 
 
 async def _leader_heartbeat_loop(omd: Coordinator) -> None:
+    # stdio MCP servers deliberately share one SQLite DB without a process-wide
+    # leader lease. Such coordinators have no lease to refresh, so heartbeat is
+    # not merely unnecessary: coordinator_heartbeat() would fence itself out.
+    if not omd.enforce_single_coordinator:
+        return
     interval = max(1.0, omd.leader_ttl / 3.0)
     while True:
         await anyio.sleep(interval)
-        omd.coordinator_heartbeat()
+        try:
+            omd.coordinator_heartbeat()
+        except CoordinatorConflict:
+            # A takeover permanently fences this coordinator. Do not keep a
+            # noisy background task retrying a lease it can no longer own.
+            return
 
 
 def _coordinator_lifespan(omd: Coordinator):
     @lifespan
     async def coordinator_lifespan(server):
-        heartbeat_task = asyncio.create_task(_leader_heartbeat_loop(omd))
+        heartbeat_task = None
+        if omd.enforce_single_coordinator:
+            heartbeat_task = asyncio.create_task(_leader_heartbeat_loop(omd))
         try:
             yield {"omd": omd}
         finally:
-            heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat_task
-            omd.resign()
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                try:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await heartbeat_task
+                finally:
+                    omd.resign()
 
     return coordinator_lifespan
 
@@ -217,11 +232,13 @@ def build_server(db_path: str = "omd.db"):
     def begin(task: str, agent: str, writes: list[str], reads: list[str] | None = None,
               shared: list[str] | None = None, deps: list[str] | None = None,
               priority: int = 0, name: str = "", ttl: float = 600.0,
+              liveness_ttl: float | None = None,
               request_id: str | None = None, bail_epoch: int | None = None) -> dict:
         """원샷 onboarding(declare→deps게이트→claim→promote→start). "그냥 begin 하면 OMD 안에서
         격리" — 7-verb 앞단을 한 호출로. complete_task 의 start-side dual. fail-loud stage 전파."""
         return omd.begin(task, agent, writes, reads=reads, shared=shared, deps=deps,
                          priority=priority, name=name, ttl=ttl,
+                         liveness_ttl=liveness_ttl,
                          request_id=request_id, bail_epoch=bail_epoch)
 
     @mcp.tool()

@@ -2,7 +2,7 @@
   "name": "omd-longinus-bindings",
   "purpose": "OMD(입체운행물방울) 코드↔KG Longinus 바인딩. self-contained drift audit(omd_server/longinus.py). lakatos 의존 0.",
   "policy": "append-only SoT. sha256=def-line[:16]. line_hint=캐시(무드리프트). 매 커밋 tests/test_longinus_bindings.py 가드. 코드 심볼 추적(test 함수 아님).",
-  "commit_baseline": "78bd168",
+  "commit_baseline": "ff78f10",
   "kg_anchors": [
     "omd-concurrency-hardening-D1-D14-20260624",
     "omd-state-space-harness-20260626",
@@ -309,6 +309,66 @@
       "sha256": "9a0a313d1898d0ae",
       "layer": "measurement_judgment_loop",
       "frege_sinn": "touch-빈도(커밋수·저자수)로 hot 공유파일 식별 — shared 레인 필요근거 진단(P2, 실측 hot 30)"
+    },
+    {
+      "sourceId": "core.Coordinator.begin",
+      "file": "omd_server/core.py",
+      "symbol": "begin",
+      "kind": "method",
+      "line_hint": 1522,
+      "sha256": "bb7fc8ed6855d486",
+      "layer": "application",
+      "frege_sinn": "원샷 onboarding — write/shared batch preflight, max task-fence, 유계 liveness 선언과 renewable orbit descriptor(Q10)"
+    },
+    {
+      "sourceId": "core._check_task_write_fence",
+      "file": "omd_server/core.py",
+      "symbol": "_check_task_write_fence",
+      "kind": "method",
+      "line_hint": 593,
+      "sha256": "663a10aab599cb26",
+      "layer": "domain-policy",
+      "frege_sinn": "다중 write/shared lease의 외부 task fence=max(individual fences)로 finish/commit stale owner를 차단"
+    },
+    {
+      "sourceId": "gitio.GitRepo._merge_into_checked",
+      "file": "omd_server/gitio.py",
+      "symbol": "_merge_into_checked",
+      "kind": "method",
+      "line_hint": 239,
+      "sha256": "cc912d6573a241d3",
+      "layer": "infrastructure",
+      "frege_sinn": "후보 merge를 --no-commit으로 만들고 operator argv 검사를 통과한 green tree만 commit(Q11 의미합성 backstop)"
+    },
+    {
+      "sourceId": "gitio.GitRepo.abort_merge_verified",
+      "file": "omd_server/gitio.py",
+      "symbol": "abort_merge_verified",
+      "kind": "method",
+      "line_hint": 484,
+      "sha256": "d0a2bbb7e510605a",
+      "layer": "infrastructure",
+      "frege_sinn": "재기동 시 pre-merge HEAD/no MERGE_HEAD/clean tracked tree를 증명하는 fail-stop rollback seam"
+    },
+    {
+      "sourceId": "server._leader_heartbeat_loop",
+      "file": "omd_server/server.py",
+      "symbol": "_leader_heartbeat_loop",
+      "kind": "function",
+      "line_hint": 66,
+      "sha256": "975a5848ca1cf55b",
+      "layer": "infrastructure",
+      "frege_sinn": "leader lease enforced 서버만 ttl/3 heartbeat; 비-enforced stdio는 no-op, takeover fence-out이면 종결"
+    },
+    {
+      "sourceId": "events.Emitter.emit",
+      "file": "omd_server/events.py",
+      "symbol": "emit",
+      "kind": "method",
+      "line_hint": 27,
+      "sha256": "69b0520200a01695",
+      "layer": "infrastructure",
+      "frege_sinn": "단일 관측 sink 실패도 coordination을 막지 않는 fail-soft 이벤트 방출 seam"
     }
   ]
 }

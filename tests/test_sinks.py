@@ -63,3 +63,12 @@ def test_multisink_is_fail_soft_when_one_sink_raises():
     m = MultiSink([_Broken(), JsonlSink(p)])
     m.ship([{"event": "y"}])                          # 예외 전파 안 함 — 나머지 sink 는 산다
     assert _lines(p)[0]["event"] == "y"
+
+
+def test_emitter_is_fail_soft_with_a_single_broken_sink():
+    """MultiSink wrapper 없이 단일 sink 만 주입해도 운행 동사를 막지 않는다."""
+    class _Broken:
+        def ship(self, envs):
+            raise RuntimeError("sink down")
+
+    Emitter(_Broken()).emit("orbit_granted", "agA", fence=1)
