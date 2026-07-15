@@ -71,7 +71,7 @@ PENDING orbit → 그 경로를 HELD 중인 orbit 들로 엣지. 사이클 = 데
                         ▼                     ├── release ──► RELEASED
                      PENDING ──grant(충돌해소)─┘                │
                         │                     └── expire(TTL) ─► EXPIRED
-                  --no-wait │ or queue-timeout                  │
+       cancel_wait/--no-wait │ or queue-timeout                 │
                         ▼                          (RELEASED/EXPIRED 시
                      DENIED                         PENDING 큐 재평가)
 ```
@@ -82,13 +82,14 @@ PENDING orbit → 그 경로를 HELD 중인 orbit 들로 엣지. 사이클 = 데
 | `HELD` | 궤도 점유 중(활성 lease) |
 | `RELEASED` | 정상 반납 |
 | `EXPIRED` | TTL 만료 → 자동 회수 |
-| `DENIED` | `--no-wait`거나 큐 타임아웃 |
+| `DENIED` | `--no-wait`, 큐 타임아웃, 또는 semantic `CANCELLED`의 legacy projection |
 
 | 이벤트 | 전이 | Guard | Side-effect |
 |---|---|---|---|
 | `request` | new→HELD | **disjoint(pathspec, mode) vs 모든 HELD** | expires_at=now+ttl |
 | `request` | new→PENDING | 충돌 존재 & wait 허용 | wait-for 엣지 추가; **사이클이면 DENIED** |
 | `grant` | PENDING→HELD | 충돌 해소됨(선행 release/expire) | FIFO+우선순위로 승격 |
+| `cancel_wait` | PENDING→DENIED | owner + request generation + bail epoch 일치 | semantic CANCELLED 기록 + 큐 재평가 |
 | `renew` | HELD→HELD | 소유 agent 일치 | expires_at 갱신 |
 | `release` | HELD→RELEASED | 소유 agent 일치 | **PENDING 큐 재평가** |
 | `expire` | HELD→EXPIRED | now ≥ expires_at & renew 없음 | 회수 + 큐 재평가 + agent ZOMBIE 의심 |

@@ -59,13 +59,22 @@ def test_coordinator_lifespan_resigns_only_when_singleton_enforced():
         def __init__(self, enforced):
             self.enforce_single_coordinator = enforced
             self.resign_calls = 0
+            self.calls = []
 
         def coordinator_heartbeat(self):
             return {"ok": True}
 
         def resign(self):
+            self.calls.append("resign")
             self.resign_calls += 1
             return {"ok": True}
+
+        def start_sweep(self, interval):
+            self.calls.append(("start_sweep", interval))
+            return {"ok": True}
+
+        def close(self):
+            self.calls.append("close")
 
     async def enter_and_exit(omd):
         async with _coordinator_lifespan(omd)(None) as state:
@@ -74,10 +83,81 @@ def test_coordinator_lifespan_resigns_only_when_singleton_enforced():
     non_enforced = _Coordinator(False)
     anyio.run(enter_and_exit, non_enforced)
     assert non_enforced.resign_calls == 0
+    assert non_enforced.calls == ["close"]
 
     enforced = _Coordinator(True)
     anyio.run(enter_and_exit, enforced)
     assert enforced.resign_calls == 1
+    assert enforced.calls[-2:] == ["close", "resign"]
+
+    swept = _Coordinator(True)
+
+    async def enter_swept():
+        async with _coordinator_lifespan(swept, sweep_interval=0.25)(None):
+            assert swept.calls == [("start_sweep", 0.25)]
+
+    anyio.run(enter_swept)
+    assert swept.calls[-2:] == ["close", "resign"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 1.0),
+        ("", 1.0),
+        ("  ", 1.0),
+        ("0", None),
+        ("0.0", None),
+        ("0.25", 0.25),
+        ("5", 5.0),
+    ],
+)
+def test_server_sweep_interval_contract(raw, expected):
+    from omd_server.server import _parse_server_sweep_interval
+
+    assert _parse_server_sweep_interval(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "nan", "inf", "-inf", "not-a-number"])
+def test_invalid_server_sweep_interval_fails_before_db_creation(
+    tmp_path, monkeypatch, raw
+):
+    pytest.importorskip("fastmcp")
+    from omd_server.server import build_server
+
+    db = tmp_path / "invalid-sweep.db"
+    monkeypatch.setenv("OMD_SWEEP_INTERVAL", raw)
+    with pytest.raises(ValueError, match="OMD_SWEEP_INTERVAL"):
+        build_server(str(db))
+    assert not db.exists()
+
+
+def test_server_lifespan_sweep_delivers_idle_wait_deadline(tmp_path):
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server.core import Coordinator
+    from omd_server.server import _coordinator_lifespan
+
+    omd = Coordinator(
+        str(tmp_path / "idle-deadline.db"),
+        agent_ttl=None,
+        admission_wait_timeout=0.04,
+        enforce_single_coordinator=False,
+    )
+    omd.claim("holder", ["a/**"])
+    waiting = omd.claim("waiter", ["a/**"], request_id="idle-wait")
+
+    async def wait_for_timeout():
+        async with _coordinator_lifespan(omd, sweep_interval=0.01)(None):
+            with anyio.fail_after(2.0):
+                while omd.store.get_orbit(waiting["orbit_id"])["state"] == "PENDING":
+                    await anyio.sleep(0.01)
+
+    anyio.run(wait_for_timeout)
+    row = omd.store.get_orbit(waiting["orbit_id"])
+    assert row["state"] == "DENIED"
+    assert row["decision_type"] == "WAIT_TIMEOUT"
+    assert omd._sweep_thread is None
 
 
 def test_begin_tool_exposes_and_forwards_liveness_ttl(tmp_path, monkeypatch):
@@ -103,6 +183,53 @@ def test_begin_tool_exposes_and_forwards_liveness_ttl(tmp_path, monkeypatch):
 
     anyio.run(inspect_and_call)
     assert observed["liveness_ttl"] == 90.0
+
+
+def test_cancel_wait_tool_exposes_and_forwards_authority_tuple(tmp_path, monkeypatch):
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server.core import Coordinator
+    from omd_server.server import build_server
+
+    mcp = build_server(str(tmp_path / "cancel-wait.db"))
+    observed = {}
+
+    def fake_cancel_wait(self, orbit_id, agent_id, request_generation, **kwargs):
+        observed.update(
+            orbit_id=orbit_id,
+            agent_id=agent_id,
+            request_generation=request_generation,
+            **kwargs,
+        )
+        return {"ok": True, "state": "CANCELLED"}
+
+    monkeypatch.setattr(Coordinator, "cancel_wait", fake_cancel_wait)
+
+    async def inspect_and_call():
+        tool = next(t for t in await mcp.list_tools() if t.name == "cancel_wait")
+        assert {"orbit_id", "agent", "request_generation", "bail_epoch", "request_id"} <= set(
+            tool.parameters["properties"]
+        )
+        assert {"orbit_id", "agent", "request_generation", "bail_epoch"} <= set(
+            tool.parameters["required"]
+        )
+        result = tool.fn(
+            orbit_id="orb-1",
+            agent="worker",
+            request_generation=4,
+            bail_epoch=2,
+            request_id="cancel-op",
+        )
+        assert result == {"ok": True, "state": "CANCELLED"}
+
+    anyio.run(inspect_and_call)
+    assert observed == {
+        "orbit_id": "orb-1",
+        "agent_id": "worker",
+        "request_generation": 4,
+        "bail_epoch": 2,
+        "request_id": "cancel-op",
+    }
 
 
 def test_server_builds(tmp_path):
@@ -136,7 +263,7 @@ def test_server_stdio_initializes_and_lists_tools(tmp_path):
                 assert init.serverInfo.name == "omd"
                 tools = await session.list_tools()
                 names = {tool.name for tool in tools.tools}
-                assert {"claim", "release", "status"} <= names
+                assert {"claim", "release", "cancel_wait", "status"} <= names
 
     anyio.run(run_smoke)
 

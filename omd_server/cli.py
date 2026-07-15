@@ -25,6 +25,12 @@ def main(argv=None):
         if verb == "renew":
             s.add_argument("--ttl", type=float, default=600.0)
 
+    cw = sub.add_parser("cancel-wait")
+    cw.add_argument("orbit_id"); cw.add_argument("agent")
+    cw.add_argument("request_generation", type=int)
+    cw.add_argument("--bail-epoch", type=int, required=True)
+    cw.add_argument("--request-id")
+
     # §D12: rebase/재독 후 task 의 read-set 재앵커(유령 읽기 청산).
     rr = sub.add_parser("read-refresh")
     rr.add_argument("task"); rr.add_argument("agent"); rr.add_argument("fence", type=int)
@@ -121,6 +127,10 @@ def main(argv=None):
                                            request_id=rid(), bail_epoch=be()),
             "renew": lambda: omd.renew(a.orbit_id, a.agent, a.fence, a.ttl,
                                        request_id=rid(), bail_epoch=be()),
+            "cancel-wait": lambda: omd.cancel_wait(
+                a.orbit_id, a.agent, a.request_generation,
+                bail_epoch=a.bail_epoch, request_id=rid(),
+            ),
             "read-refresh": lambda: omd.read_refresh(a.task, a.agent, a.fence,
                                                      request_id=rid(), bail_epoch=be()),
             "bail": lambda: omd.bail(a.agent, request_id=rid()),

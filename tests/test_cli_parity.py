@@ -128,6 +128,12 @@ def test_begin_forwards_full_onboarding_contract(spy, capsys):
             ("cancel", ("T",), {"reason": "obsolete", "request_id": "req-x"}),
         ),
         (
+            ["cancel-wait", "orb-1", "worker", "4", "--bail-epoch", "2",
+             "--request-id", "req-cancel-wait"],
+            ("cancel_wait", ("orb-1", "worker", 4),
+             {"bail_epoch": 2, "request_id": "req-cancel-wait"}),
+        ),
+        (
             ["barrier-consume", "ready", "--agent", "worker", "--request-id", "req-b",
              "--bail-epoch", "6"],
             ("barrier_consume", ("ready", "worker"),

@@ -5,6 +5,8 @@ import os
 import tempfile
 import time
 
+import pytest
+
 from omd_server.core import Coordinator
 
 
@@ -15,6 +17,14 @@ def _db():
 def test_default_no_background_thread():
     omd = Coordinator(db_path=_db(), agent_ttl=None)
     assert omd._sweep_thread is None            # 기본 off — 하위호환(inline-only 유지)
+
+
+@pytest.mark.parametrize("value", [True, -1, float("nan"), float("inf"), "bad"])
+def test_invalid_embedded_sweep_interval_fails_before_db_creation(tmp_path, value):
+    db = tmp_path / "invalid.db"
+    with pytest.raises(ValueError, match="sweep_interval"):
+        Coordinator(db_path=str(db), agent_ttl=None, sweep_interval=value)
+    assert not db.exists()
 
 
 def test_close_idempotent_without_thread():
@@ -47,6 +57,21 @@ def test_close_stops_and_joins_thread():
     assert omd._sweep_thread is not None and omd._sweep_thread.is_alive()
     omd.close()
     assert omd._sweep_thread is None             # 정지 + join 완료
+
+
+def test_deferred_start_is_idempotent_and_restartable():
+    omd = Coordinator(db_path=_db(), agent_ttl=None)
+    started = omd.start_sweep(0.02)
+    assert started == {"ok": True, "enabled": True, "interval": 0.02}
+    assert omd.start_sweep(0.02)["already"] is True
+    with pytest.raises(RuntimeError, match="different interval"):
+        omd.start_sweep(0.03)
+    first = omd._sweep_thread
+    omd.close()
+    assert not first.is_alive()
+    omd.start_sweep(0.02)
+    assert omd._sweep_thread is not first and omd._sweep_thread.is_alive()
+    omd.close()
 
 
 def test_context_manager_closes_thread():

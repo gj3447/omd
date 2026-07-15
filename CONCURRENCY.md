@@ -791,7 +791,7 @@ FEEDBACK §P3 잔여("경보 이후가 비어있다") 응답. 선행문헌: Zuul
   `max(individual fences)`로 통일했다. `begin()`은 개별 `orbits[]`와 `bail_epoch`도 반환한다.
 - `begin(liveness_ttl=...)`은 orbit TTL 이하의 유계 silence window만 한 번 선언한다. 생략 시 기존
   crash-fast 유지. NaN/inf/0/음수는 거부하며, heartbeat는 일반 write-orbit를 암묵 갱신하지 않는다.
-- CLI에 `begin/task-conditions/complete-task/cancel/barrier-consume/shared/push/heartbeat --ttl`을
+- CLI에 `begin/task-conditions/complete-task/cancel/cancel-wait/barrier-consume/shared/push/heartbeat --ttl`을
   배선하고 매 호출 후 leader lease를 반납해 연속 CLI 실행의 TTL 정지를 제거했다.
 - 단일 broken event sink fail-soft, `REQ-TASK-CONDITIONS`, server leader heartbeat lifecycle도 닫힘.
 

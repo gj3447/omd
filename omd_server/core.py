@@ -98,6 +98,23 @@ def _process_effect_lock(key: str) -> threading.Lock:
         return _EFFECT_LOCKS.setdefault(key, threading.Lock())
 
 
+def _normalize_sweep_interval(value):
+    """Return a positive finite interval, or ``None`` for an explicit off value."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("sweep_interval must be a finite non-negative number")
+    try:
+        interval = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "sweep_interval must be a finite non-negative number"
+        ) from exc
+    if not math.isfinite(interval) or interval < 0:
+        raise ValueError("sweep_interval must be a finite non-negative number")
+    return interval or None
+
+
 class CoordinatorConflict(RuntimeError):
     """D14: 같은 DB 에 살아있는 다른 코디네이터(리더 lease 보유)가 있어 기동을 거부한다.
     in-process actor 직렬화는 프로세스당이라, 한 DB 에 코디네이터 둘 = writer 둘 = SINGULON
@@ -172,6 +189,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             raise ValueError("admission_wait_timeout must be finite and positive") from exc
         if not math.isfinite(admission_wait_timeout) or admission_wait_timeout <= 0:
             raise ValueError("admission_wait_timeout must be finite and positive")
+        sweep_interval = _normalize_sweep_interval(sweep_interval)
         # §D14: `:memory:` 디폴트 금지 — 재기동마다 모든 fence/leader_epoch 가 0 으로 리셋되어
         # 낡은 토큰/잔여 merge 와 충돌(고스트 writer). 영속 DB 필수. 단위테스트는 allow_memory_db=
         # True 로 명시 opt-in(프로세스 1개, 재기동 없음 — fence 리셋 위험 없음).
@@ -239,7 +257,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         self.agent_ttl = agent_ttl
         self.events = events or NOOP
         self._lock = threading.RLock()  # 프로세스내 단일 writer(actor 대용) — D1
-        # §D3/D4 주기적 백그라운드 sweep(opt-in). None/0=off(기본=inline-only, 하위호환). 켜면
+        # §D3/D4 주기적 백그라운드 sweep(opt-in). None/0=off(embedded 기본=inline-only). 켜면
         # 만료 lease/permit/좀비 회수가 동사 호출과 무관하게 진행 → 유휴 후 첫 호출 spike 해소.
         # 스레드 안전: 변이는 전부 _cs(RLock 직렬화) + store(check_same_thread=False, WAL).
         self._sweep_interval = sweep_interval
@@ -294,10 +312,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # §D9 멱등 캐시 GC TTL(초). 기본 1h — 어떤 현실적 MCP 재시도 윈도우보다 길어 replay 안전.
         # None=GC 안 함(기존동작). _sweep_inline 이 idem_ttl 지난 DONE 행 정리(무한누적 차단).
         self.idem_ttl = idem_ttl
-        # M1 admission payloads carry a concrete wait deadline.  Inline/periodic
-        # sweep and restart reconciliation deliver WAIT_TIMEOUT before promotion;
-        # periodic delivery remains opt-in so an idle default Coordinator does not
-        # by itself establish the complete bounded-wait contract.
+        # M1 admission payloads carry a concrete wait deadline. Inline/periodic
+        # sweep and restart reconciliation deliver WAIT_TIMEOUT before promotion.
+        # Embedded delivery is opt-in; the MCP server owns a default lifespan sweep.
         self.admission_wait_timeout = admission_wait_timeout
         # P5 strict-writeset: True 면 commit-time 에 write-set 위반 즉시 거부+soft-reset(빠른 fail-loud).
         # 기본 off(connect-time enforce 유지=하위호환). env OMD_STRICT_WRITESET 폴백(정확 truthy 파싱).
@@ -323,11 +340,37 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # 재기동 복구(§D8, 멱등) — git↔DB 조정 + dangling merge_token abort.
         self._recover()
         # 리더십·복구가 끝난 *뒤*에만 백그라운드 sweep 을 발사(변이 전 writer-둘 방지).
-        if self._sweep_interval and self._sweep_interval > 0:
-            self._sweep_thread = threading.Thread(
-                target=self._periodic_sweep_loop, args=(self._sweep_interval,),
-                name=f"omd-sweep-{self.coordinator_id}", daemon=True)
-            self._sweep_thread.start()
+        if self._sweep_interval is not None:
+            self.start_sweep()
+
+    def start_sweep(self, interval=None):
+        """Start periodic authority maintenance after startup and recovery.
+
+        Server surfaces may defer this call until lifespan entry, so tool listing
+        has no hidden writer and shutdown can join the sweep before leader handoff.
+        """
+        target = self._sweep_interval if interval is None else _normalize_sweep_interval(
+            interval
+        )
+        if target is None:
+            return {"ok": True, "enabled": False, "noop": True}
+        thread = self._sweep_thread
+        if thread is not None and thread.is_alive():
+            if self._sweep_interval != target:
+                raise RuntimeError(
+                    "periodic sweep is already running with a different interval"
+                )
+            return {"ok": True, "enabled": True, "already": True, "interval": target}
+        self._sweep_interval = target
+        self._sweep_stop.clear()
+        self._sweep_thread = threading.Thread(
+            target=self._periodic_sweep_loop,
+            args=(target,),
+            name=f"omd-sweep-{self.coordinator_id}",
+            daemon=True,
+        )
+        self._sweep_thread.start()
+        return {"ok": True, "enabled": True, "interval": target}
 
     def _periodic_sweep_loop(self, interval):
         """만료 lease/permit/좀비를 주기적으로 회수(§D3/D4). Event.wait 로 자므로 stop 즉시 반응
@@ -349,6 +392,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         th = self._sweep_thread
         if th is not None and th.is_alive():
             th.join(timeout=5.0)
+            if th.is_alive():
+                raise RuntimeError(
+                    "periodic sweep did not stop; refusing unsafe coordinator handoff"
+                )
         self._sweep_thread = None
 
     def __enter__(self):
@@ -2249,6 +2296,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                                           "request_id": request_dup["request_id"],
                                           "request_generation": request_dup[
                                               "request_generation"],
+                                          "bail_epoch": request_dup["bail_epoch"],
                                           "state": request_dup["state"],
                                           "fence": request_dup["fence"],
                                           "queue_seq": request_dup["queue_seq"],
@@ -2280,6 +2328,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                                state=dup["state"])
                     out = {"orbit_id": dup["orbit_id"], "request_id": dup["request_id"],
                            "request_generation": dup["request_generation"],
+                           "bail_epoch": dup["bail_epoch"],
                            "state": dup["state"], "fence": dup["fence"],
                            "queue_seq": dup["queue_seq"],
                            "conflicts": json.loads(dup["blocker_ids"] or "[]"),
@@ -2347,6 +2396,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                         return cache.set({"orbit_id": oid,
                                           "request_id": semantic_request_id,
                                           "request_generation": request_generation,
+                                          "bail_epoch": effective_bail_epoch,
                                           "state": "DENIED",
                                           "deadlock": True,
                                           "reason": "reservation_cycle",
@@ -2364,6 +2414,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     return cache.set({"orbit_id": oid,
                                       "request_id": semantic_request_id,
                                       "request_generation": request_generation,
+                                      "bail_epoch": effective_bail_epoch,
                                       "state": "PENDING", "queue_seq": queue_seq,
                                       "conflicts": list(decision.blocker_ids),
                                       "held_conflicts": list(decision.held_blockers),
@@ -2411,6 +2462,171 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                                   "queue_seq": queue_seq, "conflicts": [],
                                   "decision_id": payload["decision_id"],
                                   "bail_epoch": effective_bail_epoch})
+
+    def cancel_wait(self, orbit_id, agent_id, request_generation, *, bail_epoch,
+                    request_id=None):
+        """Cancel one authenticated PENDING admission request.
+
+        ``request_id`` identifies this cancellation operation.  The semantic
+        CANCEL payload remains bound to the original admission request id stored
+        on the orbit row.  Exact operation replay is therefore checked before
+        lifecycle and liveness validation, while every new operation must prove
+        the current owner, request generation, and bail epoch.
+        """
+        if not isinstance(orbit_id, str) or not orbit_id:
+            return {"ok": False, "state": "REJECTED", "reason": "invalid_orbit_id"}
+        if not isinstance(agent_id, str) or not agent_id:
+            return {"ok": False, "state": "REJECTED", "reason": "invalid_agent_id"}
+        if request_id is not None and (
+            not isinstance(request_id, str) or not request_id
+        ):
+            return {"ok": False, "state": "REJECTED", "reason": "invalid_request_id"}
+        if (
+            not isinstance(request_generation, int)
+            or isinstance(request_generation, bool)
+            or request_generation < 0
+        ):
+            return {
+                "ok": False,
+                "state": "REJECTED",
+                "reason": "invalid_request_generation",
+            }
+        if (
+            not isinstance(bail_epoch, int)
+            or isinstance(bail_epoch, bool)
+            or bail_epoch < 0
+        ):
+            return {"ok": False, "state": "REJECTED", "reason": "invalid_bail_epoch"}
+
+        def cancelled_response(row, *, noop=False):
+            response = {
+                "ok": True,
+                "orbit_id": row["orbit_id"],
+                "request_id": row["request_id"],
+                "cancel_request_id": request_id,
+                "request_generation": row["request_generation"],
+                "bail_epoch": row["bail_epoch"],
+                "state": "CANCELLED",
+                "legacy_state": "DENIED",
+                "terminal_reason": row["terminal_reason"] or "cancelled",
+            }
+            if noop:
+                response["noop"] = True
+            return response
+
+        with self._cs():
+            idem_args = [orbit_id, request_generation, bail_epoch]
+            with self._idem(
+                request_id, agent_id, "cancel_wait", idem_args
+            ) as cache:
+                if cache.hit:
+                    return cache.value
+                orbit = self.store.get_orbit(orbit_id)
+                if orbit is None:
+                    return cache.set({"ok": False, "reason": "no such orbit"})
+                if orbit.get("kind") != "orbit":
+                    return cache.set({
+                        "ok": False,
+                        "reason": "resource is not a cancellable orbit",
+                        "orbit_id": orbit_id,
+                    })
+                if orbit["agent_id"] != agent_id:
+                    return cache.set({
+                        "ok": False,
+                        "reason": "not owner",
+                        "owner": orbit["agent_id"],
+                    })
+                if int(orbit["request_generation"] or 0) != request_generation:
+                    return cache.set({
+                        "ok": False,
+                        "reason": "stale request_generation",
+                        "fenced_out": True,
+                        "current": int(orbit["request_generation"] or 0),
+                        "yours": request_generation,
+                    })
+                if int(orbit["bail_epoch"] or 0) != bail_epoch:
+                    return cache.set({
+                        "ok": False,
+                        "reason": "stale bail_epoch",
+                        "fenced_out": True,
+                        "current": int(orbit["bail_epoch"] or 0),
+                        "yours": bail_epoch,
+                    })
+                agent = self.store.get_agent(agent_id)
+                if agent is None:
+                    return cache.set({
+                        "ok": False,
+                        "reason": "agent not registered",
+                        "fenced_out": True,
+                    })
+                dead = self._check_alive(agent_id, bail_epoch)
+                if dead:
+                    return cache.set(dead)
+                # F2: an authenticated mutating request is itself liveness
+                # evidence. Refresh before reconciliation so this live caller is
+                # not reclaimed in the same transaction for an old heartbeat.
+                self.store.upsert_agent(agent_id)
+                if orbit["state"] == "DENIED" and orbit["decision_type"] == "CANCEL":
+                    return cache.set(cancelled_response(orbit, noop=True))
+                if orbit["state"] != "PENDING":
+                    return cache.set({
+                        "ok": False,
+                        "reason": f"not PENDING: {orbit['state']}",
+                        "state": orbit["state"],
+                    })
+
+                snapshot_hash = authority_snapshot_hash(
+                    self.store.held_orbits(),
+                    self.store.pending_orbits(),
+                    coordinator_epoch=self.leader_epoch,
+                )
+                identity = self._admission_identity(orbit)
+                payload = {
+                    "repository_id": identity["repository_id"],
+                    "request_id": identity["request_id"],
+                    "orbit_id": identity["orbit_id"],
+                    "request_generation": identity["request_generation"],
+                    "actor": self.coordinator_id,
+                    "owner_agent": identity["owner_agent"],
+                    "bail_epoch": identity["bail_epoch"],
+                    "authority_snapshot_hash": snapshot_hash,
+                    "event_id": f"evt-{uuid.uuid4().hex}",
+                }
+                reduced = self._assert_admission_projection(
+                    {**identity, "state": "PENDING"},
+                    "CANCEL",
+                    payload,
+                    snapshot_hash,
+                    "DENIED",
+                )
+                if reduced.context["state"] != "CANCELLED":
+                    raise RuntimeError(
+                        "admission cancellation did not reach semantic CANCELLED"
+                    )
+                now = time.time()
+                self.store.set_orbit(
+                    orbit_id,
+                    state=fsm.advance("orbit", "PENDING", "deny"),
+                    released_at=now,
+                    authority_snapshot_hash=snapshot_hash,
+                    decision_id=None,
+                    decision_type="CANCEL",
+                    blocker_ids=[],
+                    terminal_reason="cancelled",
+                )
+                self._emit(
+                    "orbit_cancelled",
+                    agent_id,
+                    orbit_id=orbit_id,
+                    request_id=identity["request_id"],
+                    request_generation=request_generation,
+                    cancel_request_id=request_id,
+                    queue_seq=orbit["queue_seq"],
+                )
+                self._reconcile_admission()
+                cancelled = dict(orbit)
+                cancelled["terminal_reason"] = "cancelled"
+                return cache.set(cancelled_response(cancelled))
 
     def renew(self, orbit_id, agent_id, fence, ttl=600.0, *, request_id=None,
               bail_epoch=None):

@@ -5,9 +5,12 @@ The runtime now enforces conflicting PENDING predecessor order with durable
 queue tickets, shared initial/promotion decisions, reservation-cycle safety,
 original-TTL promotion, exact request replay conflict checks and typed semantic
 decision projection. Finite deadlines and sweep/restart timeout delivery are
-implemented. Task cancellation atomically terminalizes associated PENDING/HELD
-admission rows and repairs legacy orphans on restart. Default autonomous
-delivery, a standalone admission-wait cancel API, overload/aging, candidate
+implemented. Standalone wait cancellation authenticates the PENDING owner,
+request generation and bail epoch, then atomically projects semantic CANCELLED
+to legacy DENIED and reconciles promotion. Task cancellation terminalizes
+associated PENDING/HELD admission rows and repairs legacy orphans on restart.
+The MCP server delivers deadlines with a default 1-second lifespan-owned sweep;
+embedded coordinators remain opt-in. Overload/aging, candidate
 indexing, notification outbox and the prepared Connect pipeline remain
 implementation fronts. Do not describe this branch as the complete
 durable waiter, an optimized scheduler, a production rollout or a scientific
@@ -370,8 +373,8 @@ The materialized M1 receipt is `arrived` evidence from one in-memory
 producer/readback backend. It explicitly records no separate oracle and awaits
 independent judgment; it is not promoted to `external_verdict`.
 
-Still open before full M1: default autonomous wait-deadline delivery, standalone
-PENDING cancellation, capacity/overload, saturating aging, notification outbox,
+Still open before full M1: embedded-runtime autonomous wait-deadline delivery,
+capacity/overload, saturating aging, notification outbox,
 candidate-index soundness, explicit non-denial request-generation rollover,
 semantic binding for the remaining maintenance events, independent judgment
 and finalization. The current exact full scan is sound but is not an implemented
@@ -594,11 +597,11 @@ SHA-256 is
   decision projection; Connect payload guards remain abstract.
 - A repository-wide cross-contract validator and full Connect
   model-to-production differential replay remain promotion blockers.
-- Admission decisions, including due `WAIT_TIMEOUT`, are bound to current
-  runtime code. Default autonomous deadline delivery, cancellation, overload,
-  aging, outbox and the remaining maintenance-event semantic bindings remain
-  open; task-bound `CANCEL`/`RELEASE` projection is implemented, but a standalone
-  wait-cancel API is not. The prepared Connect pipeline is still contract-only.
+- Admission decisions, including due `WAIT_TIMEOUT` and standalone wait
+  `CANCEL`, are bound to current runtime code. MCP deadline delivery is default-on;
+  embedded-runtime delivery, overload, aging, outbox and the remaining maintenance-event semantic
+  bindings remain open; task-bound `CANCEL`/`RELEASE` projection is also
+  implemented. The prepared Connect pipeline is still contract-only.
 - M0's measured numbers and LakatoTree `partial` verdict describe reproducible
   evidence machinery only. They do not establish a fairness fix, throughput
   improvement, near-linear scaling, optimality or novel discovery.

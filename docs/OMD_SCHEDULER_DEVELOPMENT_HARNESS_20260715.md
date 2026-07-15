@@ -448,17 +448,23 @@ independent scientific judgment.
 
 This does **not** close evidence item 6. New PENDING rows persist a finite,
 typed `wait_deadline`, and sweep/restart reconciliation delivers the semantic
-timeout transition. The default Coordinator is still inline-only unless
-periodic sweep is explicitly enabled, and cancellation plus overload remain
-absent as standalone admission operations, so autonomous bounded resolution is
-not yet established. Task cancellation does terminalize its own PENDING/HELD
-rows. Item 9 has no
+timeout transition. A standalone `cancel_wait` operation now authenticates the
+PENDING owner, request generation and bail epoch, projects semantic `CANCELLED`
+to legacy `DENIED`, and reconciles eligible promotion once. Embedded
+`Coordinator` instances remain inline-only unless periodic sweep is explicitly
+enabled. The MCP server starts a 1-second sweep by default inside its lifespan
+(`OMD_SWEEP_INTERVAL=0` is the explicit opt-out), stops and joins it before
+leader handoff, and therefore delivers idle wait deadlines without a foreground
+verb. Capacity/overload is still absent, so the complete bounded admission
+contract is not yet established. Task cancellation also terminalizes its own
+PENDING/HELD rows.
+Item 9 has no
 candidate index to prove yet (the runtime uses the sound full exact scan).
 Policy-denial generation rollover is implemented; explicit non-denial rollover
-and public maintenance events `RENEW`, `RELEASE`, standalone wait cancellation
-and reclaim are not yet routed through the semantic reducer. The task-bound
-cancel path is the narrow exception: it projects `CANCEL`/`RELEASE` before
-legacy mutation. The attempt fencing above hardens the existing Connect
+and public maintenance events `RENEW`, `RELEASE` and reclaim are not yet routed
+through the semantic reducer. Standalone wait cancellation and the task-bound
+cancel path are the narrow exceptions: they project `CANCEL` (and task-bound
+`RELEASE`) before legacy mutation. The attempt fencing above hardens the existing Connect
 implementation; it does not implement the prepared
 `ConnectAttempt`/expected-old protected-ref publication pipeline.
 
@@ -613,12 +619,12 @@ slice is ready to commit only when:
   write-set;
 - the branch is committed and published intentionally, then the OMD edit orbit
   is released and the lease-only coordination task row is canceled/read back as
-  harness cleanup. This is not a standalone PENDING admission-cancel API,
-  although task cancellation now terminalizes admission rows bound to that task.
+  harness cleanup. Admission wait cancellation is a separate `cancel_wait`
+  capability bound to the PENDING row's owner, generation and bail epoch.
 
 Landing those files makes the **M1 fairness implementation slice** durable. It
-does not make full M1 or the development cycle `CLOSED`: default autonomous
-deadline delivery, standalone cancellation/overload/aging, candidate-index soundness,
+does not make full M1 or the development cycle `CLOSED`: embedded-runtime
+autonomous delivery, overload/aging, candidate-index soundness,
 maintenance-event reducer binding, an independent scripted progress judgment
 and finalization receipts remain future work.
 
@@ -634,11 +640,12 @@ and finalization receipts remain future work.
 3. No repository cross-contract validator currently proves engine, admission
    FSM, connect FSM, both loop projections and production reducer conformance.
    Individual schema validators are necessary but insufficient.
-4. Production admission/grant/queue/promotion/denial and due-timeout decisions
-   are bound to the JSON semantic reducer. Default autonomous timeout delivery,
-   standalone wait cancellation, overload, aging, notification outbox and the
+4. Production admission/grant/queue/promotion/denial, due-timeout and standalone
+   wait-cancellation decisions are bound to the JSON semantic reducer. MCP
+   timeout delivery is autonomous by default; embedded-runtime delivery,
+   overload, aging, notification outbox and the
    remaining maintenance-event bindings remain the open M1 front. Task-bound
-   `CANCEL`/`RELEASE` projection is implemented.
+   `CANCEL`/`RELEASE` projection is also implemented.
 5. The prepared candidate, expected-old ref CAS, independent ref reader and
    finalization protocol are contracts, not the current runtime path.
 6. The connect loop is a conservative `loop-contract/v1` runner aggregate over
