@@ -35,6 +35,8 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
 
 from . import bypass_audit, fsm, task_state
 from .disjoint import path_in_globs, sets_overlap
@@ -74,6 +76,41 @@ class CoordinatorConflict(RuntimeError):
     무효. 단일 인스턴스 전용을 *명시적으로 강제*(§D14)."""
 
 
+class WritesetVerdict(Enum):
+    """GAP-2: write-set 파일시스템 감사(§D10/P0-11)의 typed 판정.
+
+    이전엔 감사가 `list[str]`(위반 경로)만 돌려주고 `[]` 로 (a) *깨끗함* 과 (b) *감사 불가*
+    (git diff 실패/브랜치 부재)를 **같이** 표현해 조용히 PASS 하는 soundness 구멍이 있었다.
+    이제 4-way 로 분리한다 — 감사 불가(bound repo)는 fail-CLOSED 로 connect/merge 를 막는다."""
+    CLEAN = "clean"                     # 감사 실행됨 — 궤도 밖 경로 0 (통과)
+    VIOLATION = "violation"             # 감사 실행됨 — 궤도 밖 경로 발견 (분열 위험 → 차단)
+    AUDIT_ERROR = "audit_error"         # repo 바인딩됐으나 감사 불가(git diff 실패/브랜치 부재)
+    #                                     → **fail-CLOSED**: 검증 못 한 것을 통과시키지 않는다.
+    SKIPPED_NO_REPO = "skipped_no_repo"  # repo 미바인딩(DB-only 응결/드라이런) — 실 merge 없음 →
+    #                                      감사 대상 자체가 없음(git write-set 부재) → 비차단.
+
+
+@dataclass(frozen=True)
+class WritesetAudit:
+    """write-set 감사 결과. `blocks` 가 True 면 connect/merge 를 거부해야 한다(fail-closed)."""
+    verdict: WritesetVerdict
+    offending: tuple[str, ...] = ()
+    error: str | None = None
+
+    @property
+    def blocks(self) -> bool:
+        """merge 를 막아야 하는가 — 실제 위반(VIOLATION) *또는* 감사 불가(AUDIT_ERROR).
+        SKIPPED_NO_REPO(실 merge 없음)/CLEAN 만 통과."""
+        return self.verdict in (WritesetVerdict.VIOLATION, WritesetVerdict.AUDIT_ERROR)
+
+    @property
+    def reason(self) -> str:
+        """차단(blocks) 시 connect 거부 응답의 reason 문자열. VIOLATION→기존 'writeset_violation'
+        (하위호환), AUDIT_ERROR→'writeset_audit_error'(fail-closed 신설)."""
+        return ("writeset_violation" if self.verdict is WritesetVerdict.VIOLATION
+                else "writeset_audit_error")
+
+
 class _IdemSlot:
     """멱등 래퍼의 슬롯. hit=캐시 적중(본문 skip), value=동사 본문이 set한 응답."""
     __slots__ = ("hit", "value")
@@ -97,6 +134,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                  enforce_single_coordinator: bool = True,
                  auto_push: str | None = None,
                  idem_ttl: float | None = 3600.0,
+                 max_reclaims: int = 3,
                  strict_writeset: bool = False,
                  sweep_interval: float | None = None,
                  integration_check=None,
@@ -146,6 +184,11 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # heartbeat 만료 시 좀비 회수. 기본 ON(P0-7) — None=비활성. 끄면 죽은 물방울의
         # 궤도/작업이 영구 고아가 된다(사용자 핵심 우려). 권장 90s, renew는 TTL/3 주기.
         self.agent_ttl = agent_ttl
+        # GAP-1: per-task 좀비회수/bail 재큐 상한. reclaims 카운터가 이 값을 **초과**하면
+        # abort→requeue(PENDING) 대신 abort→poison(POISONED, 영구 terminal)로 종결한다 —
+        # flapping/poison 태스크가 무한 재순환하며 슬롯을 잠식하는 것을 막는 유계 stop.
+        # 기본 3(작게). <=0 이면 첫 회수에서 즉시 POISON(회수=1회도 불허).
+        self.max_reclaims = int(max_reclaims)
         self.events = events or NOOP
         self._lock = threading.RLock()  # 프로세스내 단일 writer(actor 대용) — D1
         # §D3/D4 주기적 백그라운드 sweep(opt-in). None/0=off(기본=inline-only, 하위호환). 켜면
@@ -557,14 +600,29 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # 이 agent 의 write-orbit 이 위에서 이미 해제됐으므로(lease 사망), 그 task 가 requeue
         # 되든(IN_ORBIT 등) 안 되든(이미 DONE) 배리어 입장에선 참가자 사망이다 → break/shrink.
         affected_barriers = set()
+        poisoned = []
         for t in self.store.tasks_for_agent(agent_id):
             for b in self.store.barriers_with_task(t["task_id"]):
                 affected_barriers.add(b["barrier_id"])
             if t["state"] in ("CLAIMED", "IN_ORBIT", "CONNECTING"):  # CONNECTING 포함(P0-9)
+                # GAP-1: per-task reclaim 카운터를 단조 증가. 상한 초과면 requeue 대신 POISONED
+                # (영구 terminal) — flapping/poison 태스크가 무한 abort→requeue 로 순환하지 못하게.
+                n_reclaims = (t["reclaims"] or 0) + 1
                 s = fsm.advance("task", t["state"], "abort")
-                s = fsm.advance("task", s, "requeue")  # ABORTED→PENDING
-                self.store.set_task(t["task_id"], state=s, agent_id=None)
-                requeued.append(t["task_id"])
+                if n_reclaims > self.max_reclaims:
+                    s = fsm.advance("task", s, "poison")   # ABORTED→POISONED (sweep/next 재큐 안 함)
+                    self.store.set_task(t["task_id"], state=s, agent_id=None,
+                                        reclaims=n_reclaims)
+                    poisoned.append(t["task_id"])
+                    # 감사 레코드: 왜(reason)·몇 회(reclaims)·상한(limit) durable emit.
+                    self._emit("task_poisoned", agent_id, task=t["task_id"],
+                               reason="max_reclaims", reclaims=n_reclaims,
+                               limit=self.max_reclaims, voluntary=voluntary)
+                else:
+                    s = fsm.advance("task", s, "requeue")  # ABORTED→PENDING
+                    self.store.set_task(t["task_id"], state=s, agent_id=None,
+                                        reclaims=n_reclaims)
+                    requeued.append(t["task_id"])
                 if self.git and t["worktree"]:
                     self.git.remove_worktree(t["worktree"])
                     if t["branch"]:
@@ -575,11 +633,12 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             self._barrier_eval(bid)
         self.store.set_agent_state(agent_id, "RETIRED")
         self._emit("agent_reclaimed", agent_id, voluntary=voluntary,
-                   orbits=len(freed), tasks=len(requeued))
+                   orbits=len(freed), tasks=len(requeued), poisoned=len(poisoned))
         for sem_id in reclaimed_sems:
             self._promote_sem_waiters(sem_id)  # 복구된 슬롯을 줄선 순서로 부여(§D7)
         self._promote_pending()
-        return {"agent": agent_id, "voluntary": voluntary, "orbits": freed, "tasks": requeued}
+        return {"agent": agent_id, "voluntary": voluntary, "orbits": freed,
+                "tasks": requeued, "poisoned": poisoned}
 
     def _check_owner(self, o, agent_id, fence):
         """소유+fence 가드(D6). 통과면 None, 아니면 거부 dict. 오추방된 좀비/타 agent 차단."""
@@ -820,19 +879,34 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 globs.append(g)
         return globs
 
-    def _writeset_audit(self, task_id, branch, write_globs) -> list[str]:
+    def _writeset_audit(self, task_id, branch, write_globs) -> WritesetAudit:
         """branch가 통합 base 대비 건드린 파일 중 **claimed write-set 밖** 경로들(있으면 위반).
         §D10 option 2(저비용 pre-connect 감사): `git diff --name-only base...branch`의 모든
         경로가 claimed write-globs 에 정확히 덮여야 한다. 안 덮인 경로 = 분열 위험 = 거부 대상.
-        repo 미바인딩이거나 branch 없으면 감사 불가 → 빈 리스트(감사 skip, 보수적으로 통과)."""
-        if not self.git or not branch:
-            return []
+
+        GAP-2 (fail-CLOSED): 이전엔 `not self.git or not branch` 나 GitError 를 전부 `[]`(=PASS)
+        로 삼켜, repo 바인딩 상태에서 diff 가 실패하면 감사가 조용히 통과했다(soundness 구멍).
+        이제 typed WritesetAudit 로 분리한다:
+          - repo 미바인딩 → SKIPPED_NO_REPO(실 git merge 없음 = DB-only 응결; 감사 대상 없음 → 비차단).
+          - repo 바인딩됐는데 branch 부재/ git diff 실패 → AUDIT_ERROR(**차단**: 검증 못 한 write-set
+            을 통과시키지 않는다). 서버는 죽지 않고 typed verdict 로 connect/merge 를 거부한다."""
+        if not self.git:
+            # DB-only 응결(테스트/드라이런) — Phase B 가 실제 merge 를 안 한다(_connect_phase_b).
+            # 통합 브랜치에 아무것도 안 들어가므로 감사 대상 자체가 없음 → 비차단(idiom 예외).
+            return WritesetAudit(WritesetVerdict.SKIPPED_NO_REPO)
+        if not branch:
+            # repo 는 있는데 감사할 브랜치가 없다 = 실제 write-set 을 확인할 수 없음 → fail-closed.
+            return WritesetAudit(WritesetVerdict.AUDIT_ERROR, error="no branch to audit")
         try:
             changed = self.git.changed_paths(branch, self.integration_branch)
-        except GitError:
-            return []   # diff 실패(브랜치 없음 등) — 다른 게이트가 처리. 감사 위반은 아님.
+        except (GitError, GitTimeout) as e:
+            # diff 자체가 실패 = write-set 을 관측 불가 → **조용히 PASS 금지**, fail-closed 로 차단.
+            return WritesetAudit(WritesetVerdict.AUDIT_ERROR, error=f"git diff failed: {e}")
         # path_in_globs = 정확매칭(soundness: 덮인다를 절대 거짓-양성으로 안 냄). 안 덮이면 위반.
-        return [p for p in changed if not path_in_globs(p, write_globs)]
+        offending = tuple(p for p in changed if not path_in_globs(p, write_globs))
+        if offending:
+            return WritesetAudit(WritesetVerdict.VIOLATION, offending=offending)
+        return WritesetAudit(WritesetVerdict.CLEAN)
 
     def _release_task_write_orbits(self, task_id):
         """task의 HELD write-orbit 전부 해제 + unpin(merge_sha 기록 *후* 호출 — P0-6 순서)."""
@@ -1374,13 +1448,19 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 # ---- advisory(기본) 경로 — 기존 동작 불변(commit 후 자문 감사, connect가 권위 거부) ----
                 sha = self.git.commit_all(t["worktree"], msg)
                 self._emit("task_committed", t["agent_id"], task=task_id, sha=sha)
-                offending = self._writeset_audit(task_id, t["branch"], write_globs)
+                audit = self._writeset_audit(task_id, t["branch"], write_globs)
                 res = {"ok": True, "sha": sha}
-                if offending:
+                if audit.verdict is WritesetVerdict.VIOLATION:
                     # 자문 경고 — connect에서 거부될 것임. 물방울은 지금 바로잡아야 한다.
+                    offending = list(audit.offending)
                     self._emit("commit_writeset_warning", task_id, offending=offending)
                     res["writeset_violation"] = True
                     res["offending"] = offending
+                elif audit.verdict is WritesetVerdict.AUDIT_ERROR:
+                    # commit 은 advisory 지점(권위 강제는 connect)이라 커밋을 되돌리지 않지만,
+                    # 감사 불가는 조용히 삼키지 않고 라우드 표기 — connect 가 fail-closed 거부할 것.
+                    self._emit("commit_writeset_audit_error", task_id, error=audit.error)
+                    res["writeset_audit_error"] = audit.error
                 return cache.set(res)
 
     def finish(self, task_id, agent_id=None, fence=None, *, request_id=None,
@@ -1702,12 +1782,18 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             # **밖**의 파일을 건드렸으면 거부(merge 안 함, 토큰 안 잡음, 상태 불변). 이것으로
             # SINGULON 토대 (c)가 성립: 선언상 서로소 write-set이 *실제* write-set이 된다.
             write_globs = self._claimed_write_globs(task_id, writes)
-            offending = self._writeset_audit(task_id, t["branch"], write_globs)
-            if offending:
-                self._emit("connect_rejected", task_id, reason="writeset_violation",
-                           offending=offending)
-                return {"ok": False, "reason": "writeset_violation", "offending": offending,
-                        "claimed": write_globs, "task_id": task_id}
+            audit = self._writeset_audit(task_id, t["branch"], write_globs)
+            if audit.blocks:
+                # GAP-2: VIOLATION(궤도 밖 경로) *또는* AUDIT_ERROR(감사 불가) 둘 다 fail-closed 거부.
+                # 감사를 못 돌렸다는 이유로 통과시키지 않는다 — merge 안 함, 토큰 안 잡음, 상태 불변.
+                offending = list(audit.offending)
+                self._emit("connect_rejected", task_id, reason=audit.reason,
+                           offending=offending, audit_error=audit.error)
+                out = {"ok": False, "reason": audit.reason, "offending": offending,
+                       "claimed": write_globs, "task_id": task_id}
+                if audit.error is not None:
+                    out["audit_error"] = audit.error
+                return out
             # §D12 read-set 코히런스 — 유령 읽기 차단. consumer 가 자기 read-set 을 동기화한
             # gen(read_synced_gen) *이후* 통합에 들어온 응결 중 자기 선언 reads 와 겹치는 게
             # 있으면 = 옛 base 위에 *조용히* 빌드(머지는 성공하되 로직이 틀림) → connect 거부.

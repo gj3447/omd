@@ -20,7 +20,7 @@ ORBIT_TRANSITIONS = [
 
 TASK_STATES = [
     "PENDING", "BLOCKED", "READY", "CLAIMED", "IN_ORBIT",
-    "DONE", "CONNECTING", "MERGED", "ABORTED",
+    "DONE", "CONNECTING", "MERGED", "ABORTED", "POISONED",
 ]
 TASK_TRANSITIONS = [
     {"trigger": "block", "source": "PENDING", "dest": "BLOCKED"},
@@ -35,6 +35,10 @@ TASK_TRANSITIONS = [
     {"trigger": "rollback", "source": "CONNECTING", "dest": "DONE"},
     {"trigger": "abort", "source": "*", "dest": "ABORTED"},
     {"trigger": "requeue", "source": "ABORTED", "dest": "PENDING"},
+    # GAP-1: 좀비회수/bail 이 무한 abort→requeue 로 flapping/poison 태스크를 영구 재순환시키는
+    # 것을 막는 **영구 terminal**. per-task reclaims 카운터가 max_reclaims 를 초과하면 requeue
+    # 대신 POISONED 로 종결한다 — sweep/next 가 절대 다시 집지 않는 typed 종단(무한루프 0).
+    {"trigger": "poison", "source": "ABORTED", "dest": "POISONED"},
 ]
 
 

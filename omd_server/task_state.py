@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 
 WRITE_MODES = ("write", "shared")
-TERMINAL = ("MERGED", "ABORTED")   # 관측 rollup 이 뒤엎지 않는 종료 상태(passthrough)
+TERMINAL = ("MERGED", "ABORTED", "POISONED")   # 관측 rollup 이 뒤엎지 않는 종료 상태(passthrough)
 
 
 def _deps(task) -> list:

@@ -19,11 +19,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 
 from .core import Coordinator, CoordinatorConflict
 from .events import Emitter
 from .sinks import JsonlSink
+
+_log = logging.getLogger(__name__)
+
+# GAP-3: 리더 heartbeat 루프의 유계 연속-실패 상한. 일시적 오류(DB busy/디스크 히컵)가 리더
+# liveness 를 *조용히* 죽이지 못하게 로그+백오프 후 재시도하되, 연속 실패가 이 값을 넘으면
+# (리스가 사실상 갱신 불가) typed 로 탈출한다 — 무한 에러 루프 금지(sweep 데몬 가드 미러).
+_HEARTBEAT_MAX_CONSECUTIVE_FAILURES = 5
 
 # 첫 접점(MCP `initialize`)에서 클라이언트/에이전트에 그대로 노출되는 자기소개.
 # 비어 있으면 에이전트가 OMD 를 'object-model/스키마/계약 정의물'로 오독한다
@@ -63,21 +71,47 @@ except ImportError:  # 서버 extra 미설치
     FastMCP = None
 
 
-async def _leader_heartbeat_loop(omd: Coordinator) -> None:
+async def _leader_heartbeat_loop(
+    omd: Coordinator,
+    *,
+    max_consecutive_failures: int = _HEARTBEAT_MAX_CONSECUTIVE_FAILURES,
+) -> None:
     # stdio MCP servers deliberately share one SQLite DB without a process-wide
     # leader lease. Such coordinators have no lease to refresh, so heartbeat is
     # not merely unnecessary: coordinator_heartbeat() would fence itself out.
     if not omd.enforce_single_coordinator:
         return
     interval = max(1.0, omd.leader_ttl / 3.0)
+    # GAP-3: sweep 데몬(_periodic_sweep_loop)처럼 per-iteration try/except 로 루프 생존을
+    # 최우선한다. 이전엔 CoordinatorConflict 만 잡아, 다른 어떤 예외 하나가
+    # coordinator_heartbeat() 에서 튀면 background task 가 조용히 죽어 리더 liveness 가
+    # 소멸했다(다른 코디네이터가 takeover 못 함 = 좀비 고착).
+    consecutive_failures = 0
     while True:
         await anyio.sleep(interval)
         try:
             omd.coordinator_heartbeat()
+            consecutive_failures = 0   # 성공 = 연속-실패 카운터 리셋
         except CoordinatorConflict:
             # A takeover permanently fences this coordinator. Do not keep a
             # noisy background task retrying a lease it can no longer own.
             return
+        except Exception as exc:  # noqa: BLE001 — 루프 생존 우선(silent kill 금지, 로그+백오프)
+            consecutive_failures += 1
+            _log.warning(
+                "leader heartbeat failed (%d/%d consecutive): %r",
+                consecutive_failures, max_consecutive_failures, exc,
+            )
+            if consecutive_failures >= max_consecutive_failures:
+                # 유계 escalate: 연속 실패가 상한을 넘으면(리스 사실상 갱신 불가) typed 로 탈출.
+                # 무한 에러 루프 금지 — resign()/새 리더 takeover 가 뒤를 잇게 둔다.
+                _log.error(
+                    "leader heartbeat exiting after %d consecutive failures; "
+                    "coordinator liveness abandoned", consecutive_failures,
+                )
+                return
+            # 백오프 후 재시도(연속 실패에 비례, interval 상한). transient 오류에 유계 재시도.
+            await anyio.sleep(min(interval, 0.5 * consecutive_failures))
 
 
 def _coordinator_lifespan(omd: Coordinator):

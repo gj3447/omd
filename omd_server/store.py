@@ -171,6 +171,9 @@ _MIGRATIONS = [
     # P2 shared 레인: hot 공유파일 glob 선언(배타 writes 와 분리 — next_task 가 shared HELD
     # 와의 겹침은 허용, connect 응결은 3-way).
     ("tasks", "shared", "TEXT NOT NULL DEFAULT '[]'"),
+    # GAP-1: per-task 좀비회수/bail 재큐 카운터. _reclaim_agent_inline 이 abort→requeue 마다
+    # 단조 증가시키고, max_reclaims 초과 시 POISONED(영구 terminal)로 종결(무한 flapping 차단).
+    ("tasks", "reclaims", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -398,7 +401,7 @@ class Store:
     def set_task(self, task_id, *, state=..., agent_id=..., worktree=..., branch=...,
                  connect_fence=..., connect_intent_at=..., branch_tip_sha=...,
                  integration_base_sha=..., merge_sha=..., merged_at=...,
-                 read_synced_gen=...):
+                 read_synced_gen=..., reclaims=...):
         sets, args = [], []
         for col, val in (("state", state), ("agent_id", agent_id),
                          ("worktree", worktree), ("branch", branch),
@@ -407,7 +410,8 @@ class Store:
                          ("branch_tip_sha", branch_tip_sha),
                          ("integration_base_sha", integration_base_sha),
                          ("merge_sha", merge_sha), ("merged_at", merged_at),
-                         ("read_synced_gen", read_synced_gen)):
+                         ("read_synced_gen", read_synced_gen),
+                         ("reclaims", reclaims)):
             if val is not ...:
                 sets.append(f"{col}=?"); args.append(val)
         if not sets:

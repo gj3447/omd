@@ -36,12 +36,12 @@ class BarrierMixin:
     def _party_alive(self, party) -> bool:
         """참가 task 가 아직 응결 가능한 살아있는 상태인가(도착 전/후 사망 판정, §D5).
         참가자 생존 = lease(write-orbit) 생존(소유물=lease 라는 §0 모델). 죽음 =
-          (a) task 가 없어졌거나 ABORTED(reclaim 이 abort→requeue 했으면 새 PENDING 행이지만
-              agent_id=None — lease 도 함께 해제됨), 또는
+          (a) task 가 없어졌거나 ABORTED/POISONED(reclaim 이 abort→requeue 했으면 새 PENDING
+              행이지만 agent_id=None — lease 도 함께 해제됨. 상한 초과면 POISONED 영구 terminal), 또는
           (b) write-orbit 이 HELD 가 아님(lease 만료/해제 = 보유자 사망/탈출, MERGED 제외), 또는
           (c) 도착했었는데 현재 write fence 가 도착 시점과 달라짐(ABA — 만료 후 타인에게 재부여)."""
         t = self.store.get_task(party["task_id"])
-        if t is None or t["state"] == "ABORTED":
+        if t is None or t["state"] in ("ABORTED", "POISONED"):
             return False
         if t["state"] == "MERGED":
             return True  # 이미 응결 — trip 멱등(plan 에서 제외됨)
@@ -283,10 +283,15 @@ class BarrierMixin:
                         "reason": "stale fence: lease changed since arrival",
                         "stale": stale}
             write_globs = self._claimed_write_globs(task_id, writes)
-            offending = self._writeset_audit(task_id, t["branch"], write_globs)
-            if offending:
-                return {"ok": False, "reason": "writeset_violation",
-                        "offending": offending, "task_id": task_id}
+            # GAP-2: 배리어-트립 merge 도 권위 게이트 — VIOLATION 뿐 아니라 AUDIT_ERROR(감사 불가)도
+            # fail-closed 거부한다(검증 못 한 write-set 을 응결시키지 않는다).
+            audit = self._writeset_audit(task_id, t["branch"], write_globs)
+            if audit.blocks:
+                out = {"ok": False, "reason": audit.reason,
+                       "offending": list(audit.offending), "task_id": task_id}
+                if audit.error is not None:
+                    out["audit_error"] = audit.error
+                return out
             owner = t["agent_id"] or f"barrier:{task_id}"
             token_id = self._acquire_merge_token_locked(owner)
             if token_id is None:
