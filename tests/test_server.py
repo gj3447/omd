@@ -47,6 +47,73 @@ def test_leader_heartbeat_loop_stops_when_leadership_is_lost(monkeypatch):
     assert calls == ["heartbeat"]
 
 
+def test_leader_heartbeat_loop_survives_transient_error_then_stops_on_conflict(monkeypatch):
+    """GAP-3: CoordinatorConflict 외의 예외(일시적 오류)가 루프를 *조용히 죽이지* 않는다 —
+    로그+백오프 후 재시도로 생존하고, 성공하면 연속-실패 카운터를 리셋한다. sweep 데몬 가드 미러."""
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server.core import CoordinatorConflict
+    from omd_server import server as server_module
+
+    calls = []
+    # 2회 일시적 오류(생존해야) → 1회 성공(카운터 리셋) → 2회 일시적 오류 → takeover 로 typed 종결.
+    script = [RuntimeError("db busy"), RuntimeError("db busy"), None,
+              RuntimeError("db busy"), RuntimeError("db busy"),
+              CoordinatorConflict("lost leadership")]
+
+    async def no_wait(_interval):
+        return None
+
+    def scripted_heartbeat():
+        calls.append("hb")
+        step = script[len(calls) - 1]
+        if step is not None:
+            raise step
+
+    monkeypatch.setattr(server_module.anyio, "sleep", no_wait)
+    omd = SimpleNamespace(
+        enforce_single_coordinator=True,
+        leader_ttl=30.0,
+        coordinator_heartbeat=scripted_heartbeat,
+    )
+    # max=3 인데도 카운터 리셋 덕에 3 연속에 도달 못 함 → 전 스크립트 소진(takeover 에서 종결).
+    async def _drive():
+        await server_module._leader_heartbeat_loop(omd, max_consecutive_failures=3)
+
+    anyio.run(_drive)
+    assert len(calls) == len(script)   # 일시 오류 4회 생존 + 성공 리셋 후 conflict 에서 종결
+
+
+def test_leader_heartbeat_loop_exits_bounded_after_repeated_failures(monkeypatch):
+    """GAP-3: 연속 실패가 상한을 넘으면 typed 로 탈출 — 무한 에러 루프 금지(유계 stop)."""
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server import server as server_module
+
+    calls = []
+
+    async def no_wait(_interval):
+        return None
+
+    def always_fails():
+        calls.append("hb")
+        raise RuntimeError("permanent programming error")
+
+    monkeypatch.setattr(server_module.anyio, "sleep", no_wait)
+    omd = SimpleNamespace(
+        enforce_single_coordinator=True,
+        leader_ttl=30.0,
+        coordinator_heartbeat=always_fails,
+    )
+
+    async def _drive():
+        await server_module._leader_heartbeat_loop(omd, max_consecutive_failures=3)
+
+    anyio.run(_drive)
+    # 정확히 상한 횟수만 시도하고 종료(무한루프 아님).
+    assert len(calls) == 3
+
+
 def test_coordinator_lifespan_resigns_only_when_singleton_enforced():
     anyio = pytest.importorskip("anyio")
     pytest.importorskip("fastmcp")
