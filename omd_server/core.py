@@ -1371,6 +1371,13 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             policy=self.admission_policy,
             observed_at=observed_at,
         )
+        self._emit(
+            "admission_candidates_scanned",
+            orbit_id or "admission-preview",
+            repository_id=self.repository_id,
+            mode=mode,
+            **decision.candidate_scan.as_dict(),
+        )
         snapshot_hash = authority_snapshot_hash(
             held,
             pending,

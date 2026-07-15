@@ -28,7 +28,7 @@
   },
   "boundary": {
     "owns": "OrbitRequest identity, compatible-mode conflict decisions, reservation order, lease grant facts, wait deadlines, cancellation, and promotion authority",
-    "mechanism": "Normalize a request, obtain a sound candidate superset, exact-check HELD and predecessor PENDING blockers, reject reservation cycles or overload, and atomically grant or queue",
+    "mechanism": "Normalize a request, derive a transaction-local maximal-literal-prefix candidate superset from the complete HELD/PENDING snapshot, exact-check candidate HELD and predecessor PENDING blockers, reject reservation cycles or overload, and atomically grant or queue",
     "policy_outside": [
       "Base task priority values",
       "Aging quantum and saturation ceiling",
@@ -89,7 +89,8 @@
     "queue": "At least one blocker exists, capacity is available, the wait deadline is valid, and inserting reservation edges does not close a cycle.",
     "deny": "The request is valid but policy or reservation-cycle safety forbids admission.",
     "reject": "The request identity, mode, pathspec, TTL, deadline, or capacity envelope is invalid before a live wait is exposed.",
-    "output_identity": "Every decision binds the complete request identity, decision_id, authority_snapshot_hash, policy_version, base_priority, effective_priority, observed_at, and the queue or grant context committed by that decision."
+    "output_identity": "Every decision binds the complete request identity, decision_id, authority_snapshot_hash, policy_version, base_priority, effective_priority, observed_at, and the queue or grant context committed by that decision.",
+    "candidate_filter": "The derived literal-prefix trie may only reduce exact glob comparisons. It is rebuilt from the complete active snapshot, places first-segment wildcard and character-class rows in the global candidate set, falls back to all active rows for an unknown request prefix or any build/query error, and never supplies rank, cycle, state, or snapshot authority."
     ,"decision_id": "SHA-256 of the canonical admission_decision/v2 envelope: event type, the complete nine-field request identity, authority_snapshot_hash, base_priority, effective_priority, observed_at, and the decision-specific grant, queue, denial, rejection, or blocker fields. Exact replay is idempotent; same id with a different envelope is a rejected security conflict; uniqueness scope is repository_id/request_id/request_generation."
   },
   "protocol": {
@@ -126,7 +127,7 @@
     "Two live HELD requests whose modes are incompatible never have overlapping pathspecs.",
     "A new request is granted only when it has no incompatible HELD blocker and no higher-ranked conflicting PENDING predecessor.",
     "Queue precedence is defined only between conflicting requests; unrelated PENDING work never blocks a disjoint request.",
-    "The candidate index returns a superset of every exact overlap; uncertainty falls back to the full active set.",
+    "The candidate index returns a superset of every exact overlap. Global-pattern authority rows are candidates for every query; request uncertainty or index construction/query failure falls back to the full active set.",
     "A queue insertion that would close the combined HELD-plus-reservation wait-for cycle is denied before exposure.",
     "Because aging can change reservation precedence after insertion, every reconciliation recomputes the combined graph at one observed time and deterministically denies the newest participating queue ticket until it is acyclic.",
     "Every live lease has a unique monotonic fence and only its current owner, fence, and bail epoch may renew or release it.",
@@ -156,7 +157,7 @@
   "durability": {
     "persistence": "Persist normalized request identity, queue sequence, requested TTL, deadlines, content-addressed policy version, rank inputs, decision schema/observed time/effective priority, blockers, state, and fence before reporting a durable result.",
     "atomic_commit": "Commit dedup claim, request state/version, wait-for cycle decision, fence allocation or queue insertion, notification outbox, and any explicit cross-stream causal predecessors in one authority transaction.",
-    "recovery": "On restart, first reconcile authority state by expiring due waits and leases and reevaluating PENDING requests with their original queue sequence and policy envelope; then arm the asynchronous dispatcher, which reclaims expired notification delivery leases and replays due stream heads by stable event_id. Candidate-index rebuild or verification remains an M2 step.",
+    "recovery": "On restart, first reconcile authority state by expiring due waits and leases and reevaluating PENDING requests with their original queue sequence and policy envelope; then arm the asynchronous dispatcher, which reclaims expired notification delivery leases and replays due stream heads by stable event_id. The candidate index has no persisted authority or stale recovery state: every decision rebuilds it from that decision's complete active snapshot.",
     "effect_idempotency": "Use repository_id, request_id, orbit_id, transition kind, and request generation as the unique semantic effect key; the canonical payload has a separate digest, and the same effect key with a different event or payload is a fail-closed conflict.",
     "migration": "The schema version is the final completion marker for additive migration. The m1-aging predecessor had no notification facts, so migration creates an empty outbox without fabricating historical effects while preserving all authority rows. A crash after outbox DDL or row insertion but before the version marker resumes idempotently and preserves the exact existing payload, digest, and dependency rows. Migration tests retain legacy PENDING, HELD, RELEASED, EXPIRED, and DENIED authority states."
   },
@@ -201,7 +202,7 @@
     "Capacity exhaustion returns explicit overload rather than creating an unbounded PENDING row.",
     "Reservation-cycle detection denies the candidate request and preserves prior grants and queue order.",
     "Unknown pending policy authority blocks fail closed; malformed or drifted active policy metadata prevents startup before recovery.",
-    "Index corruption or a failed soundness assertion disables the index and uses a full exact scan.",
+    "Candidate-index disable, an unknown request prefix, malformed active pathspec, coverage failure, or build/query error uses the complete active set and the unchanged exact oracle.",
     "Stale owner, fence, or bail epoch cannot renew, release, or cancel a current request.",
     "Notification failure, child-thread BaseException, or notifier-start failure leaves an observable retryable outbox entry and does not roll back an accepted lease fact.",
     "A closed coordinator rejects new manual drains and cannot ACK or retry durable notification state after handoff.",
@@ -211,7 +212,8 @@
   ],
   "observability": {
     "traces": [
-      "request_id, orbit_id, task_id, repository, agent, mode, pathspec digest, queue_seq, base and effective priority, observed_at, content-addressed policy version, blocker ids, decision, fence, deadlines, transition, correlation id"
+      "request_id, orbit_id, task_id, repository, agent, mode, pathspec digest, queue_seq, base and effective priority, observed_at, content-addressed policy version, blocker ids, decision, fence, deadlines, transition, correlation id",
+      "candidate-index version, complete HELD/PENDING counts, selected HELD/PENDING counts, full-scan fallback and bounded fallback reason"
     ],
     "metrics": [
       "authority lock wait and hold",
@@ -246,7 +248,8 @@
     "M1b (implemented): persist queue_seq, requested TTL, wait deadline, policy version, cancellation, and repository capacity; enforce no-overtaking with the locked gate and return typed overload without a live row.",
     "M1c (implemented): add PENDING reservation edges plus deterministic dynamic-cycle resolution, a content-addressed saturating-aging v2 policy, one-clock decision evidence, schema migration, and restart/property tests.",
     "M1d (implemented): persist state-changing semantic admission notifications and coordination dependencies transactionally; deliver them post-commit through lifecycle-gated, timer-start-fenced, claim-token-fenced, per-stream FIFO at-least-once replay without changing accepted lease facts.",
-    "M2a: add a conservative candidate prefilter and deadline-driven sweep, retaining exact glob verification and full-scan fallback.",
+    "M2a-index (implemented): derive a conservative maximal-literal-prefix candidate trie from every complete authority snapshot, retain exact glob verification and full-scan fallback, and property/differential-test it against the full oracle.",
+    "M2a-deadline: make embedded-runtime deadline ticks lifecycle-safe by default while retaining explicit deterministic opt-out; MCP already owns its lifespan-scoped sweep.",
     "M2b: move all Git effects out of the authority transaction before reconsidering RLock or SQLite replacement."
   ],
   "falsifiers": [

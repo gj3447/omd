@@ -128,8 +128,14 @@ def produce(
             "git_head_before_evidence_commit": _git_head(),
             "admission_path": "omd_server/admission.py",
             "admission_sha256": _sha256(REPO_ROOT / "omd_server" / "admission.py"),
+            "candidate_index_path": "omd_server/candidate_index.py",
+            "candidate_index_sha256": _sha256(
+                REPO_ROOT / "omd_server" / "candidate_index.py"
+            ),
             "core_path": "omd_server/core.py",
             "core_sha256": _sha256(REPO_ROOT / "omd_server" / "core.py"),
+            "disjoint_path": "omd_server/disjoint.py",
+            "disjoint_sha256": _sha256(REPO_ROOT / "omd_server" / "disjoint.py"),
         },
         "producer": {
             "path": str(producer.relative_to(REPO_ROOT)),

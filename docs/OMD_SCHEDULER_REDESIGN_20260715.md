@@ -410,9 +410,11 @@ producer/readback backend. It explicitly records no separate oracle and awaits
 independent judgment; it is not promoted to `external_verdict`.
 
 Still open before full M1: embedded-runtime default wait-deadline delivery,
-candidate-index soundness, explicit non-denial request-generation rollover,
-independent judgment and finalization. The current exact full scan is sound but is not an implemented
-candidate index. The existing Connect path now has process-tree effect fencing,
+explicit non-denial request-generation rollover, independent judgment and
+finalization. Candidate-index soundness is implemented as a transaction-local
+maximal-literal-prefix prefilter with exact verification, full-scan fallback and
+indexed/full property tests. It reduces exact glob comparisons but is neither
+persisted authority nor a sublinear database lookup. The existing Connect path now has process-tree effect fencing,
 durable attempt generations and exact Git proof, but the prepared
 `ConnectAttempt`/expected-old protected-ref pipeline remains open.
 
@@ -602,7 +604,7 @@ run = json.loads(Path("evidence/omd_scheduler_m1/ooptdd_run.json").read_text())
 receipt = json.loads(Path("evidence/omd_scheduler_m1/ooptdd_receipt.json").read_text())
 subject = run["subject"]
 assert receipt["subject_binding"] == subject
-for name in ("admission", "core"):
+for name in ("admission", "candidate_index", "core", "disjoint"):
     path = Path(subject[f"{name}_path"])
     assert hashlib.sha256(path.read_bytes()).hexdigest() == subject[f"{name}_sha256"]
 print("M1 subject binding: OK")
@@ -643,7 +645,8 @@ SHA-256 is
   delivery is default-on; repository capacity and typed overload are bound;
   content-addressed aging and dynamic rank-cycle resolution are implemented;
   the state-edge notification outbox has crash/replay and claim-token fencing;
-  embedded-runtime default deadline delivery and candidate-index soundness remain open. Task-bound
+  a conservative candidate prefilter is exact-verified and property-tested;
+  embedded-runtime default deadline delivery remains open. Task-bound
   `CANCEL`/`RELEASE` projection is also implemented. The prepared Connect
   pipeline is still contract-only.
 - M0's measured numbers and LakatoTree `partial` verdict describe reproducible

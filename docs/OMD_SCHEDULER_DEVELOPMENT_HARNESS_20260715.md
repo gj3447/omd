@@ -395,12 +395,19 @@ invalidates the downstream evidence.
 
 ### 10.1 Implemented M1 fairness slice
 
-The current runtime closes evidence items 1--8 for the bounded real-code trace;
-item 9 remains open because the runtime deliberately uses the full exact scan:
+The current runtime closes evidence items 1--9 for the bounded real-code and
+property/differential traces:
 
 - `omd_server/admission.py` is the pure mode compatibility, exact-overlap,
   versioned priority/aging/FIFO rank and blocker decision table used by both
   `claim()` and `_promote_pending()`;
+- `omd_server/candidate_index.py` rebuilds a derived maximal-literal-prefix trie
+  from each complete HELD/PENDING authority snapshot. Ancestor/descendant and
+  global-pattern candidates still pass through the unchanged exact oracle;
+  unknown request prefixes, malformed snapshots, explicit disable and index
+  errors use the complete active set. The full snapshot, not the candidate set,
+  remains the provenance hash authority. This reduces exact glob comparisons;
+  it is not a sublinear SQLite lookup or persisted authority;
 - SQLite persists monotonic `queue_seq`, requested TTL, policy version, path
   digest, request id/generation, bail epoch, enqueue/deadline timestamps,
   authority snapshot, canonical decision schema/id/type, observed time,
@@ -526,8 +533,11 @@ every orbit release summarized by a bail/reclaim is delivered before
 `agent_reclaimed`. An empty/task-only agent receives a synthetic coordination
 stream, so rollback cannot leak legacy direct telemetry. This auxiliary fact is
 not presented as an admission-FSM event.
-Item 9 has no
-candidate index to prove yet (the runtime uses the sound full exact scan).
+Item 9 is exercised by adversarial fixtures, all nine mode pairs and 250
+Hypothesis examples per run. Each generated workload asserts that every exact
+full-scan overlap remains in the candidate set and that indexed grant/blocker
+semantics equal an explicitly disabled full scan. Candidate counts and bounded
+fallback reasons are emitted separately from the canonical decision envelope.
 Policy-denial generation rollover is implemented; explicit non-denial rollover
 remains open. Public `RENEW`/`RELEASE`, due lease expiry, PENDING-owner reclaim,
 HELD-owner reclaim, standalone wait cancellation and the task-bound cancel path
@@ -626,6 +636,8 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
   -p no:cacheprovider \
   tests/test_scheduler_m0_harness.py \
   tests/test_scheduler_m1_admission.py \
+  tests/test_scheduler_m2_candidate_index.py \
+  tests/test_scheduler_m2_candidate_index_replay.py \
   tests/test_scheduler_m1_outbox.py \
   tests/test_scheduler_admission_conformance.py \
   tests/test_sinks.py \
@@ -651,7 +663,7 @@ run = json.loads(Path("evidence/omd_scheduler_m1/ooptdd_run.json").read_text())
 receipt = json.loads(Path("evidence/omd_scheduler_m1/ooptdd_receipt.json").read_text())
 subject = run["subject"]
 assert receipt["subject_binding"] == subject
-for name in ("admission", "core"):
+for name in ("admission", "candidate_index", "core", "disjoint"):
     path = Path(subject[f"{name}_path"])
     assert hashlib.sha256(path.read_bytes()).hexdigest() == subject[f"{name}_sha256"]
 print("M1 subject binding: OK")
@@ -698,8 +710,8 @@ slice is ready to commit only when:
 
 Landing those files makes the **M1 fairness implementation slice** durable. It
 does not make full M1 or the development cycle `CLOSED`: embedded-runtime
-default deadline delivery, candidate-index soundness, an independent scripted
-progress judgment and finalization receipts remain future work.
+default deadline delivery, an independent scripted progress judgment and
+finalization receipts remain future work.
 
 ## 14. Known limitations and promotion blockers
 
@@ -718,8 +730,9 @@ progress judgment and finalization receipts remain future work.
    are bound to the JSON semantic reducer. MCP timeout delivery is autonomous
    by default; content-addressed saturating aging and dynamic rank-cycle
    resolution plus the durable state-edge notification outbox are implemented.
-   Embedded-runtime default deadline delivery and candidate-index soundness
-   remain the open M1 front. Task-bound
+   The conservative, exact-verified candidate prefilter is implemented without
+   claiming a persistent or sublinear database index. Embedded-runtime default
+   deadline delivery remains the open M1 runtime front. Task-bound
    `CANCEL`/`RELEASE` projection is also implemented.
 5. The prepared candidate, expected-old ref CAS, independent ref reader and
    finalization protocol are contracts, not the current runtime path.

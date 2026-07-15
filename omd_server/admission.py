@@ -14,6 +14,11 @@ import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
+from .candidate_index import (
+    ADMISSION_MODES as MODES,
+    CandidateScan,
+    select_conflict_candidates,
+)
 from .disjoint import sets_overlap
 
 
@@ -24,7 +29,6 @@ DEFAULT_ADMISSION_AGING_QUANTUM = 60.0
 DEFAULT_ADMISSION_MAX_AGE_BOOST = 10
 MIN_ADMISSION_PRIORITY = -(1 << 63)
 MAX_ADMISSION_PRIORITY = (1 << 63) - 1
-MODES = frozenset({"read", "write", "shared"})
 
 
 def canonical_json(value: Any) -> str:
@@ -281,6 +285,7 @@ class AdmissionDecision:
     base_priority: int
     effective_priority: int
     observed_at: float
+    candidate_scan: CandidateScan
 
     @property
     def blocker_ids(self) -> tuple[str, ...]:
@@ -298,6 +303,7 @@ def decide_admission(
     *,
     policy: QueuePolicy = DEFAULT_QUEUE_POLICY,
     observed_at: float = 0.0,
+    candidate_index_enabled: bool = True,
 ) -> AdmissionDecision:
     """Classify exact blockers for one request.
 
@@ -310,9 +316,17 @@ def decide_admission(
         or not math.isfinite(observed_at)
     ):
         raise ValueError("observed_at must be a finite timestamp")
+    held_rows = tuple(held)
+    pending_rows = tuple(pending)
+    candidates = select_conflict_candidates(
+        request.pathspec,
+        held_rows,
+        pending_rows,
+        enabled=candidate_index_enabled,
+    )
     held_ids = tuple(sorted(
         str(row["orbit_id"])
-        for row in held
+        for row in candidates.held
         if row.get("orbit_id") != request.orbit_id
         and exact_conflict(request.pathspec, request.mode, row)
     ))
@@ -342,7 +356,7 @@ def decide_admission(
 
     pending_ids = tuple(sorted(
         str(row["orbit_id"])
-        for row in pending
+        for row in candidates.pending
         if row.get("orbit_id") != request.orbit_id
         and exact_conflict(request.pathspec, request.mode, row)
         # A live row with missing rank authority is corrupt or only partially
@@ -356,6 +370,7 @@ def decide_admission(
         base_priority=request.priority,
         effective_priority=effective_priority,
         observed_at=float(observed_at),
+        candidate_scan=candidates.scan,
     )
 
 
