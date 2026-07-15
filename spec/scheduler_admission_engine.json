@@ -1,0 +1,246 @@
+{
+  "schema_version": "engine-spec/v1",
+  "name": "omd-orbit-admission",
+  "purpose": "Own deterministic, starvation-bounded admission of overlapping path leases while preserving OMD fencing and disjoint-write safety.",
+  "decision": {
+    "verdict": "engine",
+    "current_consumers": [
+      "Coordinator.claim",
+      "Coordinator.begin",
+      "MCP claim adapter",
+      "CLI claim adapter"
+    ],
+    "planned_consumers": [
+      "claim_set atomic admission",
+      "durable claim waiter",
+      "repository-sharded admission workers"
+    ],
+    "fit_evidence": [
+      "All consumers require one authoritative conflict decision over shared HELD and PENDING state.",
+      "Queue order, deadlines, cancellation, crash recovery, deadlock prevention, and fencing must survive adapter and process boundaries.",
+      "The current HELD-only admission rule differs from PENDING promotion and reproduced overtaking in every locked M0 trace."
+    ],
+    "alternatives_considered": [
+      "Patch Coordinator.claim with one PENDING scan",
+      "Reuse the single-resource semaphore queue unchanged",
+      "Replace SQLite before separating admission mechanism from Git effects"
+    ]
+  },
+  "boundary": {
+    "owns": "OrbitRequest identity, compatible-mode conflict decisions, reservation order, lease grant facts, wait deadlines, cancellation, and promotion authority",
+    "mechanism": "Normalize a request, obtain a sound candidate superset, exact-check HELD and predecessor PENDING blockers, reject reservation cycles or overload, and atomically grant or queue",
+    "policy_outside": [
+      "Base task priority values",
+      "Aging quantum and saturation ceiling",
+      "Repository queue capacities",
+      "Caller wait-versus-return presentation",
+      "Task critical-path scoring",
+      "Hot-file structural decomposition"
+    ],
+    "non_goals": [
+      "Optimizing an unspecified global objective",
+      "Running Git, checkers, notifications, or wall-clock reads inside the pure decision kernel",
+      "Treating all PENDING requests as one global FIFO head",
+      "Using a candidate index result as the final overlap oracle",
+      "Changing Task lifecycle semantics"
+    ],
+    "state_authority": "SQLite LeaseAuthority is the single mutable authority; one atomic authority transaction serializes decisions that may conflict within a repository"
+  },
+  "model": {
+    "resources": [
+      "path-glob lease",
+      "PENDING reservation",
+      "bounded repository wait capacity",
+      "monotonic fence sequence"
+    ],
+    "work_units": [
+      "OrbitRequest",
+      "LeaseGrant",
+      "ReservationEdge"
+    ]
+  },
+  "state_model": "A pure admission decision table owns grant-versus-queue-versus-deny; spec/scheduler_admission_fsm.json owns each OrbitRequest lifecycle orthogonally to the existing Task FSM. The runtime_projection below is the only compatibility mapping to the legacy Orbit FSM.",
+  "decision_kernel": {
+    "interface": "decide(repository_snapshot, normalized_request, recorded_policy, observed_at) -> Grant | Queue | Deny | Reject",
+    "request_identity": [
+      "repository_id",
+      "request_id",
+      "orbit_id",
+      "request_generation",
+      "owner_agent",
+      "bail_epoch",
+      "mode",
+      "pathspec_digest",
+      "policy_version"
+    ],
+    "modes": ["read", "write", "shared"],
+    "compatibility": {
+      "read/read": "compatible",
+      "shared/shared": "compatible",
+      "read/write": "incompatible",
+      "read/shared": "incompatible",
+      "write/write": "incompatible",
+      "write/shared": "incompatible"
+    },
+    "rank": "effective_priority descending, then durable queue_seq ascending; rank is compared only among exact conflicting PENDING requests",
+    "grant": "No incompatible exact HELD blocker and no higher-ranked exact conflicting PENDING predecessor exist.",
+    "queue": "At least one blocker exists, capacity is available, the wait deadline is valid, and inserting reservation edges does not close a cycle.",
+    "deny": "The request is valid but policy or reservation-cycle safety forbids admission.",
+    "reject": "The request identity, mode, pathspec, TTL, deadline, or capacity envelope is invalid before a live wait is exposed.",
+    "output_identity": "Every decision binds the complete request identity, decision_id, authority_snapshot_hash, policy_version, and the queue or grant context committed by that decision."
+    ,"decision_id": "SHA-256 of the canonical admission_decision/v1 envelope: event type, the complete nine-field request identity, authority_snapshot_hash, and the decision-specific grant, queue, denial, rejection, or blocker fields. Exact replay is idempotent; same id with a different envelope is a rejected security conflict; uniqueness scope is repository_id/request_id/request_generation."
+  },
+  "protocol": {
+    "commands": [
+      "SubmitClaim",
+      "ReevaluatePending",
+      "RenewLease",
+      "ReleaseLease",
+      "CancelWait",
+      "SweepDeadline",
+      "ReclaimOwner"
+    ],
+    "events": [
+      "ClaimSubmitted",
+      "ClaimQueued",
+      "LeaseGranted",
+      "PromotionBlocked",
+      "ClaimDenied",
+      "ClaimRejected",
+      "LeaseRenewed",
+      "LeaseReleased",
+      "LeaseExpired",
+      "WaitCancelled",
+      "WaitTimedOut"
+    ],
+    "effects": [
+      "NotifyWaiter",
+      "ScheduleDeadline",
+      "EmitAdmissionTelemetry"
+    ],
+    "versioning": "Request, policy, event, snapshot, queue rank, and path-normalization versions are recorded. Breaking compatibility or ordering changes require a new major version and replay fixtures."
+  },
+  "invariants": [
+    "Two live HELD requests whose modes are incompatible never have overlapping pathspecs.",
+    "A new request is granted only when it has no incompatible HELD blocker and no higher-ranked conflicting PENDING predecessor.",
+    "Queue precedence is defined only between conflicting requests; unrelated PENDING work never blocks a disjoint request.",
+    "The candidate index returns a superset of every exact overlap; uncertainty falls back to the full active set.",
+    "A queue insertion that would close the combined HELD-plus-reservation wait-for cycle is denied before exposure.",
+    "Every live lease has a unique monotonic fence and only its current owner, fence, and bail epoch may renew or release it.",
+    "Every admission and promotion decision binds the canonical nine-field request identity (repository, request, orbit, generation, owner, bail epoch, mode, pathspec digest, policy version), decision-specific output fields, decision_id, and a fresh authority snapshot; lifecycle maintenance facts bind the applicable owner/fence/deadline tuple. An event for another identity or generation cannot advance this lifecycle.",
+    "Owner reclaim of a HELD request requires the current owner, fence, bail epoch, request generation, and authority snapshot; reclaim of a PENDING request requires the current owner, bail epoch, request generation, and authority snapshot.",
+    "Every wait has a durable sequence, deadline, cancellation path, and bounded capacity outcome.",
+    "Promotion and initial admission use the same blocker, compatibility, rank, and cycle rules."
+  ],
+  "ports": [
+    "AdmissionStore",
+    "Clock",
+    "ConflictCandidateIndex",
+    "ExactGlobAlgebra",
+    "QueuePolicy",
+    "WaitForGraph",
+    "WaiterNotifier",
+    "TelemetrySink"
+  ],
+  "runtime": {
+    "ordering": "Authority mutations are serialized per repository. Queue rank is effective_priority descending then queue_seq ascending, evaluated under a recorded policy version and observed time.",
+    "concurrency": "Disjoint or mode-compatible requests may become HELD in the same promotion pass and execute concurrently outside the authority transaction.",
+    "backpressure": "Global and per-repository durable queue limits return QUEUE_FULL with retry-after metadata; conflict-domain limits remain advisory until their no-bypass accounting is proved.",
+    "cancellation": "A PENDING owner may cancel with current identity and bail epoch. Cancellation is idempotent and immediately triggers eligible promotion.",
+    "timeouts": "Wait and lease deadlines are persisted timestamps. External deadline events carry observed time; no lazy status read is the sole liveness mechanism."
+  },
+  "durability": {
+    "persistence": "Persist normalized request identity, queue sequence, requested TTL, deadlines, policy version, rank inputs, blockers, state, and fence before reporting a durable result.",
+    "atomic_commit": "Commit dedup claim, request state/version, wait-for cycle decision, fence allocation or queue insertion, and notification outbox in one authority transaction.",
+    "recovery": "On restart, expire due waits and leases, rebuild or verify the candidate index, then reevaluate PENDING requests with their original queue sequence and policy envelope.",
+    "effect_idempotency": "Use request_id, transition kind, request generation, and immutable argument digest; same identity with different intent is a conflict.",
+    "migration": "Additive queue metadata and target lifecycle states are introduced behind an admission protocol version; retain fixtures for legacy PENDING, HELD, RELEASED, EXPIRED, and DENIED rows."
+  },
+  "runtime_projection": {
+    "semantic_source": "spec/scheduler_admission_fsm.json",
+    "legacy_target": "omd_server/fsm.py Orbit FSM plus the current orbits table",
+    "state_map": {
+      "REQUESTED": "transient; no legacy orbit row is externally visible",
+      "PENDING": "PENDING",
+      "HELD": "HELD",
+      "RELEASED": "RELEASED",
+      "EXPIRED": "EXPIRED",
+      "DENIED": "DENIED with typed reason=policy_or_cycle_denial",
+      "REJECTED": "no live legacy row; return a typed rejection receipt",
+      "CANCELLED": "DENIED with typed reason=cancelled during compatibility mode",
+      "TIMED_OUT": "DENIED with typed reason=wait_timeout during compatibility mode"
+    },
+    "field_map": {
+      "request_id": "dedup request identity and admission receipt",
+      "orbit_id": "orbits.orbit_id",
+      "owner_agent": "orbits.agent_id",
+      "mode": "orbits.mode",
+      "queue_seq": "new durable queue_seq; legacy created_at ordering is read-only migration input, never the M1 authority",
+      "wait_deadline": "new durable wait_deadline; legacy PENDING rows require explicit migration policy before M1 authority",
+      "fence": "orbits.fence",
+      "lease_deadline": "orbits.expires_at",
+      "request_generation": "new monotonic request generation used with request_id and orbit_id",
+      "authority_snapshot_hash": "new digest of the authority rows and coordinator epoch used by the decision"
+      ,"bail_epoch": "orbits.bail_epoch and the canonical request identity"
+      ,"pathspec_digest": "canonical normalized pathspec digest persisted with the request"
+      ,"policy_version": "recorded admission policy version"
+      ,"decision_id": "canonical admission_decision/v1 digest resolving to the atomically persisted decision envelope"
+      ,"terminal_reason": "typed denial/rejection/cancellation/timeout projection reason"
+    },
+    "rule": "Projection is one-way compatibility output. Production conformance compares the semantic lifecycle first and then the legacy projection; legacy state names must not redefine the semantic machine. task_id is non-identity scheduling metadata and is deliberately excluded from the canonical request identity."
+  },
+  "failure_model": [
+    "Invalid pathspec, mode, TTL, priority, or identity is rejected without state mutation.",
+    "Capacity exhaustion returns explicit overload rather than creating an unbounded PENDING row.",
+    "Reservation-cycle detection denies the candidate request and preserves prior grants and queue order.",
+    "Index corruption or a failed soundness assertion disables the index and uses a full exact scan.",
+    "Stale owner, fence, or bail epoch cannot renew, release, or cancel a current request.",
+    "Notification failure leaves an observable outbox entry and does not roll back an accepted lease fact."
+  ],
+  "observability": {
+    "traces": [
+      "request_id, orbit_id, task_id, repository, agent, mode, pathspec digest, queue_seq, base and effective priority, policy version, blocker ids, decision, fence, deadlines, transition, correlation id"
+    ],
+    "metrics": [
+      "authority lock wait and hold",
+      "transaction duration",
+      "HELD and PENDING candidates scanned",
+      "full-scan fallback count",
+      "queue depth and age",
+      "overtake prevention count",
+      "promotion delay",
+      "cycle denial",
+      "queue rejection",
+      "deadline and cancellation outcomes"
+    ],
+    "redaction": "Path content and unbounded identities remain trace fields or hashes; metrics use bounded repository and mode labels."
+  },
+  "security": [
+    "Lease owner, cancellation, and fence capabilities are explicit and never inferred from caller-supplied task text.",
+    "A caller cannot supply its own candidate set, effective rank, cycle result, or fence.",
+    "Repository-domain traffic cannot alter another repository's queue rank, capacity, or candidate-index residency."
+  ],
+  "verification": [
+    "Validate the engine, lifecycle FSM, and abstract traces.",
+    "Run a decision-table truth suite for every mode pair, HELD blocker, PENDING predecessor, priority, FIFO, aging, capacity, and cycle combination.",
+    "Property-test indexed candidates against a full exact scan with the assertion full_conflicts is a subset of indexed_candidates.",
+    "Run real Coordinator positive readback and injected-negative OOPTDD receipts for no-overtaking.",
+    "Crash-test queue insertion, grant, release-plus-promotion, cancellation, deadline, and notification cut points.",
+    "Model-check bounded safety and liveness with conflicting partial orders and restart."
+  ],
+  "implementation_slices": [
+    "M1a: add metrics and a pure compatibility/rank/blocker decision table without changing production outcomes.",
+    "M1b: persist queue_seq, requested TTL, wait deadline, policy version, cancellation, and capacity; enforce no-overtaking with the locked gate.",
+    "M1c: add PENDING reservation edges to cycle detection and restart/property tests.",
+    "M2a: add a conservative candidate prefilter and deadline-driven sweep, retaining exact glob verification and full-scan fallback.",
+    "M2b: move all Git effects out of the authority transaction before reconsidering RLock or SQLite replacement."
+  ],
+  "falsifiers": [
+    "A newer lower-ranked conflicting request becomes HELD while its predecessor remains PENDING.",
+    "A global queue head blocks a request that is disjoint and mode-compatible with all live blockers.",
+    "The indexed path misses any conflict found by the full exact scan.",
+    "A bounded workload can leave a PENDING request without grant, timeout, cancellation, denial, or explicit overload.",
+    "Adding reservation precedence introduces an undetected wait-for cycle.",
+    "The abstraction should collapse back into a module if only one caller remains and durable queue, recovery, and replaceable policies disappear."
+  ]
+}

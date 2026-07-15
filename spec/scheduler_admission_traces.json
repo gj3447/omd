@@ -1,0 +1,184 @@
+{
+  "limitations": "These abstract fixtures prove transition selection and injected guard outcomes. Production conformance must compute identity, deadline, authority-snapshot, and projection guards from typed payloads and persisted context.",
+  "cases": [
+    {
+      "id": "immediate-grant-and-release",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_GRANTED", "guard_results": {"admission_identity_current": true}, "expected_state": "HELD", "expected_effects": ["RecordLeaseGrant"]},
+        {"event": "RELEASE", "guard_results": {"lease_authority_current": true}, "expected_state": "RELEASED", "expected_effects": ["RecordRelease"]}
+      ]
+    },
+    {
+      "id": "queued-promoted-and-renewed",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_QUEUED", "guard_results": {"admission_identity_current": true}, "expected_state": "PENDING", "expected_effects": ["RecordQueueEntry"]},
+        {"event": "PROMOTION_GRANTED", "guard_results": {"promotion_identity_current": true}, "expected_state": "HELD", "expected_effects": ["RecordLeaseGrant"]},
+        {"event": "RENEW", "guard_results": {"lease_authority_current": true}, "expected_state": "HELD", "expected_effects": ["RecordLeaseRenewal"]},
+        {"event": "LEASE_EXPIRED", "guard_results": {"lease_timeout_due": true}, "expected_state": "EXPIRED", "expected_effects": ["RecordExpiration"]}
+      ]
+    },
+    {
+      "id": "policy-denial",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_DENIED", "guard_results": {"admission_identity_current": true}, "expected_state": "DENIED", "expected_effects": ["RecordDenial"]}
+      ]
+    },
+    {
+      "id": "queue-overload-rejection",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_REJECTED", "guard_results": {"admission_identity_current": true}, "expected_state": "REJECTED", "expected_effects": ["RecordOverload"]}
+      ]
+    },
+    {
+      "id": "cancel-before-decision",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "CANCEL", "guard_results": {"wait_owner_current": true}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancellation"]}
+      ]
+    },
+    {
+      "id": "blocked-then-cancelled",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_QUEUED", "guard_results": {"admission_identity_current": true}, "expected_state": "PENDING", "expected_effects": ["RecordQueueEntry"]},
+        {"event": "PROMOTION_BLOCKED", "guard_results": {"promotion_identity_current": true}, "expected_state": "PENDING", "expected_effects": ["RecordQueueObservation"]},
+        {"event": "CANCEL", "guard_results": {"wait_owner_current": true}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancellation"]}
+      ]
+    },
+    {
+      "id": "wait-deadline",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_QUEUED", "guard_results": {"admission_identity_current": true}, "expected_state": "PENDING", "expected_effects": ["RecordQueueEntry"]},
+        {"event": "WAIT_TIMEOUT", "guard_results": {"wait_timeout_due": true}, "expected_state": "TIMED_OUT", "expected_effects": ["RecordTimeout"]}
+      ]
+    },
+    {
+      "id": "pending-owner-reclaimed",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_QUEUED", "guard_results": {"admission_identity_current": true}, "expected_state": "PENDING", "expected_effects": ["RecordQueueEntry"]},
+        {"event": "WAIT_OWNER_RECLAIMED", "guard_results": {"pending_owner_reclaim_current": true}, "expected_state": "CANCELLED", "expected_effects": ["RecordWaitOwnerReclaim"]}
+      ]
+    },
+    {
+      "id": "held-owner-reclaimed",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_GRANTED", "guard_results": {"admission_identity_current": true}, "expected_state": "HELD", "expected_effects": ["RecordLeaseGrant"]},
+        {"event": "LEASE_OWNER_RECLAIMED", "guard_results": {"held_owner_reclaim_current": true}, "expected_state": "EXPIRED", "expected_effects": ["RecordLeaseOwnerReclaim"]}
+      ]
+    },
+    {
+      "id": "stale-held-authority-rejected",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_GRANTED", "guard_results": {"admission_identity_current": true}, "expected_state": "HELD", "expected_effects": ["RecordLeaseGrant"]},
+        {"event": "RELEASE", "guard_results": {"lease_authority_current": false}, "expected_state": "HELD", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "stale-wait-owner-rejected",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_QUEUED", "guard_results": {"admission_identity_current": true}, "expected_state": "PENDING", "expected_effects": ["RecordQueueEntry"]},
+        {"event": "CANCEL", "guard_results": {"wait_owner_current": false}, "expected_state": "PENDING", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "early-wait-timeout-rejected",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_QUEUED", "guard_results": {"admission_identity_current": true}, "expected_state": "PENDING", "expected_effects": ["RecordQueueEntry"]},
+        {"event": "WAIT_TIMEOUT", "guard_results": {"wait_timeout_due": false}, "expected_state": "PENDING", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "early-lease-expiry-rejected",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_GRANTED", "guard_results": {"admission_identity_current": true}, "expected_state": "HELD", "expected_effects": ["RecordLeaseGrant"]},
+        {"event": "LEASE_EXPIRED", "guard_results": {"lease_timeout_due": false}, "expected_state": "HELD", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "pending-policy-denial",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_QUEUED", "guard_results": {"admission_identity_current": true}, "expected_state": "PENDING", "expected_effects": ["RecordQueueEntry"]},
+        {"event": "PROMOTION_DENIED", "guard_results": {"promotion_identity_current": true}, "expected_state": "DENIED", "expected_effects": ["RecordDenial"]}
+      ]
+    },
+    {
+      "id": "cross-request-admission-rejected",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_GRANTED", "guard_results": {"admission_identity_current": false}, "expected_state": "REQUESTED", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "stale-promotion-identity-rejected",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_QUEUED", "guard_results": {"admission_identity_current": true}, "expected_state": "PENDING", "expected_effects": ["RecordQueueEntry"]},
+        {"event": "PROMOTION_GRANTED", "guard_results": {"promotion_identity_current": false}, "expected_state": "PENDING", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "cross-owner-admission-rejected",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_GRANTED", "guard_results": {"admission_identity_current": false}, "expected_state": "REQUESTED", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "stale-bail-epoch-admission-rejected",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_QUEUED", "guard_results": {"admission_identity_current": false}, "expected_state": "REQUESTED", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "mode-mismatch-promotion-rejected",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_QUEUED", "guard_results": {"admission_identity_current": true}, "expected_state": "PENDING", "expected_effects": ["RecordQueueEntry"]},
+        {"event": "PROMOTION_GRANTED", "guard_results": {"promotion_identity_current": false}, "expected_state": "PENDING", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "decision-id-envelope-conflict-rejected",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_GRANTED", "guard_results": {"admission_identity_current": false}, "expected_state": "REQUESTED", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "stale-pending-reclaim-rejected",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_QUEUED", "guard_results": {"admission_identity_current": true}, "expected_state": "PENDING", "expected_effects": ["RecordQueueEntry"]},
+        {"event": "WAIT_OWNER_RECLAIMED", "guard_results": {"pending_owner_reclaim_current": false}, "expected_state": "PENDING", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "stale-held-reclaim-rejected",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "ADMISSION_GRANTED", "guard_results": {"admission_identity_current": true}, "expected_state": "HELD", "expected_effects": ["RecordLeaseGrant"]},
+        {"event": "LEASE_OWNER_RECLAIMED", "guard_results": {"held_owner_reclaim_current": false}, "expected_state": "HELD", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "invalid-event-audited",
+      "machine": "orbit_request",
+      "steps": [
+        {"event": "FINALIZE_COMMITTED", "guard_results": {}, "expected_state": "REQUESTED", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    }
+  ]
+}
