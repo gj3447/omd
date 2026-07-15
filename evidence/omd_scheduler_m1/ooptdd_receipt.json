@@ -11,7 +11,7 @@
     "injection": "Ignore conflicting PENDING predecessors in decide_admission.",
     "observed_verdict": "red",
     "receipt_path": "evidence/omd_scheduler_m1/ooptdd_run.json",
-    "receipt_sha256": "1d001a231795b372cef81db911a7202dc4fcfa6cc682b9c89b2cf70bb49217f6",
+    "receipt_sha256": "7edb8f8640da7e403180c75d3d27cec4f9960050b50f73ae788e4f083324d170",
     "restored": true,
     "spec_sha256": "586d8b7e92e7f1974c7acbb1d12969337f57c5f678670243e215b46bb8c2d995",
     "technique": "fault_injection"
@@ -28,14 +28,14 @@
     "forbidden_events_passed": true,
     "observed_verdict": "green",
     "receipt_path": "evidence/omd_scheduler_m1/ooptdd_run.json",
-    "receipt_sha256": "1d001a231795b372cef81db911a7202dc4fcfa6cc682b9c89b2cf70bb49217f6"
+    "receipt_sha256": "7edb8f8640da7e403180c75d3d27cec4f9960050b50f73ae788e4f083324d170"
   },
   "producer": {
     "command": "/Users/lagyeongjun/CD/omd/.venv/bin/python /Users/lagyeongjun/CD/omd/benchmarks/produce_scheduler_m1_receipt.py --gate gates/scheduler_fairness.yaml --cid omd-scheduler-m1-newer --output evidence/omd_scheduler_m1/ooptdd_run.json --receipt-output evidence/omd_scheduler_m1/ooptdd_receipt.json",
     "cwd": "/Users/lagyeongjun/CD/omd",
     "entrypoint": "benchmarks.produce_scheduler_m1_receipt:produce",
     "exit_code": 0,
-    "git_head": "a1d2ddde2a337425162eb8f6457bbc0920892480",
+    "git_head": "b8126dc01d5fa81e7ade004c22aca797cf22ada1",
     "real_code_path": true,
     "source_path": "benchmarks/produce_scheduler_m1_receipt.py",
     "source_symbol": "produce"
@@ -67,10 +67,10 @@
   },
   "subject_binding": {
     "admission_path": "omd_server/admission.py",
-    "admission_sha256": "05ef13014b60e3ef318ebecd14bf5bd85ab30d8df8918150dc025bc67593bdd2",
+    "admission_sha256": "8d303792cdf9ca25a9230f676a88c29e3aa54f2f2d26234d7e0a45244a317653",
     "core_path": "omd_server/core.py",
-    "core_sha256": "6ec1abddffff80af2befc809c27cf8d07062b79009ee40ef767bae2b3e97f7e5",
-    "git_head_before_evidence_commit": "a1d2ddde2a337425162eb8f6457bbc0920892480"
+    "core_sha256": "52ca4c4a72976a674c1509693f6a4b26f37534d3ab782340f1ad10eabec731ce",
+    "git_head_before_evidence_commit": "b8126dc01d5fa81e7ade004c22aca797cf22ada1"
   },
   "template_only": false
 }
