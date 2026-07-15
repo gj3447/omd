@@ -1,6 +1,6 @@
 {
   "cid": "omd-scheduler-m1-newer",
-  "completed_at": "2026-07-15T19:01:37.670063+00:00",
+  "completed_at": "2026-07-15T19:39:58.976838+00:00",
   "gate": {
     "path": "gates/scheduler_fairness.yaml",
     "sha256": "7e249d738e941c2a56e6d8846ddc2d5b6489c95a0238d5471301c63bea19c4d1"
@@ -50,7 +50,7 @@
           "charged": true,
           "firsts": {
             "orbit_pending": null,
-            "orbit_requested": 1784142097621603
+            "orbit_requested": 1784144398924804
           },
           "grounding": "derived-self",
           "kind": "must_order",
@@ -131,12 +131,12 @@
       },
       "holder_state": "HELD",
       "newer_claim_state": "HELD",
-      "newer_created_at": 1784142097.621401,
+      "newer_created_at": 1784144398.9245849,
       "newer_granted_while_older_pending": true,
       "newer_priority": 0,
       "no_overtaking_passed": false,
       "older_arrived_first": true,
-      "older_created_at": 1784142097.6205719,
+      "older_created_at": 1784144398.9237518,
       "older_priority": 10,
       "older_waiter_state": "PENDING",
       "pending_predecessor_bypass_injected": true,
@@ -189,8 +189,8 @@
         {
           "charged": true,
           "firsts": {
-            "orbit_pending": 1784142097610085,
-            "orbit_requested": 1784142097608587
+            "orbit_pending": 1784144398911840,
+            "orbit_requested": 1784144398910395
           },
           "grounding": "derived-self",
           "kind": "must_order",
@@ -267,12 +267,12 @@
       },
       "holder_state": "HELD",
       "newer_claim_state": "PENDING",
-      "newer_created_at": 1784142097.608337,
+      "newer_created_at": 1784144398.9101639,
       "newer_granted_while_older_pending": false,
       "newer_priority": 0,
       "no_overtaking_passed": true,
       "older_arrived_first": true,
-      "older_created_at": 1784142097.6074188,
+      "older_created_at": 1784144398.9091861,
       "older_priority": 10,
       "older_waiter_state": "PENDING",
       "pending_predecessor_bypass_injected": false,
@@ -288,7 +288,7 @@
     "entrypoint_path": "benchmarks/omd_scheduler_m1.py",
     "entrypoint_sha256": "3443423ea3b21636f53a703e334b61e4678afcfb136c31760b1bbab416aa96c4",
     "exit_code": 0,
-    "git_head": "be8043a2994d3acf187c821d8ffbfc71d2ad3cf8",
+    "git_head": "987a6e24c7ce90853af451405f252fc797ca8dcb",
     "path": "benchmarks/produce_scheduler_m1_receipt.py",
     "real_code_path": true,
     "scenario_entrypoint": "benchmarks.omd_scheduler_m1:run_ooptdd",
@@ -339,8 +339,8 @@
         {
           "charged": true,
           "firsts": {
-            "orbit_pending": 1784142097635958,
-            "orbit_requested": 1784142097633954
+            "orbit_pending": 1784144398942044,
+            "orbit_requested": 1784144398937382
           },
           "grounding": "derived-self",
           "kind": "must_order",
@@ -417,12 +417,12 @@
       },
       "holder_state": "HELD",
       "newer_claim_state": "PENDING",
-      "newer_created_at": 1784142097.633717,
+      "newer_created_at": 1784144398.937133,
       "newer_granted_while_older_pending": false,
       "newer_priority": 0,
       "no_overtaking_passed": true,
       "older_arrived_first": true,
-      "older_created_at": 1784142097.632885,
+      "older_created_at": 1784144398.9363258,
       "older_priority": 10,
       "older_waiter_state": "PENDING",
       "pending_predecessor_bypass_injected": false,
@@ -443,9 +443,9 @@
     "candidate_index_path": "omd_server/candidate_index.py",
     "candidate_index_sha256": "c28351aca323a5abe8f34f895a7a02087e7e68f1eb851fdf6ba8ca9134d9c85a",
     "core_path": "omd_server/core.py",
-    "core_sha256": "89878983e7a7852f4d003cdde173385f5c5f05efe11e713bd9ffc7470f2b7778",
+    "core_sha256": "28fd42fa885129894151fde3fb94709f62379f0b35cfcf5cea618464172e5199",
     "disjoint_path": "omd_server/disjoint.py",
     "disjoint_sha256": "30ee08801dfe6a1b52e738cca493e6497c1949062bd62e98b5963106323fa79b",
-    "git_head_before_evidence_commit": "be8043a2994d3acf187c821d8ffbfc71d2ad3cf8"
+    "git_head_before_evidence_commit": "987a6e24c7ce90853af451405f252fc797ca8dcb"
   }
 }
