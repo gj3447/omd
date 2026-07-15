@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "omd"
+abstract: "OMD (Orbital Motion Droplet) — runtime coordinator for N parallel coding agents on one git repository, preventing merge conflicts in advance via server-authoritative disjoint write-set leases and git-worktree isolation."
+authors:
+  - family-names: "Ra"
+    given-names: "Gyeongjun"
+    alias: "gj3447"
+    affiliation: "Independent Researcher"
+repository-code: "https://github.com/gj3447/omd"
+license: Apache-2.0
+date-released: "2026-07-15"
+keywords:
+  - agent-harness
+  - loop-engineering
+  - metahumotonic
