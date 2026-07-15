@@ -174,10 +174,11 @@
       "file": "omd_server/core.py",
       "symbol": "_connect_phase_a",
       "kind": "function",
-      "line_hint": 1200,
-      "sha256": "98e3a769da0b85a9",
+      "line_hint": 2912,
+      "sha256": "d904964e33b02d94",
       "layer": "domain-policy",
-      "frege_sinn": "split-phase Phase A(임계구역): fence 재검증+merge_token 획득+intent 영속+pin+→CONNECTING"
+      "frege_sinn": "split-phase Phase A(임계구역): fence 재검증+attempt/owner generation+merge_token+idempotency envelope를 동일 세대로 결속하고 pin+→CONNECTING",
+      "note": "[re-baseline 2026-07-15: multi-Coordinator split-effect attempt fencing parameters added]"
     },
     {
       "sourceId": "core._connect_phase_b",

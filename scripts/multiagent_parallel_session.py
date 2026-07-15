@@ -74,6 +74,7 @@ def run_session(n_agents: int = 4) -> dict:
     developed = list(mods)
 
     # ── 2) 겹치는 5번째 에이전트 — 이 시점 svc_a 궤도는 아직 HELD(connect 전) → OMD 가 직렬화(PENDING) ──
+    omd.declare("overlap", writes=[f"{mods[0]}/impl.py"])
     overlap = omd.claim("ag-overlap", [f"{mods[0]}/impl.py"], task_id="overlap")
 
     # ── 3) N 에이전트가 *동시* connect → 실 git merge, merge_token 직렬화 ──

@@ -5,9 +5,11 @@ The runtime now enforces conflicting PENDING predecessor order with durable
 queue tickets, shared initial/promotion decisions, reservation-cycle safety,
 original-TTL promotion, exact request replay conflict checks and typed semantic
 decision projection. Finite deadlines and sweep/restart timeout delivery are
-implemented; default autonomous delivery, cancellation, overload/aging,
-candidate indexing, notification outbox and the prepared Connect pipeline
-remain implementation fronts. Do not describe this branch as the complete
+implemented. Task cancellation atomically terminalizes associated PENDING/HELD
+admission rows and repairs legacy orphans on restart. Default autonomous
+delivery, a standalone admission-wait cancel API, overload/aging, candidate
+indexing, notification outbox and the prepared Connect pipeline remain
+implementation fronts. Do not describe this branch as the complete
 durable waiter, an optimized scheduler, a production rollout or a scientific
 progress result. The governing `L_IDE` lifecycle is documented in
 [`OMD_SCHEDULER_DEVELOPMENT_HARNESS_20260715.md`](./OMD_SCHEDULER_DEVELOPMENT_HARNESS_20260715.md).
@@ -334,7 +336,22 @@ Implemented fairness slice:
 - policy-denial retry advances the durable request generation, while terminal
   replay cannot create another generation-zero admission effect;
 - split-phase Connect and barrier effects reserve the exact idempotency
-  envelope until their unlocked phase completes or is safely cleared;
+  envelope until their unlocked phase completes or is safely cleared. A
+  deterministically ordered DB- and repo-scoped process/file effect locks
+  (inherited by Git/check children) cover
+  reservation through finalization, while task/token/idempotency rows carry one
+  immutable attempt id and monotonic owner generation for Phase-C/recovery CAS;
+- subprocess crash cuts verify same-repo/different-DB exclusion and prove that
+  an inherited child descriptor keeps both domains fenced after parent death;
+  Git common-directory identity also collapses main/linked-worktree aliases;
+- merge tokens are internal-only and cannot pass through public `release`, and
+  a persisted `CONNECTING` generation cannot be overwritten by either direct
+  or barrier Connect before recovery resolves it;
+- a live second Coordinator cannot recover that attempt. Once the effect lock
+  proves the old process tree is gone, repo-bound recovery requires exact
+  attempt-trailer plus merge-SHA readback; DB-only execution remains explicit;
+- task cancel invalidates stale claim replay, and barrier trip revalidates its
+  generation and `TRIPPING` state before every effect and final success;
 - the unchanged frozen gate is green normally, RED under a test-only pure
   predecessor bypass, and green again after restoration.
 
@@ -342,13 +359,14 @@ The materialized M1 receipt is `arrived` evidence from one in-memory
 producer/readback backend. It explicitly records no separate oracle and awaits
 independent judgment; it is not promoted to `external_verdict`.
 
-Still open before full M1: default autonomous wait-deadline delivery, PENDING
-cancellation, capacity/overload, saturating aging, notification outbox,
+Still open before full M1: default autonomous wait-deadline delivery, standalone
+PENDING cancellation, capacity/overload, saturating aging, notification outbox,
 candidate-index soundness, explicit non-denial request-generation rollover,
 semantic binding for the remaining maintenance events, independent judgment
 and finalization. The current exact full scan is sound but is not an implemented
-candidate index. Connect now reserves its transport envelope across the split
-effect, but the prepared `ConnectAttempt`/protected-ref pipeline remains open.
+candidate index. The existing Connect path now has process-tree effect fencing,
+durable attempt generations and exact Git proof, but the prepared
+`ConnectAttempt`/expected-old protected-ref pipeline remains open.
 
 ### M2 — effect split
 
@@ -488,8 +506,10 @@ python3 "$LOOP_VALIDATOR" \
 
 ```bash
 : "${SYMPOSIUM_ROOT:?set SYMPOSIUM_ROOT to the SYMPOSIUM checkout}"
-OOPTDD_LOOP_BIN="${OOPTDD_LOOP_BIN:-$SYMPOSIUM_ROOT/PI/ooptdd-loop/.venv/bin/ooptdd-loop}"
-test -x "$OOPTDD_LOOP_BIN"
+OOPTDD_LOOP_ROOT="${OOPTDD_LOOP_ROOT:-$(cd "$SYMPOSIUM_ROOT/.." && pwd)/ooptdd-loop}"
+test -f "$OOPTDD_LOOP_ROOT/ooptdd_loop/cli.py"
+export PYTHONPATH="$OOPTDD_LOOP_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+OOPTDD_LOOP=(.venv/bin/python -m ooptdd_loop.cli)
 python3 - <<'PY'
 import hashlib
 from pathlib import Path
@@ -499,16 +519,20 @@ actual = hashlib.sha256(Path("gates/scheduler_fairness.yaml").read_bytes()).hexd
 print(actual)
 raise SystemExit(actual != expected)
 PY
-"$OOPTDD_LOOP_BIN" \
+"${OOPTDD_LOOP[@]}" \
   validate-spec spec/omd_scheduler_m0_ooptdd.yaml --json
-"$OOPTDD_LOOP_BIN" \
+"${OOPTDD_LOOP[@]}" \
   validate-spec spec/omd_scheduler_m1_ooptdd.yaml --json
+"${OOPTDD_LOOP[@]}" \
+  run spec/omd_scheduler_m1_ooptdd.yaml --json
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
   -p no:cacheprovider \
   tests/test_scheduler_m0_harness.py \
   tests/test_scheduler_m1_admission.py \
   tests/test_scheduler_admission_conformance.py \
-  tests/test_d9_idempotency.py
+  tests/test_d9_idempotency.py \
+  tests/test_m1_connect_process_fencing.py \
+  tests/test_m1_connect_effect_process.py
 .venv/bin/python -m benchmarks.produce_scheduler_m1_receipt \
   --gate gates/scheduler_fairness.yaml \
   --cid omd-scheduler-m1-newer \
@@ -516,6 +540,19 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
   --receipt-output evidence/omd_scheduler_m1/ooptdd_receipt.json
 .venv/bin/python "$SYMPOSIUM_ROOT/SKILLS/ooptdd-receipt/scripts/validate_receipt.py" \
   evidence/omd_scheduler_m1/ooptdd_receipt.json --verify-linked --root .
+.venv/bin/python - <<'PY'
+import hashlib, json
+from pathlib import Path
+
+run = json.loads(Path("evidence/omd_scheduler_m1/ooptdd_run.json").read_text())
+receipt = json.loads(Path("evidence/omd_scheduler_m1/ooptdd_receipt.json").read_text())
+subject = run["subject"]
+assert receipt["subject_binding"] == subject
+for name in ("admission", "core"):
+    path = Path(subject[f"{name}_path"])
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == subject[f"{name}_sha256"]
+print("M1 subject binding: OK")
+PY
 git diff --check
 ```
 
@@ -549,7 +586,8 @@ SHA-256 is
 - Admission decisions, including due `WAIT_TIMEOUT`, are bound to current
   runtime code. Default autonomous deadline delivery, cancellation, overload,
   aging, outbox and the remaining maintenance-event semantic bindings remain
-  open, and the prepared Connect pipeline is still contract-only.
+  open; task-bound `CANCEL`/`RELEASE` projection is implemented, but a standalone
+  wait-cancel API is not. The prepared Connect pipeline is still contract-only.
 - M0's measured numbers and LakatoTree `partial` verdict describe reproducible
   evidence machinery only. They do not establish a fairness fix, throughput
   improvement, near-linear scaling, optimality or novel discovery.

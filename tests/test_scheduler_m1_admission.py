@@ -336,6 +336,152 @@ def test_begin_preflight_sees_pending_predecessor_without_partial_held(tmp_path)
     omd.close()
 
 
+def test_task_cancel_terminalizes_pending_orbit_before_blocker_release(tmp_path):
+    omd = Coordinator(str(tmp_path / "omd.db"), agent_ttl=None)
+    holder = omd.claim("holder", ["src/**"])
+    omd.declare("cancel-pending", writes=["src/a.py"])
+    waiting = omd.claim(
+        "waiter",
+        ["src/a.py"],
+        task_id="cancel-pending",
+        request_id="cancel-pending-claim",
+    )
+    assert waiting["state"] == "PENDING"
+
+    cancelled = omd.cancel("cancel-pending", reason="superseded")
+    assert cancelled["ok"] is True
+    row = omd.store.get_orbit(waiting["orbit_id"])
+    assert row["state"] == "DENIED"
+    assert row["decision_type"] == "CANCEL"
+    assert row["terminal_reason"] == "task_cancelled"
+
+    omd.release(holder["orbit_id"], "holder", holder["fence"])
+    assert omd.store.get_orbit(waiting["orbit_id"])["state"] == "DENIED"
+    omd.close()
+
+
+def test_task_cancel_releases_held_orbit_and_promotes_waiter(tmp_path):
+    omd = Coordinator(str(tmp_path / "omd.db"), agent_ttl=None)
+    omd.declare("cancel-held", writes=["src/a.py"])
+    held = omd.claim("owner", ["src/a.py"], task_id="cancel-held")
+    waiting = omd.claim("next", ["src/a.py"])
+    assert held["state"] == "HELD"
+    assert waiting["state"] == "PENDING"
+
+    cancelled = omd.cancel("cancel-held", reason="lease-only work complete")
+    assert cancelled["ok"] is True
+    held_row = omd.store.get_orbit(held["orbit_id"])
+    waiting_row = omd.store.get_orbit(waiting["orbit_id"])
+    assert held_row["state"] == "RELEASED"
+    assert held_row["decision_type"] == "RELEASE"
+    assert held_row["terminal_reason"] == "task_cancelled"
+    assert waiting_row["state"] == "HELD"
+    omd.close()
+
+
+def test_cancelled_task_rejects_new_and_exact_claim_replay_before_fence_exposure(tmp_path):
+    omd = Coordinator(str(tmp_path / "omd.db"), agent_ttl=None)
+    omd.declare("cancelled", writes=["src/a.py"])
+    held = omd.claim(
+        "owner", ["src/a.py"], task_id="cancelled", request_id="claim-once"
+    )
+    assert held["state"] == "HELD"
+    assert omd.store.get_idem("claim-once")["status"] == "DONE"
+
+    omd.cancel("cancelled", reason="superseded")
+    assert omd.store.get_task("cancelled")["state"] == "ABORTED"
+    assert omd.store.get_idem("claim-once") is None
+    fence_before = omd.store.current_fence()
+    seq_before = omd.store.current_seq()
+    orbit_count = len(omd.store.orbits_for_task("cancelled"))
+
+    exact = omd.claim(
+        "owner", ["src/a.py"], task_id="cancelled", request_id="claim-once"
+    )
+    fresh = omd.claim(
+        "owner", ["src/a.py"], task_id="cancelled", request_id="claim-new"
+    )
+    for rejected in (exact, fresh):
+        assert rejected["ok"] is False
+        assert rejected["state"] == "REJECTED"
+        assert rejected["reason"] == "task_not_admission_eligible"
+        assert rejected["task_state"] == "ABORTED"
+        assert rejected.get("fence") is None
+    assert omd.store.current_fence() == fence_before
+    assert omd.store.current_seq() == seq_before
+    assert len(omd.store.orbits_for_task("cancelled")) == orbit_count
+    assert omd.store.get_orbit(held["orbit_id"])["state"] == "RELEASED"
+    omd.close()
+
+
+def test_task_bound_claim_requires_existing_task_and_rejects_merged_task(tmp_path):
+    omd = Coordinator(str(tmp_path / "omd.db"), agent_ttl=None)
+    missing = omd.claim(
+        "owner", ["missing/**"], task_id="missing", request_id="missing-claim"
+    )
+    assert missing == {
+        "ok": False,
+        "state": "REJECTED",
+        "reason": "no such task",
+        "task_id": "missing",
+    }
+    assert omd.store.get_idem("missing-claim") is None
+    assert omd.store.orbits_for_task("missing") == []
+
+    omd.declare("merged", writes=["src/m.py"])
+    omd.next_task("owner")
+    held = omd.claim(
+        "owner", ["src/m.py"], task_id="merged", request_id="merged-claim"
+    )
+    omd.start("merged", "owner")
+    omd.finish("merged")
+    connected = omd.connect("merged")
+    assert connected["ok"] is True
+    assert omd.store.get_task("merged")["state"] == "MERGED"
+
+    fence_before = omd.store.current_fence()
+    seq_before = omd.store.current_seq()
+    orbit_count = len(omd.store.orbits_for_task("merged"))
+    exact = omd.claim(
+        "owner", ["src/m.py"], task_id="merged", request_id="merged-claim"
+    )
+    fresh = omd.claim(
+        "owner", ["src/m.py"], task_id="merged", request_id="merged-claim-new"
+    )
+    for rejected in (exact, fresh):
+        assert rejected["ok"] is False
+        assert rejected["reason"] == "task_not_admission_eligible"
+        assert rejected["task_state"] == "MERGED"
+        assert rejected.get("fence") is None
+    assert omd.store.current_fence() == fence_before
+    assert omd.store.current_seq() == seq_before
+    assert len(omd.store.orbits_for_task("merged")) == orbit_count
+    assert omd.store.get_orbit(held["orbit_id"])["state"] == "RELEASED"
+    omd.close()
+
+
+def test_restart_repairs_legacy_aborted_task_with_live_pending_orbit(tmp_path):
+    db = tmp_path / "omd.db"
+    first = Coordinator(str(db), agent_ttl=None)
+    holder = first.claim("holder", ["src/**"])
+    first.declare("legacy-cancelled", writes=["src/a.py"])
+    waiting = first.claim("waiter", ["src/a.py"], task_id="legacy-cancelled")
+    assert waiting["state"] == "PENDING"
+    with first.store.tx():
+        first.store.set_task("legacy-cancelled", state="ABORTED")
+    first.resign()
+    first.close()
+
+    reopened = Coordinator(str(db), agent_ttl=None)
+    repaired = reopened.store.get_orbit(waiting["orbit_id"])
+    assert repaired["state"] == "DENIED"
+    assert repaired["decision_type"] == "CANCEL"
+    assert repaired["terminal_reason"] == "task_cancelled"
+    reopened.release(holder["orbit_id"], "holder", holder["fence"])
+    assert reopened.store.get_orbit(waiting["orbit_id"])["state"] == "DENIED"
+    reopened.close()
+
+
 def test_frozen_m1_gate_hash_is_unchanged():
     gate = ROOT / "gates" / "scheduler_fairness.yaml"
     assert hashlib.sha256(gate.read_bytes()).hexdigest() == FROZEN_GATE_SHA256

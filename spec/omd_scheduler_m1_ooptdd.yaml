@@ -29,6 +29,11 @@ contracts:
     description: >
       A conflicting lower-ranked request cannot enter HELD while an older or
       higher-ranked conflicting PENDING predecessor remains live.
+    status: accepted
+    source_req: REQ-M1-NO-OVERTAKING
+    invariant: >
+      not (higher_ranked_conflicting_predecessor_pending and
+      candidate_state == HELD)
 
 requirements:
   - id: REQ-M1-NO-OVERTAKING

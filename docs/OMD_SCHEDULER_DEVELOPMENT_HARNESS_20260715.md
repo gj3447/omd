@@ -6,9 +6,12 @@ kernel, persist durable `queue_seq` and original TTL, prevent conflicting
 PENDING overtaking, reject reservation-edge cycles, and bind canonical typed
 decision payloads to the semantic admission FSM before projecting legacy Orbit
 state. Finite deadlines and sweep/restart `WAIT_TIMEOUT` delivery are now in
-the slice. Default autonomous deadline delivery, wait cancellation, queue
-capacity/aging, notification outbox, candidate indexing, the prepared Connect
-pipeline, and protected-ref control plane remain unimplemented. Do not
+the slice. Cancelling a task now atomically maps its associated PENDING row to
+semantic `CANCEL` and its HELD row to semantic `RELEASE`, with restart repair
+for legacy orphan rows. Default autonomous deadline delivery, a standalone
+admission-wait cancel API, queue capacity/aging, notification outbox, candidate
+indexing, the prepared Connect pipeline, and protected-ref control plane remain
+unimplemented. Do not
 describe this slice as the complete durable waiter, an optimized scheduler, a
 production rollout, or a scientific progress result.
 
@@ -284,7 +287,7 @@ A same-tree but wrong-commit readback is not success.
 | `LEASE_HELD` | The request is `HELD` with current owner, full fence set, bail epoch, expiry and write-set digest |
 | `SUSPEND_RELEASING` | Editing is stopped; admission remains `HELD` only until the bound release effect is acknowledged |
 | `SUSPENDED` | L_IDE `lease_status` is `pending`, `released`, or `lost`; `lost` is a local discriminator, not an admission state. Admission readback is `PENDING` or an authoritative FSM-valid non-`HELD` outcome such as `RELEASED`, `EXPIRED`, `DENIED`, `CANCELLED`, or `TIMED_OUT`; a fresh request and generation are required |
-| Cycle finalization | The edit lease is `RELEASED` or otherwise terminal and read back; a lease-only OMD task is canceled after release |
+| Cycle finalization | The edit lease is `RELEASED` or otherwise terminal and read back; a lease-only OMD coordination task row is canceled after release as harness cleanup, not as admission-wait cancellation |
 
 Initial admission and later promotion must use the same compatibility,
 predecessor, rank, cycle and capacity contract.
@@ -400,8 +403,28 @@ trace, and the queue-order part of item 8:
   durable request generation, while exact completed claim replay cannot create
   a second generation-zero effect;
 - split-phase Connect and barrier trips reserve their exact request envelope
-  across unlocked effects, then complete or clear it with an envelope-matching
-  compare-and-set;
+  across unlocked effects. Deterministically ordered DB- and repo-scoped
+  process/file effect locks span
+  reservation, Phase A/B/C and response finalization; Git/check children inherit
+  its descriptor. Task, merge-token and idempotency rows bind the same immutable
+  attempt id, process instance and monotonic owner generation, and Phase C
+  compare-and-sets that full authority tuple before release or finalization;
+- real subprocess crash-cut tests prove that the repo domain serializes two
+  database authorities (including main/linked-worktree aliases via Git common
+  directory) and that inherited Git/checker descriptors keep both locks held
+  after the Coordinator parent is killed;
+- public `release` is restricted to path orbits: internal merge tokens cannot
+  be released through the lease API, and an unresolved `CONNECTING` generation
+  is non-reentrant for both direct and barrier-driven Connect;
+- recovery can take over only after acquiring that effect lock. Repo-bound
+  success additionally requires the recorded merge SHA to match the exact
+  attempt trailer read back from the integration branch; explicit DB-only mode
+  permits `merge_sha=null`. A second live Coordinator therefore skips recovery
+  rather than stealing a peer's CONNECTING state, token, pin or INFLIGHT row;
+- a task-bound claim checks task admission eligibility before transport-cache or
+  live-orbit replay, so cancel/merge cannot replay an old HELD fence. Barrier
+  trip checks its generation and `TRIPPING` state before every member effect and
+  final success, preventing a concurrent abort from yielding `ok:true/BROKEN`;
 - `benchmarks/produce_scheduler_m1_receipt.py` runs the unchanged frozen gate
   as positive, a test-only pure-kernel predecessor bypass as RED, and the
   restored runtime as green. The bypass is not a Coordinator/MCP/CLI option;
@@ -418,11 +441,17 @@ This does **not** close evidence item 6. New PENDING rows persist a finite,
 typed `wait_deadline`, and sweep/restart reconciliation delivers the semantic
 timeout transition. The default Coordinator is still inline-only unless
 periodic sweep is explicitly enabled, and cancellation plus overload remain
-absent, so autonomous bounded resolution is not yet established. Item 9 has no
+absent as standalone admission operations, so autonomous bounded resolution is
+not yet established. Task cancellation does terminalize its own PENDING/HELD
+rows. Item 9 has no
 candidate index to prove yet (the runtime uses the sound full exact scan).
 Policy-denial generation rollover is implemented; explicit non-denial rollover
-and maintenance events `RENEW`, `RELEASE`, cancellation and reclaim are not yet
-routed through the semantic reducer.
+and public maintenance events `RENEW`, `RELEASE`, standalone wait cancellation
+and reclaim are not yet routed through the semantic reducer. The task-bound
+cancel path is the narrow exception: it projects `CANCEL`/`RELEASE` before
+legacy mutation. The attempt fencing above hardens the existing Connect
+implementation; it does not implement the prepared
+`ConnectAttempt`/expected-old protected-ref publication pipeline.
 
 ## 11. Evidence, judgment and landing chain
 
@@ -491,8 +520,10 @@ python3 "$LOOP_VALIDATOR" \
 
 ```bash
 : "${SYMPOSIUM_ROOT:?set SYMPOSIUM_ROOT to the SYMPOSIUM checkout}"
-OOPTDD_LOOP_BIN="${OOPTDD_LOOP_BIN:-$SYMPOSIUM_ROOT/PI/ooptdd-loop/.venv/bin/ooptdd-loop}"
-test -x "$OOPTDD_LOOP_BIN"
+OOPTDD_LOOP_ROOT="${OOPTDD_LOOP_ROOT:-$(cd "$SYMPOSIUM_ROOT/.." && pwd)/ooptdd-loop}"
+test -f "$OOPTDD_LOOP_ROOT/ooptdd_loop/cli.py"
+export PYTHONPATH="$OOPTDD_LOOP_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+OOPTDD_LOOP=(.venv/bin/python -m ooptdd_loop.cli)
 python3 - <<'PY'
 import hashlib
 from pathlib import Path
@@ -502,16 +533,20 @@ actual = hashlib.sha256(Path("gates/scheduler_fairness.yaml").read_bytes()).hexd
 print(actual)
 raise SystemExit(actual != expected)
 PY
-"$OOPTDD_LOOP_BIN" \
+"${OOPTDD_LOOP[@]}" \
   validate-spec spec/omd_scheduler_m0_ooptdd.yaml --json
-"$OOPTDD_LOOP_BIN" \
+"${OOPTDD_LOOP[@]}" \
   validate-spec spec/omd_scheduler_m1_ooptdd.yaml --json
+"${OOPTDD_LOOP[@]}" \
+  run spec/omd_scheduler_m1_ooptdd.yaml --json
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
   -p no:cacheprovider \
   tests/test_scheduler_m0_harness.py \
   tests/test_scheduler_m1_admission.py \
   tests/test_scheduler_admission_conformance.py \
-  tests/test_d9_idempotency.py
+  tests/test_d9_idempotency.py \
+  tests/test_m1_connect_process_fencing.py \
+  tests/test_m1_connect_effect_process.py
 .venv/bin/python -m benchmarks.produce_scheduler_m1_receipt \
   --gate gates/scheduler_fairness.yaml \
   --cid omd-scheduler-m1-newer \
@@ -519,6 +554,19 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
   --receipt-output evidence/omd_scheduler_m1/ooptdd_receipt.json
 .venv/bin/python "$SYMPOSIUM_ROOT/SKILLS/ooptdd-receipt/scripts/validate_receipt.py" \
   evidence/omd_scheduler_m1/ooptdd_receipt.json --verify-linked --root .
+.venv/bin/python - <<'PY'
+import hashlib, json
+from pathlib import Path
+
+run = json.loads(Path("evidence/omd_scheduler_m1/ooptdd_run.json").read_text())
+receipt = json.loads(Path("evidence/omd_scheduler_m1/ooptdd_receipt.json").read_text())
+subject = run["subject"]
+assert receipt["subject_binding"] == subject
+for name in ("admission", "core"):
+    path = Path(subject[f"{name}_path"])
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == subject[f"{name}_sha256"]
+print("M1 subject binding: OK")
+PY
 git diff --check
 ```
 
@@ -555,11 +603,13 @@ slice is ready to commit only when:
 - `git diff --check` is green and the diff is limited to the declared OMD
   write-set;
 - the branch is committed and published intentionally, then the OMD edit orbit
-  is released and the lease-only coordination task is canceled/read back.
+  is released and the lease-only coordination task row is canceled/read back as
+  harness cleanup. This is not a standalone PENDING admission-cancel API,
+  although task cancellation now terminalizes admission rows bound to that task.
 
 Landing those files makes the **M1 fairness implementation slice** durable. It
 does not make full M1 or the development cycle `CLOSED`: default autonomous
-deadline delivery, cancellation/overload/aging, candidate-index soundness,
+deadline delivery, standalone cancellation/overload/aging, candidate-index soundness,
 maintenance-event reducer binding, an independent scripted progress judgment
 and finalization receipts remain future work.
 
@@ -577,8 +627,9 @@ and finalization receipts remain future work.
    Individual schema validators are necessary but insufficient.
 4. Production admission/grant/queue/promotion/denial and due-timeout decisions
    are bound to the JSON semantic reducer. Default autonomous timeout delivery,
-   cancellation, overload, aging, notification outbox and maintenance-event
-   binding remain the open M1 front.
+   standalone wait cancellation, overload, aging, notification outbox and the
+   remaining maintenance-event bindings remain the open M1 front. Task-bound
+   `CANCEL`/`RELEASE` projection is implemented.
 5. The prepared candidate, expected-old ref CAS, independent ref reader and
    finalization protocol are contracts, not the current runtime path.
 6. The connect loop is a conservative `loop-contract/v1` runner aggregate over

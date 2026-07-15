@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS orbits (
   merging INTEGER NOT NULL DEFAULT 0,  -- 1=connect Phase B 진행중 pin(sweep/reclaim skip, §E)
   merge_deadline REAL,                 -- pin 유계(§E): 이 시각 넘으면 abort 대상
   merge_started_mono REAL,             -- merge_token crash-safe(§D11): dangling merge abort 판정
+  operation_id TEXT,                   -- split effect attempt bound to a merge_token
+  owner_instance TEXT,                 -- process generation that owns the effect
+  owner_generation INTEGER,            -- monotonic task-local connect generation
   intent_key TEXT,                     -- 증분5(§D9): claim 자연 멱등 — hash(agent,paths,mode,task)
   -- M1 fair admission: created_at은 migration 입력일 뿐 ordering authority가 아니다.
   queue_seq INTEGER,                    -- 전역 단조 입장 티켓(priority DESC, queue_seq ASC)
@@ -69,6 +72,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   connect_intent_at REAL,       -- intent 영속 타임스탬프(복구가 CONNECTING 식별)
   branch_tip_sha TEXT,          -- merge 직전 task 브랜치 tip(복구 trailer-probe 보조)
   integration_base_sha TEXT,    -- Q11 후보 merge 전 통합 HEAD(rollback proof/recovery 기준)
+  connect_attempt_id TEXT,      -- exact external-effect generation (never reused)
+  connect_owner_instance TEXT,  -- Coordinator process instance, not PID/coordinator label
+  connect_owner_generation INTEGER NOT NULL DEFAULT 0,
+  connect_token_id TEXT,        -- exact merge_token for this attempt
+  connect_request_id TEXT,      -- exact split idempotency envelope, if public connect
+  connect_arg_hash TEXT,
+  connect_repo_bound INTEGER NOT NULL DEFAULT 0,
   merge_sha TEXT,               -- 응결된 merge 커밋(MERGED 증거, P0-6: release 전에 기록)
   merged_at REAL,
   -- 증분9(§D12): consumer 가 자기 read-set 을 마지막으로 통합과 동기화한 generation. claim(read)
@@ -134,7 +144,8 @@ CREATE INDEX IF NOT EXISTS idx_sem_waiters_sem ON sem_waiters(sem_id, state);
 CREATE TABLE IF NOT EXISTS idempotency (
   request_id TEXT PRIMARY KEY, agent_id TEXT, verb TEXT, arg_hash TEXT,
   args_json TEXT, status TEXT NOT NULL, response TEXT,
-  created_at REAL, completed_at REAL
+  created_at REAL, completed_at REAL,
+  operation_id TEXT, owner_instance TEXT, owner_generation INTEGER
 );
 -- 증분8(§D5): 응결 랑데부 배리어. 세대(generation) 스탬프 + BROKEN 종단. 멤버십은 agent 수가
 -- 아니라 **task 집합**(reclaim 으로 task 가 requeue 되면 N 재계산). 참가자 사망(도착 전/후)·
@@ -165,12 +176,22 @@ _MIGRATIONS = [
     ("orbits", "merging", "INTEGER NOT NULL DEFAULT 0"),
     ("orbits", "merge_deadline", "REAL"),
     ("orbits", "merge_started_mono", "REAL"),
+    ("orbits", "operation_id", "TEXT"),
+    ("orbits", "owner_instance", "TEXT"),
+    ("orbits", "owner_generation", "INTEGER"),
     ("tasks", "connect_fence", "INTEGER"),
     ("tasks", "connect_intent_at", "REAL"),
     ("tasks", "branch_tip_sha", "TEXT"),
     ("tasks", "integration_base_sha", "TEXT"),
     ("tasks", "merge_sha", "TEXT"),
     ("tasks", "merged_at", "REAL"),
+    ("tasks", "connect_attempt_id", "TEXT"),
+    ("tasks", "connect_owner_instance", "TEXT"),
+    ("tasks", "connect_owner_generation", "INTEGER NOT NULL DEFAULT 0"),
+    ("tasks", "connect_token_id", "TEXT"),
+    ("tasks", "connect_request_id", "TEXT"),
+    ("tasks", "connect_arg_hash", "TEXT"),
+    ("tasks", "connect_repo_bound", "INTEGER NOT NULL DEFAULT 0"),
     # 증분5(§D6/§D9)
     ("agents", "bail_epoch", "INTEGER NOT NULL DEFAULT 0"),
     ("orbits", "intent_key", "TEXT"),
@@ -191,6 +212,9 @@ _MIGRATIONS = [
     ("orbits", "wait_deadline", "REAL"),
     ("orbits", "terminal_reason", "TEXT"),
     ("idempotency", "args_json", "TEXT"),
+    ("idempotency", "operation_id", "TEXT"),
+    ("idempotency", "owner_instance", "TEXT"),
+    ("idempotency", "owner_generation", "INTEGER"),
     # 증분6(§D3 flags): EPHEMERAL/LATCH 분리 + wait register→poll.
     ("flags", "flag_type", "TEXT NOT NULL DEFAULT 'LATCH'"),
     ("flags", "epoch", "INTEGER NOT NULL DEFAULT 0"),
@@ -248,6 +272,16 @@ class Store:
                 cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
                 if col not in cols:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            # The additive column defaults old rows to DB-only.  Recover the
+            # durable mode for legacy Git attempts from fields that only a
+            # repo-bound connect populated; otherwise a repo-less restart could
+            # misclassify a committed external effect as a safe DB rollback.
+            self.db.execute(
+                "UPDATE tasks SET connect_repo_bound=1 "
+                "WHERE state IN ('CONNECTING','MERGED') AND connect_repo_bound=0 "
+                "AND (integration_base_sha IS NOT NULL OR branch_tip_sha IS NOT NULL "
+                "OR merge_sha IS NOT NULL OR worktree IS NOT NULL OR branch IS NOT NULL)"
+            )
             max_ticket = self.db.execute(
                 "SELECT MAX(queue_seq) AS n FROM orbits "
                 "WHERE kind='orbit' AND queue_seq IS NOT NULL"
@@ -294,9 +328,11 @@ class Store:
                 "WHERE kind='orbit' AND queue_seq IS NOT NULL"
             )
             # Older M1 snapshots constrained only live rows and could therefore
-            # leave multiple terminal generation-zero histories.  Preserve the
-            # live authority row when present, then deterministically renumber
-            # duplicate history before upgrading to the global uniqueness rule.
+            # leave multiple terminal generation-zero histories.  Within one
+            # duplicated generation, preserve the oldest terminal history and
+            # move later history -- with any current live authority last -- to
+            # fresh generations.  This keeps latest_orbit_by_request() pointed at
+            # HELD/PENDING rather than letting migrated history shadow it.
             duplicate_generations = self.db.execute(
                 "SELECT request_id,request_generation FROM orbits "
                 "WHERE kind='orbit' AND request_id IS NOT NULL "
@@ -306,10 +342,17 @@ class Store:
             for duplicate in duplicate_generations:
                 request_id = duplicate["request_id"]
                 generation = duplicate["request_generation"]
+                # A successful claim cache embeds request_generation in its
+                # response.  Renumbering would make that response stale, while
+                # the durable orbit can reconstruct the exact replay safely.
+                self.db.execute(
+                    "DELETE FROM idempotency WHERE request_id=? AND verb='claim'",
+                    (request_id,),
+                )
                 rows = self.db.execute(
                     "SELECT orbit_id,state,created_at FROM orbits "
                     "WHERE kind='orbit' AND request_id=? AND request_generation=? "
-                    "ORDER BY CASE WHEN state IN ('PENDING','HELD') THEN 0 ELSE 1 END, "
+                    "ORDER BY CASE WHEN state IN ('PENDING','HELD') THEN 1 ELSE 0 END, "
                     "created_at ASC, orbit_id ASC",
                     (request_id, generation),
                 ).fetchall()
@@ -531,6 +574,7 @@ class Store:
 
     def set_orbit(self, oid, *, state=..., expires_at=..., released_at=..., fence=...,
                   merging=..., merge_deadline=..., merge_started_mono=...,
+                  operation_id=..., owner_instance=..., owner_generation=...,
                   read_gen=..., stale=..., authority_snapshot_hash=...,
                   decision_id=..., decision_type=..., blocker_ids=...,
                   enqueued_at=..., wait_deadline=..., terminal_reason=...):
@@ -539,6 +583,9 @@ class Store:
                          ("released_at", released_at), ("fence", fence),
                          ("merging", merging), ("merge_deadline", merge_deadline),
                          ("merge_started_mono", merge_started_mono),
+                         ("operation_id", operation_id),
+                         ("owner_instance", owner_instance),
+                         ("owner_generation", owner_generation),
                          ("read_gen", read_gen), ("stale", stale),
                          ("authority_snapshot_hash", authority_snapshot_hash),
                          ("decision_id", decision_id),
@@ -602,6 +649,10 @@ class Store:
     def set_task(self, task_id, *, state=..., agent_id=..., worktree=..., branch=...,
                  connect_fence=..., connect_intent_at=..., branch_tip_sha=...,
                  integration_base_sha=..., merge_sha=..., merged_at=...,
+                 connect_attempt_id=..., connect_owner_instance=...,
+                 connect_owner_generation=..., connect_token_id=...,
+                 connect_request_id=..., connect_arg_hash=...,
+                 connect_repo_bound=...,
                  read_synced_gen=...):
         sets, args = [], []
         for col, val in (("state", state), ("agent_id", agent_id),
@@ -610,6 +661,13 @@ class Store:
                          ("connect_intent_at", connect_intent_at),
                          ("branch_tip_sha", branch_tip_sha),
                          ("integration_base_sha", integration_base_sha),
+                         ("connect_attempt_id", connect_attempt_id),
+                         ("connect_owner_instance", connect_owner_instance),
+                         ("connect_owner_generation", connect_owner_generation),
+                         ("connect_token_id", connect_token_id),
+                         ("connect_request_id", connect_request_id),
+                         ("connect_arg_hash", connect_arg_hash),
+                         ("connect_repo_bound", connect_repo_bound),
                          ("merge_sha", merge_sha), ("merged_at", merged_at),
                          ("read_synced_gen", read_synced_gen)):
             if val is not ...:
@@ -745,6 +803,60 @@ class Store:
         )
         return cur.rowcount == 1
 
+    def bind_idem_operation_exact(self, request_id, agent_id, verb, arg_hash, *,
+                                  operation_id, owner_instance,
+                                  owner_generation) -> bool:
+        """Bind an INFLIGHT request to one exact split-effect generation."""
+        cur = self.db.execute(
+            "UPDATE idempotency SET operation_id=?,owner_instance=?,owner_generation=? "
+            "WHERE request_id=? AND agent_id IS ? AND verb=? AND arg_hash=? "
+            "AND status='INFLIGHT' AND operation_id IS NULL",
+            (operation_id, owner_instance, owner_generation, request_id, agent_id,
+             verb, arg_hash),
+        )
+        return cur.rowcount == 1
+
+    def takeover_idem_operation_exact(self, request_id, agent_id, verb, arg_hash, *,
+                                      operation_id, previous_owner,
+                                      previous_generation, owner_instance,
+                                      owner_generation) -> bool:
+        """Recovery CAS for the exact durable operation envelope."""
+        cur = self.db.execute(
+            "UPDATE idempotency SET owner_instance=?,owner_generation=? "
+            "WHERE request_id=? AND agent_id IS ? AND verb=? AND arg_hash=? "
+            "AND status='INFLIGHT' AND operation_id=? "
+            "AND owner_instance IS ? AND owner_generation IS ?",
+            (owner_instance, owner_generation, request_id, agent_id, verb, arg_hash,
+             operation_id, previous_owner, previous_generation),
+        )
+        return cur.rowcount == 1
+
+    def mark_idem_retryable_exact(self, request_id, agent_id, verb, arg_hash) -> bool:
+        """Preserve a recovered request envelope while allowing its exact retry.
+
+        Split-phase recovery uses RETRYABLE only after the authoritative state
+        proves that the effect did not commit.  Keeping the row (rather than
+        deleting it) prevents another envelope from stealing the request id.
+        """
+        cur = self.db.execute(
+            "UPDATE idempotency SET status='RETRYABLE', response=NULL, "
+            "completed_at=NULL WHERE request_id=? AND agent_id IS ? AND verb=? "
+            "AND arg_hash=? AND status='INFLIGHT'",
+            (request_id, agent_id, verb, arg_hash),
+        )
+        return cur.rowcount == 1
+
+    def reopen_idem_exact(self, request_id, agent_id, verb, arg_hash) -> bool:
+        """Atomically reclaim an exact RETRYABLE envelope for a new attempt."""
+        cur = self.db.execute(
+            "UPDATE idempotency SET status='INFLIGHT', created_at=?, response=NULL, "
+            "completed_at=NULL,operation_id=NULL,owner_instance=NULL,owner_generation=NULL "
+            "WHERE request_id=? AND agent_id IS ? AND verb=? "
+            "AND arg_hash=? AND status='RETRYABLE'",
+            (time.time(), request_id, agent_id, verb, arg_hash),
+        )
+        return cur.rowcount == 1
+
     def clear_idem(self, request_id):
         """비성공(DENIED/stale-fence/fenced_out) — INFLIGHT 흔적 제거 → 세상이 바뀌면 재시도 가능."""
         self.db.execute("DELETE FROM idempotency WHERE request_id=?", (request_id,))
@@ -757,11 +869,6 @@ class Store:
             (request_id, agent_id, verb, arg_hash),
         )
         return cur.rowcount == 1
-
-    def clear_inflight_idem(self) -> int:
-        """Clear abandoned split-phase reservations after leader recovery."""
-        cur = self.db.execute("DELETE FROM idempotency WHERE status='INFLIGHT'")
-        return cur.rowcount
 
     def inflight_idem(self) -> list[dict]:
         return _rows(self.db.execute(

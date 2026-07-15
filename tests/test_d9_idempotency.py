@@ -8,6 +8,8 @@ MCP 는 at-least-once: 서버는 성공했는데 응답이 유실되면 클라�
 §3.C: 성공만 캐시(DENIED/stale-fence 는 재시도 가능해야) + dedup 재생을 owner/fence 가 감싼다.
 """
 
+import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -165,6 +167,111 @@ def test_promoted_then_released_request_cannot_repeat_generation_zero(tmp_path):
     assert conflict["reason"] == "idempotency_conflict"
 
 
+def test_partial_index_upgrade_renumbers_history_and_keeps_live_request_latest(tmp_path):
+    """An older live-only index may leave terminal and live generation-zero rows."""
+    db_path = tmp_path / "omd.db"
+    old = Coordinator(db_path=str(db_path), agent_ttl=None)
+    first = old.claim(
+        "waiter", ["a/**"], ttl=60, request_id="pre-migration-first"
+    )
+    old.release(first["orbit_id"], "waiter", first["fence"])
+    second = old.claim(
+        "waiter", ["a/**"], ttl=60, request_id="pre-migration-second"
+    )
+    old.release(second["orbit_id"], "waiter", second["fence"])
+    live = old.claim(
+        "waiter", ["a/**"], ttl=60, request_id="pre-migration-live"
+    )
+    old.resign()
+    old.close()
+    old.store.db.close()
+
+    # Recreate the exact authority shape accepted by the earlier partial index:
+    # terminal history may reuse generation zero, while at most one live row does.
+    with sqlite3.connect(db_path) as legacy:
+        legacy.execute("DROP INDEX uq_orbits_request_generation")
+        legacy.executemany(
+            "UPDATE orbits SET request_id='legacy-reused', "
+            "request_generation=0, created_at=? WHERE orbit_id=?",
+            [
+                (10.0, first["orbit_id"]),
+                (20.0, second["orbit_id"]),
+                (30.0, live["orbit_id"]),
+            ],
+        )
+        legacy.execute(
+            "CREATE UNIQUE INDEX uq_orbits_request_generation "
+            "ON orbits(request_id,request_generation) "
+            "WHERE kind='orbit' AND request_id IS NOT NULL "
+            "AND state IN ('HELD','PENDING')"
+        )
+        cached = legacy.execute(
+            "SELECT response FROM idempotency WHERE request_id=?",
+            ("pre-migration-live",),
+        ).fetchone()
+        stale_response = json.loads(cached[0])
+        stale_response["request_id"] = "legacy-reused"
+        legacy.execute(
+            "UPDATE idempotency SET request_id='legacy-reused', response=? "
+            "WHERE request_id='pre-migration-live'",
+            (json.dumps(stale_response),),
+        )
+
+    migrated = Coordinator(db_path=str(db_path), agent_ttl=None)
+    rows = migrated.store.db.execute(
+        "SELECT orbit_id,request_generation,state,decision_id,decision_type "
+        "FROM orbits WHERE request_id='legacy-reused' "
+        "ORDER BY request_generation"
+    ).fetchall()
+    assert [
+        (row["orbit_id"], row["request_generation"], row["state"])
+        for row in rows
+    ] == [
+        (first["orbit_id"], 0, "RELEASED"),
+        (second["orbit_id"], 1, "RELEASED"),
+        (live["orbit_id"], 2, "HELD"),
+    ]
+    assert rows[0]["decision_id"] is not None
+    assert rows[0]["decision_type"] == "ADMISSION_GRANTED"
+    assert all(row["decision_id"] is None for row in rows[1:])
+    assert all(row["decision_type"] == "MIGRATION_RENUMBERED" for row in rows[1:])
+
+    latest = migrated.store.latest_orbit_by_request("legacy-reused")
+    assert latest["orbit_id"] == live["orbit_id"]
+    assert latest["request_generation"] == 2
+    assert migrated.store.get_idem("legacy-reused") is None
+    replay = migrated.claim(
+        "waiter", ["a/**"], ttl=60, request_id="legacy-reused"
+    )
+    assert replay["dedup"] is True
+    assert replay["orbit_id"] == live["orbit_id"]
+    assert replay["request_generation"] == 2
+    assert replay["state"] == "HELD"
+
+    index_sql = migrated.store.db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='uq_orbits_request_generation'"
+    ).fetchone()["sql"]
+    assert "state IN" not in index_sql
+
+    migrated.resign()
+    migrated.close()
+    migrated.store.db.close()
+    reopened = Coordinator(db_path=str(db_path), agent_ttl=None)
+    assert [
+        (row["orbit_id"], row["request_generation"])
+        for row in reopened.store.db.execute(
+            "SELECT orbit_id,request_generation FROM orbits "
+            "WHERE request_id='legacy-reused' ORDER BY request_generation"
+        ).fetchall()
+    ] == [
+        (first["orbit_id"], 0),
+        (second["orbit_id"], 1),
+        (live["orbit_id"], 2),
+    ]
+    reopened.close()
+
+
 def test_timed_out_request_replays_terminal_generation_zero(tmp_path):
     omd = Coordinator(db_path=str(tmp_path / "omd.db"), agent_ttl=None)
     holder = omd.claim("holder", ["a/**"])
@@ -200,6 +307,7 @@ def test_timed_out_request_replays_terminal_generation_zero(tmp_path):
 def test_claim_semantic_dedup_without_request_id(tmp_path):
     """request_id 없어도(또는 달라도) 같은 의도(agent,paths,mode,task)면 기존 궤도 반환 — intent_key."""
     omd = Coordinator(db_path=str(tmp_path / "omd.db"))
+    omd.declare("T", writes=["a/**"])
     r1 = omd.claim("agA", ["a/**"], "write", task_id="T")
     r2 = omd.claim("agA", ["a/**"], "write", task_id="T")   # request_id 없음 — 의미적 멱등
     assert r1["orbit_id"] == r2["orbit_id"] and r2.get("dedup")
@@ -280,6 +388,20 @@ def _develop(omd, task, subdir, fname, content):
     (Path(s["worktree"]) / subdir / fname).write_text(content)
     omd.commit(task, f"feat: {subdir}/{fname}")
     omd.finish(task)
+
+
+def _ready_db_task(omd, task, subdir):
+    """Prepare a DB-only DONE task with a live write fence."""
+    omd.declare(task, writes=[f"{subdir}/**"])
+    omd.next_task(f"ag{task}")
+    claim = omd.claim(f"ag{task}", [f"{subdir}/**"], task_id=task)
+    omd.start(task, f"ag{task}")
+    omd.finish(task)
+    return claim["fence"]
+
+
+class _CrashCut(RuntimeError):
+    pass
 
 
 def test_connect_retry_no_double_merge(tmp_path):
@@ -369,11 +491,11 @@ def test_barrier_trip_reserves_request_envelope_across_split_phase(tmp_path):
     real_connect_one = omd._barrier_connect_one
     result = {}
 
-    def blocked_connect_one(task_id, expected_fence):
+    def blocked_connect_one(task_id, expected_fence, **trip_guard):
         if not entered.is_set():
             entered.set()
             assert proceed.wait(5)
-        return real_connect_one(task_id, expected_fence)
+        return real_connect_one(task_id, expected_fence, **trip_guard)
 
     omd._barrier_connect_one = blocked_connect_one
 
@@ -402,6 +524,212 @@ def test_barrier_trip_reserves_request_envelope_across_split_phase(tmp_path):
         "rv", "agB", "B", request_id="barrier-split"
     )
     assert replay["state"] == "TRIPPED" and replay["replayed"]
+
+
+def test_restart_finishes_connect_idem_after_effect_committed(tmp_path, monkeypatch):
+    """Phase C committed + response-cache cut replays the original envelope."""
+    db_path = tmp_path / "omd.db"
+    omd = Coordinator(db_path=str(db_path))
+    _ready_db_task(omd, "A", "a")
+    real_finish = omd.store.finish_idem_exact
+
+    def cut_after_phase_c(request_id, agent_id, verb, arg_hash, response):
+        if verb == "connect":
+            raise _CrashCut("cut after MERGED before idempotency DONE")
+        return real_finish(request_id, agent_id, verb, arg_hash, response)
+
+    monkeypatch.setattr(omd.store, "finish_idem_exact", cut_after_phase_c)
+    with pytest.raises(_CrashCut):
+        omd.connect("A", request_id="connect-committed-cut")
+
+    row = omd.store.get_idem("connect-committed-cut")
+    assert omd.store.get_task("A")["state"] == "MERGED"
+    assert row["status"] == "INFLIGHT"
+    assert row["args_json"] is not None
+    omd.resign()
+    omd.close()
+    omd.store.db.close()
+
+    recovered = Coordinator(db_path=str(db_path))
+    assert recovered.store.get_idem("connect-committed-cut")["status"] == "DONE"
+    replay = recovered.connect("A", request_id="connect-committed-cut")
+    assert replay["state"] == "MERGED"
+    assert replay["recovered"] is True and replay["replayed"] is True
+    conflict = recovered.connect(
+        "A", push="different", request_id="connect-committed-cut"
+    )
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "idempotency_conflict"
+
+
+def test_restart_preserves_uncommitted_connect_envelope_for_exact_retry(
+    tmp_path, monkeypatch
+):
+    """A proven non-effect becomes RETRYABLE without releasing request identity."""
+    db_path = tmp_path / "omd.db"
+    omd = Coordinator(db_path=str(db_path))
+    _ready_db_task(omd, "A", "a")
+
+    def cut_before_phase_a(*_args, **_kwargs):
+        raise _CrashCut("cut before connect effect")
+
+    monkeypatch.setattr(omd, "_connect_phase_a", cut_before_phase_a)
+    with pytest.raises(_CrashCut):
+        omd.connect("A", request_id="connect-uncommitted-cut")
+    assert omd.store.get_task("A")["state"] == "DONE"
+    assert omd.store.get_idem("connect-uncommitted-cut")["status"] == "INFLIGHT"
+    omd.resign()
+    omd.close()
+    omd.store.db.close()
+
+    recovered = Coordinator(db_path=str(db_path))
+    row = recovered.store.get_idem("connect-uncommitted-cut")
+    assert row["status"] == "RETRYABLE"
+    conflict = recovered.connect(
+        "A", push="different", request_id="connect-uncommitted-cut"
+    )
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "idempotency_conflict"
+    exact = recovered.connect("A", request_id="connect-uncommitted-cut")
+    assert exact["state"] == "MERGED"
+    assert recovered.store.get_idem("connect-uncommitted-cut")["status"] == "DONE"
+
+
+def test_barrier_trip_exception_is_terminal_and_replays_broken(
+    tmp_path, monkeypatch
+):
+    """An in-process trip exception cannot poison DONE with stale TRIPPING."""
+    db_path = tmp_path / "omd.db"
+    omd = Coordinator(db_path=str(db_path))
+    fa = _ready_db_task(omd, "A", "a")
+    fb = _ready_db_task(omd, "B", "b")
+    omd.barrier_declare("rv", ["A", "B"])
+    omd.barrier_arrive("rv", "agA", "A", fence=fa)
+
+    def fail_trip(*_args, **_kwargs):
+        raise _CrashCut("trip implementation failed")
+
+    monkeypatch.setattr(omd, "_barrier_connect_one", fail_trip)
+    with pytest.raises(_CrashCut):
+        omd.barrier_arrive(
+            "rv", "agB", "B", fence=fb, request_id="barrier-exception"
+        )
+
+    assert omd.store.barrier_by_name("rv")["state"] == "BROKEN"
+    assert omd.store.get_idem("barrier-exception")["status"] == "DONE"
+    exact = omd.barrier_arrive(
+        "rv", "agB", "B", fence=fb, request_id="barrier-exception"
+    )
+    assert exact["ok"] is False and exact["state"] == "BROKEN"
+    assert exact["replayed"] is True
+    conflict = omd.barrier_arrive(
+        "rv", "agB", "B", fence=fb + 1, request_id="barrier-exception"
+    )
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "idempotency_conflict"
+    omd.resign()
+    omd.close()
+    omd.store.db.close()
+
+    recovered = Coordinator(db_path=str(db_path))
+    replay = recovered.barrier_arrive(
+        "rv", "agB", "B", fence=fb, request_id="barrier-exception"
+    )
+    assert replay["ok"] is False and replay["state"] == "BROKEN"
+    assert replay["replayed"] is True
+
+
+def test_restart_finalizes_inflight_barrier_after_full_trip_cut(
+    tmp_path, monkeypatch
+):
+    """All effects committed + TRIPPED/cache cut is reconstructed on restart."""
+    db_path = tmp_path / "omd.db"
+    omd = Coordinator(db_path=str(db_path))
+    fa = _ready_db_task(omd, "A", "a")
+    fb = _ready_db_task(omd, "B", "b")
+    omd.barrier_declare("rv", ["A", "B"])
+    omd.barrier_arrive("rv", "agA", "A", fence=fa)
+    real_set_barrier = omd.store.set_barrier
+
+    def cut_before_terminal_marker(barrier_id, **kwargs):
+        if kwargs.get("state") == "TRIPPED":
+            raise _CrashCut("cut before TRIPPED marker")
+        return real_set_barrier(barrier_id, **kwargs)
+
+    monkeypatch.setattr(omd.store, "set_barrier", cut_before_terminal_marker)
+    with pytest.raises(_CrashCut):
+        omd.barrier_arrive(
+            "rv", "agB", "B", fence=fb, request_id="barrier-full-cut"
+        )
+
+    assert omd.store.barrier_by_name("rv")["state"] == "TRIPPING"
+    assert all(omd.store.get_task(t)["state"] == "MERGED" for t in ("A", "B"))
+    row = omd.store.get_idem("barrier-full-cut")
+    assert row["status"] == "INFLIGHT" and row["args_json"] is not None
+    omd.resign()
+    omd.close()
+    omd.store.db.close()
+
+    recovered = Coordinator(db_path=str(db_path))
+    assert recovered.store.barrier_by_name("rv")["state"] == "TRIPPED"
+    assert recovered.store.get_idem("barrier-full-cut")["status"] == "DONE"
+    replay = recovered.barrier_arrive(
+        "rv", "agB", "B", fence=fb, request_id="barrier-full-cut"
+    )
+    assert replay["state"] == "TRIPPED"
+    assert replay["recovered"] is True and replay["replayed"] is True
+    conflict = recovered.barrier_arrive(
+        "rv", "agB", "B", fence=fb + 1, request_id="barrier-full-cut"
+    )
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "idempotency_conflict"
+
+
+def test_restart_keeps_mismatched_barrier_envelope_inflight_fail_closed(tmp_path):
+    """Terminal state alone cannot authorize a request bound to the wrong party."""
+    db_path = tmp_path / "omd.db"
+    omd = Coordinator(db_path=str(db_path))
+    fa = _ready_db_task(omd, "A", "a")
+    fb = _ready_db_task(omd, "B", "b")
+    omd.barrier_declare("rv", ["A", "B"])
+    omd.barrier_arrive("rv", "agA", "A", fence=fa)
+    bad_args = ["rv", "B", fb, None]
+
+    # Persist the same state a process cut would leave, but corrupt the request
+    # owner.  Recovery may terminalize the barrier, never this envelope.
+    with omd._cs():
+        barrier = omd.store.barrier_by_name("rv")
+        omd.store.set_barrier_party(
+            barrier["barrier_id"], barrier["generation"], "B",
+            arrived=1, arrive_fence=fb, agent_id="agB",
+        )
+        plan = omd._barrier_eval(barrier["barrier_id"], can_trip=True)
+        omd.store.begin_idem(
+            "barrier-owner-mismatch", "intruder", "barrier_arrive",
+            omd._arg_hash("barrier_arrive", bad_args), bad_args,
+        )
+    for step in plan:
+        assert omd._barrier_connect_one(
+            step["task_id"], step["expected_fence"]
+        )["ok"] is True
+    assert omd.store.barrier_by_name("rv")["state"] == "TRIPPING"
+    omd.resign()
+    omd.close()
+    omd.store.db.close()
+
+    recovered = Coordinator(db_path=str(db_path))
+    assert recovered.store.barrier_by_name("rv")["state"] == "TRIPPED"
+    assert recovered.store.get_idem("barrier-owner-mismatch")["status"] == "INFLIGHT"
+    retry = recovered.barrier_arrive(
+        "rv", "intruder", "B", fence=fb,
+        request_id="barrier-owner-mismatch",
+    )
+    assert retry["ok"] is False and retry["reason"] == "request_inflight"
+    rightful = recovered.barrier_arrive(
+        "rv", "agB", "B", fence=fb, request_id="barrier-owner-mismatch"
+    )
+    assert rightful["ok"] is False
+    assert rightful["reason"] == "idempotency_conflict"
 
 
 def test_connect_already_merged_semantic_idempotent(tmp_path):
