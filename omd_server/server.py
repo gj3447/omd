@@ -65,6 +65,7 @@ except ImportError:  # 서버 extra 미설치
 
 
 DEFAULT_SERVER_SWEEP_INTERVAL = 1.0
+DEFAULT_SERVER_ADMISSION_QUEUE_CAPACITY = 1024
 
 
 def _parse_server_sweep_interval(raw: str | None) -> float | None:
@@ -80,6 +81,23 @@ def _parse_server_sweep_interval(raw: str | None) -> float | None:
     if not math.isfinite(interval) or interval < 0:
         raise ValueError("OMD_SWEEP_INTERVAL must be 0 or a positive finite number")
     return interval or None
+
+
+def _parse_admission_queue_capacity(raw: str | None) -> int:
+    """Parse a bounded repository wait capacity before opening the DB."""
+    if raw is None or not raw.strip():
+        return DEFAULT_SERVER_ADMISSION_QUEUE_CAPACITY
+    try:
+        capacity = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "OMD_ADMISSION_QUEUE_CAPACITY must be a non-negative integer"
+        ) from exc
+    if capacity < 0:
+        raise ValueError(
+            "OMD_ADMISSION_QUEUE_CAPACITY must be a non-negative integer"
+        )
+    return capacity
 
 
 async def _leader_heartbeat_loop(omd: Coordinator) -> None:
@@ -132,11 +150,19 @@ def build_server(db_path: str = "omd.db"):
     # §D3/D4 백그라운드 sweep: MCP는 기본 1초. 빈 값/미설정도 default, 정확한 0만 opt-out,
     # 양의 finite 값은 override다. 파싱은 Coordinator/DB 생성 전에 fail loud한다.
     _swp = _parse_server_sweep_interval(os.environ.get("OMD_SWEEP_INTERVAL"))
+    _capacity = _parse_admission_queue_capacity(
+        os.environ.get("OMD_ADMISSION_QUEUE_CAPACITY")
+    )
     # Q6 observability: env OMD_EVENT_LOG=<path> 주면 모든 OMD 동사 이벤트를 append-only JSONL
     # 로 durable 기록(OpenObserve/vector 가 tail→ship). 미설정=NOOP(기존동작). fail-soft.
     _evlog = os.environ.get("OMD_EVENT_LOG")
     _events = Emitter(JsonlSink(_evlog)) if _evlog else None
-    omd = Coordinator(db_path, enforce_single_coordinator=False, events=_events)
+    omd = Coordinator(
+        db_path,
+        enforce_single_coordinator=False,
+        events=_events,
+        admission_queue_capacity=_capacity,
+    )
     mcp = FastMCP(
         "omd",
         instructions=OMD_INSTRUCTIONS,

@@ -12,8 +12,10 @@ associated PENDING/HELD admission rows and repairs legacy orphans on restart.
 The MCP server delivers deadlines with a default 1-second lifespan-owned sweep;
 embedded coordinators remain opt-in. Public renew/release, due lease expiry and
 both PENDING/HELD owner-reclaim paths now pass through the typed lifecycle
-reducer before legacy mutation. Overload/aging, candidate
-indexing, notification outbox and the prepared Connect pipeline remain
+reducer before legacy mutation. Repository wait capacity is durable and bounded
+(default 1024; `0` is no-wait); a full queue returns a replayable semantic
+`QUEUE_FULL` receipt without a row, fence or ticket, while disjoint work still
+grants. Saturating aging, candidate indexing, notification outbox and the prepared Connect pipeline remain
 implementation fronts. Do not describe this branch as the complete
 durable waiter, an optimized scheduler, a production rollout or a scientific
 progress result. The governing `L_IDE` lifecycle is documented in
@@ -376,7 +378,7 @@ producer/readback backend. It explicitly records no separate oracle and awaits
 independent judgment; it is not promoted to `external_verdict`.
 
 Still open before full M1: embedded-runtime default wait-deadline delivery,
-capacity/overload, saturating aging, notification outbox,
+saturating aging, notification outbox,
 candidate-index soundness, explicit non-denial request-generation rollover,
 independent judgment and finalization. The current exact full scan is sound but is not an implemented
 candidate index. The existing Connect path now has process-tree effect fencing,
@@ -601,7 +603,8 @@ SHA-256 is
 - Admission decisions and every implemented lifecycle path, including due
   `WAIT_TIMEOUT`, standalone wait `CANCEL`, renew/release, lease expiry and both
   owner-reclaim variants, are bound to current runtime code. MCP deadline
-  delivery is default-on; embedded-runtime default delivery, overload, aging,
+  delivery is default-on; repository capacity and typed overload are bound;
+  embedded-runtime default delivery, aging,
   outbox and candidate-index soundness remain open. Task-bound
   `CANCEL`/`RELEASE` projection is also implemented. The prepared Connect
   pipeline is still contract-only.

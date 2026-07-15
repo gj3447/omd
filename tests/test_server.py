@@ -132,6 +132,30 @@ def test_invalid_server_sweep_interval_fails_before_db_creation(
     assert not db.exists()
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 1024), ("", 1024), ("  ", 1024), ("0", 0), ("1", 1), ("4096", 4096)],
+)
+def test_server_admission_queue_capacity_contract(raw, expected):
+    from omd_server.server import _parse_admission_queue_capacity
+
+    assert _parse_admission_queue_capacity(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "1.5", "nan", "inf", "not-a-number"])
+def test_invalid_server_queue_capacity_fails_before_db_creation(
+    tmp_path, monkeypatch, raw
+):
+    pytest.importorskip("fastmcp")
+    from omd_server.server import build_server
+
+    db = tmp_path / "invalid-capacity.db"
+    monkeypatch.setenv("OMD_ADMISSION_QUEUE_CAPACITY", raw)
+    with pytest.raises(ValueError, match="OMD_ADMISSION_QUEUE_CAPACITY"):
+        build_server(str(db))
+    assert not db.exists()
+
+
 def test_server_lifespan_sweep_delivers_idle_wait_deadline(tmp_path):
     anyio = pytest.importorskip("anyio")
     pytest.importorskip("fastmcp")

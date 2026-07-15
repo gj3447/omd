@@ -12,9 +12,11 @@ mutation. A standalone authenticated wait-cancel operation is available, and
 cancelling a task atomically maps its associated PENDING row to semantic
 `CANCEL` and its HELD row to semantic `RELEASE`, with restart repair for legacy
 orphan rows. The MCP server owns a default autonomous sweep; embedded
-coordinators remain opt-in. Queue capacity/aging, notification outbox,
-candidate indexing, the prepared Connect pipeline, and protected-ref control
-plane remain unimplemented. Do not
+coordinators remain opt-in. The repository queue is now bounded (default 1024,
+operator-pinned per DB), and full queues return a typed, replayable
+`QUEUE_FULL` receipt without allocating an Orbit, fence or queue ticket.
+Saturating aging, notification outbox, candidate indexing, the prepared Connect
+pipeline, and protected-ref control plane remain unimplemented. Do not
 describe this slice as the complete durable waiter, an optimized scheduler, a
 production rollout, or a scientific progress result.
 
@@ -449,7 +451,7 @@ the same in-memory backend, `oracle.separate_source=false`, and the receipt
 remains `AWAITING_INDEPENDENT_JUDGE`. It is execution evidence, not an
 independent scientific judgment.
 
-This does **not** close evidence item 6. New PENDING rows persist a finite,
+The runtime path for evidence item 6 is now implemented. New PENDING rows persist a finite,
 typed `wait_deadline`, and sweep/restart reconciliation delivers the semantic
 timeout transition. A standalone `cancel_wait` operation now authenticates the
 PENDING owner, request generation and bail epoch, projects semantic `CANCELLED`
@@ -458,8 +460,12 @@ to legacy `DENIED`, and reconciles eligible promotion once. Embedded
 enabled. The MCP server starts a 1-second sweep by default inside its lifespan
 (`OMD_SWEEP_INTERVAL=0` is the explicit opt-out), stops and joins it before
 leader handoff, and therefore delivers idle wait deadlines without a foreground
-verb. Capacity/overload is still absent, so the complete bounded admission
-contract is not yet established. Task cancellation also terminalizes its own
+verb. A durable per-repository capacity (default 1024; `0` means no-wait) is
+pinned in DB metadata. Once full, only blocked claims take semantic
+`ADMISSION_REJECTED`; disjoint/compatible grants still proceed. The rejection
+binds depth, capacity and `retry_after_at` in its decision ID, creates no live
+row, and exact request-ID replay returns the same terminal receipt; a later
+attempt uses a fresh request ID. Task cancellation also terminalizes its own
 PENDING/HELD rows.
 Item 9 has no
 candidate index to prove yet (the runtime uses the sound full exact scan).
@@ -627,7 +633,7 @@ slice is ready to commit only when:
 
 Landing those files makes the **M1 fairness implementation slice** durable. It
 does not make full M1 or the development cycle `CLOSED`: embedded-runtime
-default delivery, overload/aging, candidate-index soundness, an independent
+default delivery, saturating aging, candidate-index soundness, an independent
 scripted progress judgment and finalization receipts remain future work.
 
 ## 14. Known limitations and promotion blockers
@@ -645,7 +651,7 @@ scripted progress judgment and finalization receipts remain future work.
 4. Production admission/grant/queue/promotion/denial, due-timeout, standalone
    wait cancellation, renew/release, lease expiry and both owner-reclaim paths
    are bound to the JSON semantic reducer. MCP timeout delivery is autonomous
-   by default; embedded-runtime default delivery, overload, aging, notification
+   by default; embedded-runtime default delivery, aging, notification
    outbox and candidate-index soundness remain the open M1 front. Task-bound
    `CANCEL`/`RELEASE` projection is also implemented.
 5. The prepared candidate, expected-old ref CAS, independent ref reader and

@@ -669,6 +669,17 @@ class Store:
             "SELECT * FROM orbits WHERE state='PENDING' AND kind='orbit' "
             "ORDER BY priority DESC, queue_seq ASC"))
 
+    def pending_queue_stats(self) -> dict:
+        """Repository-authority PENDING depth and earliest automatic relief."""
+        row = self.db.execute(
+            "SELECT COUNT(*) AS depth, MIN(wait_deadline) AS earliest_wait_deadline "
+            "FROM orbits WHERE state='PENDING' AND kind='orbit'"
+        ).fetchone()
+        return {
+            "depth": int(row["depth"] or 0),
+            "earliest_wait_deadline": row["earliest_wait_deadline"],
+        }
+
     def orbits_for_task(self, task_id) -> list[dict]:
         return _rows(self.db.execute(
             "SELECT * FROM orbits WHERE task_id=? AND kind='orbit'", (task_id,)))

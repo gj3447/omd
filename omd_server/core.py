@@ -83,6 +83,10 @@ MERGE_TIMEOUT_S = 120.0
 # 옛 리더의 잔여 변이는 stale leader_epoch 로 차단). 권장: leader heartbeat 주기 = TTL/3.
 LEADER_TTL_S = 30.0
 
+# Repository-authority PENDING rows are bounded by default.  This is an
+# operational default, not a value derived from the scheduler proof contract.
+DEFAULT_ADMISSION_QUEUE_CAPACITY = 1024
+
 # A task-bound orbit is acquired before execution starts.  Later lifecycle
 # states may retain an old claim response, but they are not admission authority.
 TASK_ADMISSION_STATES = frozenset({"PENDING", "BLOCKED", "READY"})
@@ -123,12 +127,13 @@ class CoordinatorConflict(RuntimeError):
 
 class _IdemSlot:
     """멱등 래퍼의 슬롯. hit=캐시 적중(본문 skip), value=동사 본문이 set한 응답."""
-    __slots__ = ("hit", "value", "deferred")
+    __slots__ = ("hit", "value", "deferred", "terminal")
 
     def __init__(self):
         self.hit = False
         self.value = None
         self.deferred = False
+        self.terminal = False
 
     def set(self, value):
         self.value = value
@@ -137,6 +142,12 @@ class _IdemSlot:
     def defer(self):
         """Keep this exact request envelope INFLIGHT across a split phase."""
         self.deferred = True
+
+    def set_terminal(self, value):
+        """Cache a deterministic terminal failure receipt for exact replay."""
+        self.value = value
+        self.terminal = True
+        return value
 
 
 class Coordinator(FlagMixin, SemMixin, BarrierMixin):
@@ -150,6 +161,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                  auto_push: str | None = None,
                  idem_ttl: float | None = 3600.0,
                  admission_wait_timeout: float = 3600.0,
+                 admission_queue_capacity: int = DEFAULT_ADMISSION_QUEUE_CAPACITY,
                  strict_writeset: bool = False,
                  sweep_interval: float | None = None,
                  integration_check=None,
@@ -189,6 +201,12 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             raise ValueError("admission_wait_timeout must be finite and positive") from exc
         if not math.isfinite(admission_wait_timeout) or admission_wait_timeout <= 0:
             raise ValueError("admission_wait_timeout must be finite and positive")
+        if (not isinstance(admission_queue_capacity, int)
+                or isinstance(admission_queue_capacity, bool)
+                or admission_queue_capacity < 0):
+            raise ValueError(
+                "admission_queue_capacity must be a non-negative integer"
+            )
         sweep_interval = _normalize_sweep_interval(sweep_interval)
         # §D14: `:memory:` 디폴트 금지 — 재기동마다 모든 fence/leader_epoch 가 0 으로 리셋되어
         # 낡은 토큰/잔여 merge 와 충돌(고스트 writer). 영속 DB 필수. 단위테스트는 allow_memory_db=
@@ -300,6 +318,39 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 self.store.set_meta("repository_id", repository_id_seed)
                 persisted_repository_id = repository_id_seed
             self.repository_id = persisted_repository_id
+            persisted_capacity = self.store.get_meta("admission_queue_capacity")
+            capacity_policy_error = None
+            capacity_mismatch = False
+            if persisted_capacity is None:
+                self.store.set_meta(
+                    "admission_queue_capacity", admission_queue_capacity
+                )
+            else:
+                try:
+                    durable_capacity = int(persisted_capacity)
+                except (TypeError, ValueError):
+                    capacity_policy_error = (
+                        "durable admission_queue_capacity is not an integer"
+                    )
+                else:
+                    if durable_capacity < 0:
+                        capacity_policy_error = (
+                            "durable admission_queue_capacity is negative"
+                        )
+                    capacity_mismatch = (
+                        durable_capacity != admission_queue_capacity
+                    )
+        if capacity_policy_error or capacity_mismatch:
+            # Queue policy is repository authority, not a per-process hint.
+            # Refuse configuration drift before recovery or any admission work.
+            if self.leader_epoch is not None:
+                self.resign()
+            self.store.db.close()
+            raise ValueError(
+                capacity_policy_error
+                or "admission_queue_capacity conflicts with the durable repository "
+                f"policy ({persisted_capacity})"
+            )
         self.merge_timeout = merge_timeout if merge_timeout is not None else MERGE_TIMEOUT_S
         self.integration_check = integration_check
         self.integration_check_timeout = integration_check_timeout
@@ -316,6 +367,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # sweep and restart reconciliation deliver WAIT_TIMEOUT before promotion.
         # Embedded delivery is opt-in; the MCP server owns a default lifespan sweep.
         self.admission_wait_timeout = admission_wait_timeout
+        self.admission_queue_capacity = admission_queue_capacity
         # P5 strict-writeset: True 면 commit-time 에 write-set 위반 즉시 거부+soft-reset(빠른 fail-loud).
         # 기본 off(connect-time enforce 유지=하위호환). env OMD_STRICT_WRITESET 폴백(정확 truthy 파싱).
         self.strict_writeset = bool(strict_writeset) or (
@@ -1336,7 +1388,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             raise
         if cache.deferred:
             return
-        if cache.value is not None and self._is_success(cache.value):
+        if cache.value is not None and (
+            cache.terminal or self._is_success(cache.value)
+        ):
             if not self.store.finish_idem_exact(
                 request_id, agent_id, verb, arg_hash, cache.value
             ):
@@ -2288,6 +2342,38 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         return self._arg_hash("claim",
                               [agent_id, sorted(pathspec), mode, task_id])
 
+    def _replay_terminal_claim_overload(self, request_id, agent_id, args):
+        """Replay only an exact terminal QUEUE_FULL receipt before task gating.
+
+        Successful claim receipts may contain live fence authority and must keep
+        flowing through the task eligibility checks.  Overload allocates no
+        orbit or fence, so its exact DONE envelope remains safe and authoritative
+        even if the optional task has since become terminal.
+        """
+        if request_id is None:
+            return None
+        prior = self.store.get_idem(request_id)
+        if prior is None or prior["status"] != "DONE":
+            return None
+        if (
+            prior["agent_id"] != agent_id
+            or prior["verb"] != "claim"
+            or prior["arg_hash"] != self._arg_hash("claim", args)
+        ):
+            return None
+        try:
+            response = json.loads(prior["response"])
+        except (TypeError, ValueError):
+            return None
+        if not (
+            isinstance(response, dict)
+            and response.get("state") == "REJECTED"
+            and response.get("code") == "QUEUE_FULL"
+            and response.get("reason") == "queue_full"
+        ):
+            return None
+        return dict(response, replayed=True)
+
     def claim(self, agent_id, pathspec, mode="write", *, ttl=600.0, task_id=None,
               reason="", priority=0, request_id=None, bail_epoch=None):
         if not isinstance(agent_id, str) or not agent_id:
@@ -2313,7 +2399,13 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 "reason": "invalid_admission_request",
                 "detail": str(exc),
             }
+        args = [agent_id, pathspec, mode, task_id, ttl, priority, reason, bail_epoch]
         with self._cs():
+            terminal_overload = self._replay_terminal_claim_overload(
+                request_id, agent_id, args
+            )
+            if terminal_overload is not None:
+                return terminal_overload
             if task_id is not None:
                 task = self.store.get_task(task_id)
                 if task is None:
@@ -2331,7 +2423,6 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                         "task_id": task_id,
                         "task_state": task["state"],
                     }
-            args = [agent_id, pathspec, mode, task_id, ttl, priority, reason, bail_epoch]
             with self._idem(request_id, agent_id, "claim", args) as cache:
                 if cache.hit:
                     return cache.value
@@ -2424,7 +2515,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                            "conflicts": json.loads(dup["blocker_ids"] or "[]"),
                            "decision_id": dup["decision_id"], "dedup": True}
                     return cache.set(out)
-                queue_seq = self.store.next_seq()
+                # Preview the next durable ticket under the same BEGIN IMMEDIATE
+                # transaction.  A terminal overload must not consume a ticket.
+                queue_seq = self.store.current_seq() + 1
                 oid = "orb-" + uuid.uuid4().hex[:12]
                 semantic_request_id = request_id or f"internal:{oid}"
                 decision, snapshot_hash = self._admission_decision(
@@ -2438,6 +2531,76 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     policy_version=ADMISSION_POLICY_VERSION,
                 )
                 if not decision.grantable:
+                    queue_stats = self.store.pending_queue_stats()
+                    queue_depth = queue_stats["depth"]
+                    if queue_depth >= self.admission_queue_capacity:
+                        now = time.time()
+                        retry_after_at = queue_stats["earliest_wait_deadline"]
+                        if retry_after_at is None or retry_after_at <= now:
+                            retry_after_at = now + min(
+                                1.0, self.admission_wait_timeout
+                            )
+                        payload = self._admission_payload(
+                            "ADMISSION_REJECTED",
+                            identity,
+                            snapshot_hash,
+                            reason="queue_full",
+                            queue_depth=queue_depth,
+                            queue_capacity=self.admission_queue_capacity,
+                            retry_after_at=retry_after_at,
+                        )
+                        self._assert_admission_projection(
+                            {**identity, "state": "REQUESTED"},
+                            "ADMISSION_REJECTED",
+                            payload,
+                            snapshot_hash,
+                            None,
+                        )
+                        rejected = {
+                            "ok": False,
+                            "state": "REJECTED",
+                            "reason": "queue_full",
+                            "code": "QUEUE_FULL",
+                            "retry": True,
+                            "retry_requires_new_request_id": request_id is not None,
+                            "retry_after_at": retry_after_at,
+                            "queue_depth": queue_depth,
+                            "queue_capacity": self.admission_queue_capacity,
+                            "repository_id": identity["repository_id"],
+                            "request_id": identity["request_id"],
+                            "request_generation": identity["request_generation"],
+                            "orbit_id": identity["orbit_id"],
+                            "owner_agent": identity["owner_agent"],
+                            "bail_epoch": identity["bail_epoch"],
+                            "mode": identity["mode"],
+                            "pathspec_digest": identity["pathspec_digest"],
+                            "policy_version": identity["policy_version"],
+                            "authority_snapshot_hash": snapshot_hash,
+                            "decision_id": payload["decision_id"],
+                            "actor": payload["actor"],
+                            "event_id": payload["event_id"],
+                        }
+                        self._emit(
+                            "orbit_rejected",
+                            agent_id,
+                            orbit_id=oid,
+                            request_id=semantic_request_id,
+                            request_generation=request_generation,
+                            reason="queue_full",
+                            queue_depth=queue_depth,
+                            queue_capacity=self.admission_queue_capacity,
+                            retry_after_at=retry_after_at,
+                            decision_id=payload["decision_id"],
+                        )
+                        # REJECTED is terminal for this request identity.  A later
+                        # retry uses a fresh request id; exact retries replay this
+                        # byte-equivalent receipt even if capacity has since freed.
+                        return cache.set_terminal(rejected)
+                    committed_seq = self.store.next_seq()
+                    if committed_seq != queue_seq:
+                        raise RuntimeError(
+                            "admission queue ticket changed inside authority transaction"
+                        )
                     enqueued_at = time.time()
                     wait_deadline = enqueued_at + self.admission_wait_timeout
                     payload = self._admission_payload(
@@ -2506,11 +2669,19 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                                       "request_generation": request_generation,
                                       "bail_epoch": effective_bail_epoch,
                                       "state": "PENDING", "queue_seq": queue_seq,
+                                      "wait_deadline": wait_deadline,
+                                      "queue_depth": queue_depth,
+                                      "queue_capacity": self.admission_queue_capacity,
                                       "conflicts": list(decision.blocker_ids),
                                       "held_conflicts": list(decision.held_blockers),
                                       "pending_predecessors": list(
                                           decision.pending_predecessors),
                                       "decision_id": payload["decision_id"]})
+                committed_seq = self.store.next_seq()
+                if committed_seq != queue_seq:
+                    raise RuntimeError(
+                        "admission queue ticket changed inside authority transaction"
+                    )
                 fence = self.store.next_fence()
                 lease_deadline = time.time() + ttl
                 payload = self._admission_payload(
@@ -3955,4 +4126,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
 
     def status(self):
         self.sweep()
-        return self.store.snapshot()
+        snapshot = self.store.snapshot()
+        snapshot["admission_queue"] = {
+            **self.store.pending_queue_stats(),
+            "capacity": self.admission_queue_capacity,
+        }
+        return snapshot

@@ -145,7 +145,7 @@
   "runtime": {
     "ordering": "Authority mutations are serialized per repository. Queue rank is effective_priority descending then queue_seq ascending, evaluated under a recorded policy version and observed time.",
     "concurrency": "Disjoint or mode-compatible requests may become HELD in the same promotion pass and execute concurrently outside the authority transaction.",
-    "backpressure": "Global and per-repository durable queue limits return QUEUE_FULL with retry-after metadata; conflict-domain limits remain advisory until their no-bypass accounting is proved.",
+    "backpressure": "The current one-repository-per-DB authority pins one durable non-negative queue limit (default 1024; zero is no-wait) and returns a typed QUEUE_FULL receipt with retry_after_at metadata. Cross-repository global and conflict-domain limits remain deferred until their no-bypass accounting is proved.",
     "cancellation": "A PENDING owner may cancel with current identity and bail epoch. Cancellation is idempotent and immediately triggers eligible promotion.",
     "timeouts": "Wait and lease deadlines are persisted timestamps. External deadline events carry observed time; no lazy status read is the sole liveness mechanism."
   },
@@ -230,7 +230,7 @@
   ],
   "implementation_slices": [
     "M1a: add metrics and a pure compatibility/rank/blocker decision table without changing production outcomes.",
-    "M1b: persist queue_seq, requested TTL, wait deadline, policy version, cancellation, and capacity; enforce no-overtaking with the locked gate.",
+    "M1b (implemented): persist queue_seq, requested TTL, wait deadline, policy version, cancellation, and repository capacity; enforce no-overtaking with the locked gate and return typed overload without a live row.",
     "M1c: add PENDING reservation edges to cycle detection and restart/property tests.",
     "M2a: add a conservative candidate prefilter and deadline-driven sweep, retaining exact glob verification and full-scan fallback.",
     "M2b: move all Git effects out of the authority transaction before reconsidering RLock or SQLite replacement."
