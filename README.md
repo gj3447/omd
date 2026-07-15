@@ -61,3 +61,63 @@ omd.connect("A", "agA", s["fence"])
 `writes`와 `shared`는 한 task 안에서도 서로소여야 한다. 현재 glob 문법은
 `parent/** EXCEPT parent/hot.py`를 표현하지 않으므로, hot 파일을 shared로 옮길 때는 원래
 exclusive glob도 함께 더 작은 서로소 단위로 재분할한다.
+
+## Field overlap pilot (PROM16 R3)
+
+`python -m omd_server.overlap_pilot` runs an exploratory, read-only measurement
+that keeps three claims separate:
+
+1. cross-task **nominal lease/request windows** overlap;
+2. the temporally intersecting orbit rows have overlapping declared write sets;
+3. two provenance-eligible branch tips conflict in a counterfactual pairwise
+   `git merge-tree` oracle.
+
+Neither (1) nor (2) proves continuous concurrent execution. Claim (3) is not a
+replay of the historical OMD connect base, order, or outcome. It runs for every
+candidate nominal-window pair, including pairs whose declarations are disjoint,
+because non-strict deployments may have changed files outside their declarations.
+
+```bash
+python -m omd_server.overlap_pilot \
+  --db /path/to/omd_coord.db \
+  --created-before 1784075303.5643721 \
+  --scope 'lakatotree=(^lt-|lakatotree)' \
+  --path-root lakatotree=/old/worktree/lakatotree \
+  --git-repo lakatotree=/path/to/lakatotree \
+  --require-complete-oracle
+```
+
+At invocation, the analyzer takes a stable temporary copy of the SQLite base
+file plus WAL, then opens only that copy; it does not let SQLite touch the live
+DB, WAL, or SHM files. A window begins at `created_at`, which is request-row
+creation and can precede the actual grant after a PENDING promotion because OMD
+does not persist `granted_at`. It ends at `released_at`, or at the nominal
+`expires_at` proxy when no release was recorded. The interval can therefore
+include waiting time or overstate an early reclaim; it is not a held-lease trace.
+
+`--created-before` limits row membership but is not an as-of freeze for task
+fields that can later mutate. Task-level branch tips are withheld for multi-agent
+requeues, ambiguous multi-orbit histories, and—under a cutoff—unless a
+single-agent task was durably merged before that cutoff.
+
+The Git oracle creates a temporary bare repository with its own object sink and
+neutral attributes. It reads source objects through alternates but does not load
+the measured repository's config, hooks, attributes override, or custom merge
+drivers. Its safe built-in text-merge result may therefore differ from the
+repository's native custom-merge behavior. Missing tips produce
+`oracle_coverage_status=INCOMPLETE`; Git-oracle errors and ambiguous scope
+assignment exit 2. `--require-complete-oracle` exits 3 unless every scope has
+complete candidate-pair coverage (`--require-measured` remains a compatibility
+alias only).
+
+The report preserves both a canonical decoded-input digest and a measurement
+digest that binds scope regexes, path roots, cutoff/exclusions, evidence and pair
+limits, Git identity/version/object format, oracle policy, and implementation
+and overlap-dependency hashes. The measurement digest covers the full canonical
+report, not only its inputs. Pair/orbit/path-selector budgets fail closed before
+unbounded Cartesian work. Repeat `--path-root` when one logical repository
+appears under several historical clone roots. Pair edges may share task/agent
+groups, so fractions are descriptive only; the field endpoint and metric
+promotion remain explicitly `NOT_ASSESSED`.
+
+From a source checkout, `scripts/omd_overlap_pilot.py` is an equivalent shim.
