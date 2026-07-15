@@ -1,0 +1,137 @@
+{
+  "cases": [
+    {
+      "id": "happy-path",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
+        {"event": "REF_CAS_SUCCEEDED", "guard_results": {"published_tree_matches_receipt": true}, "expected_state": "PUBLISHED", "expected_effects": ["RecordPublished"]},
+        {"event": "FINALIZE_COMMITTED", "guard_results": {}, "expected_state": "FINALIZED", "expected_effects": ["EnqueuePostPublishEffects"]}
+      ]
+    },
+    {
+      "id": "candidate-failed",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_FAILED", "guard_results": {}, "expected_state": "FAILED", "expected_effects": ["RecordFailure"]}
+      ]
+    },
+    {
+      "id": "validation-red",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_RED", "guard_results": {}, "expected_state": "RED", "expected_effects": ["RecordFailure"]}
+      ]
+    },
+    {
+      "id": "validation-failed",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_FAILED", "guard_results": {}, "expected_state": "FAILED", "expected_effects": ["RecordFailure"]}
+      ]
+    },
+    {
+      "id": "receipt-mismatch-rejected",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": false}, "expected_state": "VALIDATING", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "stale-authority-rejected",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": false}, "expected_state": "VALIDATED", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "published-tree-mismatch-rejected",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
+        {"event": "REF_CAS_SUCCEEDED", "guard_results": {"published_tree_matches_receipt": false}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "cas-stale",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
+        {"event": "REF_CAS_STALE", "guard_results": {}, "expected_state": "STALE", "expected_effects": ["RecordStale"]}
+      ]
+    },
+    {
+      "id": "unknown-cas-reconciles-new",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
+        {"event": "REF_CAS_UNKNOWN", "guard_results": {}, "expected_state": "RECONCILING", "expected_effects": ["ReconcileRef"]},
+        {"event": "RECOVER_REF_NEW", "guard_results": {}, "expected_state": "PUBLISHED", "expected_effects": ["RecordPublished"]},
+        {"event": "FINALIZE_COMMITTED", "guard_results": {}, "expected_state": "FINALIZED", "expected_effects": ["EnqueuePostPublishEffects"]}
+      ]
+    },
+    {
+      "id": "unknown-cas-reconciles-old",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
+        {"event": "REF_CAS_UNKNOWN", "guard_results": {}, "expected_state": "RECONCILING", "expected_effects": ["ReconcileRef"]},
+        {"event": "RECOVER_REF_OLD", "guard_results": {}, "expected_state": "VALIDATED", "expected_effects": ["RecordRetry"]}
+      ]
+    },
+    {
+      "id": "unknown-cas-requires-repair",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
+        {"event": "REF_CAS_UNKNOWN", "guard_results": {}, "expected_state": "RECONCILING", "expected_effects": ["ReconcileRef"]},
+        {"event": "RECOVER_REF_OTHER", "guard_results": {}, "expected_state": "NEEDS_REPAIR", "expected_effects": ["RecordFailure"]}
+      ]
+    },
+    {
+      "id": "finalize-failed-after-publish",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
+        {"event": "REF_CAS_SUCCEEDED", "guard_results": {"published_tree_matches_receipt": true}, "expected_state": "PUBLISHED", "expected_effects": ["RecordPublished"]},
+        {"event": "FINALIZE_FAILED", "guard_results": {}, "expected_state": "NEEDS_REPAIR", "expected_effects": ["RecordFailure"]}
+      ]
+    },
+    {"id": "cancel-queued", "machine": "connect_attempt", "steps": [{"event": "CANCEL", "guard_results": {}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancelled"]}]},
+    {"id": "cancel-preparing", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "CANCEL", "guard_results": {}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancelled"]}]},
+    {"id": "cancel-validating", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]}, {"event": "CANCEL", "guard_results": {}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancelled"]}]},
+    {"id": "cancel-validated", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]}, {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]}, {"event": "CANCEL", "guard_results": {}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancelled"]}]},
+    {"id": "invalid-finalize-from-queued", "machine": "connect_attempt", "steps": [{"event": "FINALIZE_COMMITTED", "guard_results": {}, "expected_state": "QUEUED", "expected_effects": ["AuditInvalidTransition"]}]}
+  ]
+}

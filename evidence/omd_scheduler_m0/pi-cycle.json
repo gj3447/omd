@@ -1,0 +1,89 @@
+{
+  "schema_version": "pi-cycle/v1",
+  "template_only": false,
+  "cycle_id": "pi-omd-scheduler-m0-20260715",
+  "mode": "write",
+  "kind": "progress_claim",
+  "runtime_behavior": true,
+  "progress_claim": true,
+  "repo": {
+    "name": "omd",
+    "logical_path": "PI/omd",
+    "resolved_root": "/Users/lagyeongjun/CD/omd",
+    "git_head": "73d0b7a888740554b83cf761b7c1b0945de24ef6",
+    "instructions_read": [
+      "SYMPOSIUM/AGENTS.md",
+      "SYMPOSIUM/PI/AGENTS.md",
+      "SYMPOSIUM/SKILLS/pi-workbench/SKILL.md",
+      "SYMPOSIUM/SKILLS/ooptdd-receipt/SKILL.md",
+      "SYMPOSIUM/SKILLS/lakatotree-judge/SKILL.md"
+    ]
+  },
+  "roles": {
+    "coordinator": "root",
+    "implementer": "codex-omd-scheduler-m0-20260715-root",
+    "judge": "progress_judge.omd_scheduler_m0"
+  },
+  "coordination": {
+    "task_id": "omd-scheduler-m0-evidence-20260715-codex",
+    "agent_id": "codex-omd-scheduler-m0-20260715-root",
+    "writes": [
+      "omd/benchmarks/**",
+      "omd/spec/connect_pipeline_*",
+      "omd/spec/omd_scheduler_m0_ooptdd.yaml",
+      "omd/gates/scheduler_fairness.yaml",
+      "omd/docs/OMD_SCHEDULER_REDESIGN_20260715.md",
+      "omd/tests/test_scheduler_m0_harness.py",
+      "omd/evidence/omd_scheduler_m0/**",
+      "omd/scripts/judge_scheduler_m0.py"
+    ],
+    "claim_status": "HELD",
+    "orbit_id": "orb-da53d4f1b702",
+    "fence": 51,
+    "heartbeat_at": "2026-07-15T13:48:41+09:00",
+    "released": true,
+    "cancelled": true,
+    "additional_orbits": [
+      {
+        "orbit_id": "orb-531cd4fff8ae",
+        "fence": 53,
+        "path": "omd/scripts/judge_scheduler_m0.py",
+        "released": true
+      }
+    ],
+    "terminal_task_state": "ABORTED",
+    "terminal_reason": "lease-only task completed and was cancelled after both write orbits were released"
+  },
+  "finalization_coordination": {
+    "task_id": "omd-scheduler-m0-finalize-20260715-codex",
+    "agent_id": "codex-omd-scheduler-m0-finalizer-20260715-root",
+    "orbit_id": "orb-c1e047da704e",
+    "fence": 54,
+    "path": "omd/evidence/omd_scheduler_m0/pi-cycle.json"
+  },
+  "measurement": {
+    "measurement_type": "replay",
+    "receipt_path": "evidence/omd_scheduler_m0/ooptdd_receipt.json",
+    "receipt_sha256": "1eff60c5f709cdeb0f19d5e98322ddc06ecab0fbf687bb66e474de69d5c0dcda",
+    "evidence_path": "evidence/omd_scheduler_m0/evidence.json",
+    "evidence_sha256": "9fef2cef053b52587b2508e12e1624d50891fccba9e3815268d1f842287278c2",
+    "test_command": "PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m benchmarks.produce_scheduler_m0_receipt --gate evidence/omd_scheduler_m0/m0_measurement_gate.yaml --cid omd-scheduler-m0-ooptdd-fresh --output evidence/omd_scheduler_m0/ooptdd_run.json",
+    "positive_verdict": "green",
+    "negative_verdict": "red"
+  },
+  "judgment": {
+    "packet_path": "evidence/omd_scheduler_m0/judgment-packet.json",
+    "packet_sha256": "834900ded20169fe831478987a2b3a28814409aaa69d5b7e929f41c9a03afb13",
+    "judge_command": "PYTHONPATH=/Users/lagyeongjun/CD/SYMPOSIUM/PI/lakatotree .venv/bin/python scripts/judge_scheduler_m0.py --prereg evidence/omd_scheduler_m0/preregistration.json --evidence evidence/omd_scheduler_m0/evidence.json --replay --judge-id progress_judge.omd_scheduler_m0 --implementer-id codex-omd-scheduler-m0-20260715-root --output /tmp/omd_scheduler_m0_judge-response-attempt2.json",
+    "source": "scripted",
+    "verified_from_receipt": true
+  },
+  "verification": [
+    {
+      "command": "PYTHONDONTWRITEBYTECODE=1 make verify plus the contract and linked-receipt validators enumerated in the structured verification summary",
+      "exit_code": 0,
+      "output_path": "evidence/omd_scheduler_m0/verification-summary.json",
+      "output_sha256": "7f06ea8d499169dd0e46656e2f9402e1a60db671ec28c54082576199ae0406db"
+    }
+  ]
+}

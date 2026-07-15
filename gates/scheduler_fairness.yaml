@@ -1,0 +1,13 @@
+# Preregistered M1 target gate. This is intentionally RED on the M0 baseline.
+# The newer claimant conflicts with an older PENDING reservation and therefore
+# must wait instead of overtaking it.
+cid: omd-scheduler-m1-newer
+service: omd
+expect:
+  - event: orbit_requested
+    op: "=="
+    count: 1
+  - event: orbit_pending
+    op: "=="
+    count: 1
+  - must_order: [orbit_requested, orbit_pending]

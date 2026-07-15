@@ -1,0 +1,153 @@
+{
+  "schema_version": "engine-spec/v1",
+  "name": "omd-connect-pipeline",
+  "purpose": "Own durable connect-attempt admission, exact-candidate validation, and fenced publication without placing Git or checks inside the lease authority's long critical section.",
+  "decision": {
+    "verdict": "engine",
+    "current_consumers": ["Coordinator.connect", "MCP connect adapter", "CLI connect adapter"],
+    "planned_consumers": ["bounded validator workers", "batch connect policy", "speculative prefix train"],
+    "fit_evidence": [
+      "Connect has durable state, fencing, crash recovery, scheduling, and replaceable Git/check adapters.",
+      "The same safety protocol must serve CLI, MCP, and harness callers while policy remains replaceable."
+    ],
+    "alternatives_considered": [
+      "Keep merge, validation, and publication under one repository token",
+      "Replace SQLite before shortening the publication critical section",
+      "Allow multiple writers to update one integration ref"
+    ]
+  },
+  "boundary": {
+    "owns": "ConnectAttempt identity, lifecycle, candidate receipt binding, publish intent, and finalization authority",
+    "mechanism": "Admit immutable attempts, request isolated candidate effects, accept exact-tree validation receipts, and publish with expected-old-SHA compare-and-swap",
+    "policy_outside": [
+      "Task priority scoring",
+      "Validator pool size",
+      "Batch size and speculative window",
+      "Hot-file lane selection",
+      "Rollout and SLO thresholds"
+    ],
+    "non_goals": [
+      "Parallel mutation of one integration ref",
+      "Running Git or operator checks inside a deterministic reducer",
+      "Calling the scheduler globally optimal without an objective and oracle",
+      "Changing Task lifecycle semantics in the M0 evidence slice"
+    ],
+    "state_authority": "SQLite LeaseAuthority is the single writer for attempts and leases; IntegrationPublisher is the sole capability allowed to update a configured integration ref"
+  },
+  "model": {
+    "resources": ["write-set lease", "bounded validation slot", "integration-ref publish capability"],
+    "work_units": ["ConnectAttempt", "immutable Candidate", "ValidationReceipt"]
+  },
+  "state_model": "The versioned ConnectAttempt FSM in spec/connect_pipeline_fsm.json is orthogonal to the existing Task FSM.",
+  "protocol": {
+    "commands": [
+      "SubmitConnect",
+      "CancelAttempt",
+      "AcceptCandidate",
+      "AcceptValidationReceipt",
+      "RequestPublish",
+      "FinalizePublishedAttempt",
+      "ReconcileUnknownPublish"
+    ],
+    "events": [
+      "ConnectQueued",
+      "CandidatePrepared",
+      "ValidationGreen",
+      "ValidationRed",
+      "PublishIntentCommitted",
+      "RefCasSucceeded",
+      "RefCasStale",
+      "PublishReconciled",
+      "ConnectFinalized"
+    ],
+    "effects": [
+      "PrepareCandidate",
+      "RunValidation",
+      "ApplyExpectedOldRefCAS",
+      "PushIntegrationRef",
+      "RemoveWorktree",
+      "EmitTelemetry"
+    ],
+    "versioning": "Attempt, receipt, event, and snapshot envelopes carry schema versions. Breaking identity or replay changes require a new major version and an explicit migration."
+  },
+  "invariants": [
+    "A published ref points to the exact candidate tree named by a green receipt.",
+    "A receipt is reusable only when base SHA, task tip SHA, candidate tree SHA, write-set digest, fence set, and check-policy digest all match.",
+    "Integration ref movement uses a sole publisher capability and expected-old-SHA CAS or an equivalent proved primitive.",
+    "PUBLISH_INTENT is durable before the external ref update is attempted.",
+    "A stale base never reuses a prior green receipt.",
+    "Cancellation and timeout do not abandon an unknown ref-update outcome; reconciliation runs first.",
+    "Exclusive HELD write-sets remain pairwise disjoint."
+  ],
+  "ports": [
+    "AttemptStore",
+    "LeaseAuthority",
+    "CandidateGit",
+    "ValidationRunner",
+    "IntegrationRefPublisher",
+    "Clock",
+    "Outbox",
+    "TelemetrySink"
+  ],
+  "runtime": {
+    "ordering": "Commands are serialized per attempt; ref CAS attempts are serialized per (repo_id, integration_ref).",
+    "concurrency": "Candidate preparation and validation may run concurrently across attempts; final publication remains a short single-ref CAS.",
+    "backpressure": "A bounded durable queue rejects or defers admission with an explicit retry-after reason; no 10 ms authoritative busy polling.",
+    "cancellation": "Cancellation is accepted before publish intent. During publish intent or reconciliation it is recorded as pending and honored after outcome reconciliation.",
+    "timeouts": "Queue, preparation, validation, CAS, reconciliation, and finalization each have typed deadlines and terminal exhaustion states."
+  },
+  "durability": {
+    "persistence": "Persist attempt identity and every accepted transition before exposing it as durable.",
+    "atomic_commit": "Commit dedup claim, attempt state/version, and outbox intent in one SQLite transaction where a transition requests an effect.",
+    "recovery": "If Git ref equals new SHA, repair forward; if it equals expected old SHA, retry from VALIDATED; otherwise enter NEEDS_REPAIR without destructive reset.",
+    "effect_idempotency": "Use attempt_id, effect kind, and attempt generation; same key with different parameters is a conflict.",
+    "migration": "M0 is observation-only. Later slices run legacy and prepared protocols behind a per-repository versioned rollout flag and retain old recovery fixtures."
+  },
+  "failure_model": [
+    "Invalid or stale authority is rejected without Git mutation.",
+    "Candidate or validation red leaves the integration ref unchanged.",
+    "CAS base mismatch produces STALE, not an implicit rebase or receipt reuse.",
+    "Unknown CAS outcome enters reconciliation and is never blindly retried.",
+    "Outbox failures remain observable after publication and do not falsify the published tree."
+  ],
+  "observability": {
+    "traces": [
+      "attempt_id, task_id, repo_id, integration_ref, base_sha, task_tip_sha, candidate_tree_sha, fence set, transition, effect id, and correlation id"
+    ],
+    "metrics": [
+      "queue depth and age",
+      "lock and transaction wait/hold",
+      "candidate and validation duration",
+      "publish-token wait/hold",
+      "CAS stale ratio",
+      "retry and reconciliation counts",
+      "finalization and outbox lag"
+    ],
+    "redaction": "Repository and task identities are bounded labels or trace fields; source content, credentials, and check output are not metric labels."
+  },
+  "security": [
+    "Lease, validation, and publication capabilities are explicit and separately scoped.",
+    "Validator workers cannot mutate the authoritative integration ref.",
+    "Caller-supplied shell strings are not executed; operator-fixed argv and policy digests bind validation."
+  ],
+  "verification": [
+    "Validate the machine-readable engine, FSM, trace, and loop contracts.",
+    "Run real-code positive readback and injected-negative OOPTDD receipts.",
+    "Crash-test every cut point around PUBLISH_INTENT, ref CAS, and FINALIZE.",
+    "Compare M1 and later throughput against isolated-worktree GIT and lease-only baselines."
+  ],
+  "implementation_slices": [
+    "M0: lock contracts, build reproducible probes, and record the current RED fairness and scaling baseline without changing runtime behavior.",
+    "M1: prevent older conflicting PENDING overtaking and replace connect busy polling with a durable queue.",
+    "M2: move Git effects out of coordinator critical sections.",
+    "M3: introduce exact-tree receipts and a short expected-old-SHA publish CAS behind a shadow/canary flag.",
+    "M4: add pairwise-disjoint batch connect, then a bounded adaptive speculative prefix train."
+  ],
+  "falsifiers": [
+    "A landed tree differs from its green receipt tree.",
+    "A stale base publishes without candidate regeneration and revalidation.",
+    "A bounded workload can starve an older conflicting waiter.",
+    "Publish-token p95 still includes operator check time after M3.",
+    "The new path loses throughput or safety against preregistered baselines without an explicit rollback."
+  ]
+}

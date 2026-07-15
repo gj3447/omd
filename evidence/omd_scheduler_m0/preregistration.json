@@ -1,0 +1,101 @@
+{
+  "schema_version": "omd-scheduler-preregistration/v2",
+  "programme": "omd-safe-conflict-aware-scheduler",
+  "branch": "m0-reproducible-evidence",
+  "conjecture": "A fresh locked replay will reproduce the disclosed orbit no-overtaking defect and freeze a descriptive single-Coordinator claim-scaling baseline without claiming a performance improvement.",
+  "registered_at": "2026-07-15T13:35:09+09:00",
+  "registered_before_measurement": true,
+  "study_kind": "preregistered_replication_of_disclosed_exploratory_observation",
+  "prior_observation": {
+    "disclosed": true,
+    "confirmatory_evidence": false,
+    "description": "Earlier exploratory one-run probes observed older-PENDING overtaking and non-scaling claim throughput. They informed this replication and are excluded from its evidence."
+  },
+  "subject": {
+    "repo": "omd",
+    "runtime_git_head": "4402d2b1a33417501edb400d5da8ccd7312fddaa",
+    "runtime_branch": "feat/omd-runtime-guardrails-q10-q11",
+    "runtime_paths_changed_by_m0": false
+  },
+  "prediction": {
+    "metric": "m0_replay_obligations_met",
+    "direction": "higher",
+    "baseline": 0.0,
+    "noise_band": 0.0,
+    "scale_type": "ratio",
+    "required_value": 2.0
+  },
+  "descriptive_only": {
+    "no_overtaking_pass_rate": {
+      "episodes": 10,
+      "expected_on_subject_revision": 0.0
+    },
+    "parallel_efficiency_n8": {
+      "performance_claim": false,
+      "reported_as_baseline_only": true
+    }
+  },
+  "benchmark_contract": {
+    "scenarios": ["fairness", "claims"],
+    "workers": [1, 2, 4, 8],
+    "total_claims_per_episode": 600,
+    "warmup_episodes": 1,
+    "measured_episodes": 10,
+    "agent_ttl": null,
+    "fresh_database_per_episode": true,
+    "disjoint_paths": true,
+    "simultaneous_start_barrier": true,
+    "clock": "time.perf_counter_ns",
+    "quantile_method": "nearest_rank",
+    "efficiency_formula": "throughput_n/(n*throughput_1)",
+    "episode_is_statistical_unit": true
+  },
+  "measurement_entrypoint": {
+    "formal_run_requires_prereg_argument": true,
+    "development_tests_and_pre_registration_probes_are_excluded": true,
+    "command": ".venv/bin/python -m benchmarks.omd_scheduler_m0 --scenarios fairness,claims --workers 1,2,4,8 --claim-operations 600 --fairness-repeats 10 --warmups 1 --repeats 10 --prereg evidence/omd_scheduler_m0/preregistration.json --output evidence/omd_scheduler_m0/evidence.json"
+  },
+  "harness": {
+    "script_path": "benchmarks/omd_scheduler_m0.py",
+    "script_sha256": "3c39d0c6cf57ce9e05b916e2a691aaefebd9f5d080b06d8ec7568345f59bdc15"
+  },
+  "judge": {
+    "script_path": "scripts/judge_scheduler_m0.py",
+    "script_sha256": "04e122e92ec4bf2ae17ed99d76885e8466ebdf4e94ce1bea1e7e0543a3fe6db6",
+    "lakatotree_git_head": "11c2e1a9c42b29d3440b1c21e650a4021c2d590d",
+    "independent_identity_required": true
+  },
+  "ooptdd": {
+    "spec_path": "spec/omd_scheduler_m0_ooptdd.yaml",
+    "spec_sha256": "270424d68f8434fa77b24fc1672a2ee08f8bacdd8c9035da32733947500b05e3",
+    "receipt_producer_path": "benchmarks/produce_scheduler_m0_receipt.py",
+    "receipt_producer_sha256": "691a1ea196f2470040bceff86d62efb2673fe083a1e0c6624af4d434be6ba4ac",
+    "measurement_gate_path": "evidence/omd_scheduler_m0/m0_measurement_gate.yaml",
+    "measurement_gate_sha256": "3f76fd6da11e4c806c052fd6843540d19fdef372a55b9401067f288b762e5c28",
+    "m1_gate_path": "gates/scheduler_fairness.yaml",
+    "m1_gate_sha256": "7e249d738e941c2a56e6d8846ddc2d5b6489c95a0238d5471301c63bea19c4d1",
+    "m1_gate_expected_on_m0": "red"
+  },
+  "non_claims": [
+    "throughput improvement",
+    "linear scaling",
+    "scheduler optimality",
+    "no-overtaking fix",
+    "novel empirical discovery"
+  ],
+  "kill_conditions": [
+    "The real Coordinator does not produce holder=HELD, older broad=PENDING, newer narrow=HELD in every fairness episode.",
+    "Any preregistered worker/repeat cell, raw latency sample, environment fingerprint, command, or hash is absent or non-finite.",
+    "The preregistration, harness, OOPTDD spec, M1 gate, or judge script hash differs from the locked value.",
+    "The evidence contains a verdict field or is not grounded.",
+    "Any M0 output is interpreted as throughput improvement, linear scaling, or global scheduler optimality."
+  ],
+  "suggested_later_promotion_gates": {
+    "low_conflict_full_over_git_throughput_ci_lower": 0.9,
+    "low_conflict_p95_latency_ratio_ci_upper": 1.25,
+    "conflict_heavy_correct_throughput_ratio_ci_lower": 1.2,
+    "conflict_or_manual_retry_reduction_ci_lower": 0.5,
+    "near_linear_n8_efficiency_ci_lower": 0.8,
+    "tested_instance_makespan_over_opt_ci_upper": 1.1
+  }
+}

@@ -1,0 +1,52 @@
+# Locked M0 measurement contract. A green result means the real Coordinator probe
+# reproducibly exposed and recorded the current no-overtaking defect. It is not a
+# claim that the defect has been fixed or that throughput improved.
+name: omd-scheduler-m0-ooptdd
+
+methodology:
+  name: OOPTDD_methodology_v1
+  enforce: true
+
+target:
+  mode: in_process
+  callable: benchmarks.omd_scheduler_m0:run_ooptdd
+  backend: memory
+  root: <REPO>/omd
+
+requirements:
+  - id: REQ-M0-PROBE-COMPLETE
+    kind: feature
+    description: The real Coordinator fairness probe completes and its event arrives under the locked cid.
+    gate:
+      - {event: scheduler_fairness_probe_completed, op: "==", count: 1}
+    longinus:
+      kg_anchor: ref_site:omd:benchmark:scheduler_m0:run_ooptdd
+      source: benchmarks/omd_scheduler_m0.py
+      symbol: run_ooptdd
+      must_emit: scheduler_fairness_probe_completed
+
+  - id: REQ-M0-CURRENT-OVERTAKING-OBSERVED
+    kind: guiding
+    description: >
+      On the locked pre-M1 revision, an older src/** waiter remains PENDING while a
+      newer src/b.py claimant is granted HELD. The harness reports the safety
+      predicate as false; this is a baseline defect receipt, not a green scheduler.
+    gate:
+      - event: scheduler_fairness_probe_completed
+        where:
+          older_waiter_state: PENDING
+          newer_claim_state: HELD
+          no_overtaking_passed: false
+        op: "=="
+        count: 1
+    longinus:
+      kg_anchor: ref_site:omd:benchmark:scheduler_m0:fairness_probe
+      source: benchmarks/omd_scheduler_m0.py
+      symbol: fairness_probe
+      must_emit: scheduler_fairness_probe_completed
+
+future_gate:
+  id: REQ-M1-NO-OVERTAKING
+  path: gates/scheduler_fairness.yaml
+  expected_on_m0: red
+  promotion_rule: Do not edit this gate to fit M1 output; M1 must make the locked gate green.

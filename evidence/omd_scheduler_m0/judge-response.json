@@ -1,0 +1,82 @@
+{
+  "branch": "m0-reproducible-evidence",
+  "engine": {
+    "baseline": 0.0,
+    "baseline_key": "value",
+    "delta": 2.0,
+    "direction": "higher",
+    "improved": true,
+    "measured": 2.0,
+    "metric": "m0_replay_obligations_met",
+    "node_tag": "m0_reproducible_baseline",
+    "source_record": "M0_scheduler_baseline_replication@benchmarks/omd_scheduler_m0.py",
+    "status": "judged",
+    "verdict": "partial"
+  },
+  "executed_at": "2026-07-15T04:55:24.142585+00:00",
+  "inputs": {
+    "evidence_path": "/Users/lagyeongjun/CD/omd/evidence/omd_scheduler_m0/evidence.json",
+    "evidence_sha256": "9fef2cef053b52587b2508e12e1624d50891fccba9e3815268d1f842287278c2",
+    "judge_script_sha256": "04e122e92ec4bf2ae17ed99d76885e8466ebdf4e94ce1bea1e7e0543a3fe6db6",
+    "preregistration_path": "/Users/lagyeongjun/CD/omd/evidence/omd_scheduler_m0/preregistration.json",
+    "preregistration_sha256": "f43aa5ab89b1c1dd08da313fa457eeef48f921c28a497f3fdedf60abee75406e"
+  },
+  "programme": "omd-safe-conflict-aware-scheduler",
+  "recomputed": {
+    "claim_cells": {
+      "1": 10,
+      "2": 10,
+      "4": 10,
+      "8": 10
+    },
+    "claim_matrix_complete": true,
+    "fairness_observations": 10,
+    "fairness_replication_complete": true,
+    "m0_replay_obligations_met": 2,
+    "required": 2.0
+  },
+  "replay": {
+    "execution": {
+      "command": [
+        "/Users/lagyeongjun/CD/omd/.venv/bin/python",
+        "/Users/lagyeongjun/CD/omd/benchmarks/omd_scheduler_m0.py",
+        "--scenarios",
+        "fairness,claims",
+        "--workers",
+        "1,2,4,8",
+        "--claim-operations",
+        "600",
+        "--fairness-repeats",
+        "10",
+        "--warmups",
+        "1",
+        "--repeats",
+        "10",
+        "--output",
+        "/var/folders/vy/s6_3ycyd4nx14j0kt0cwxqmm0000gn/T/omd-m0-judge-replay-rv10yzxx/replay.json"
+      ],
+      "exit_code": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "recomputed": {
+      "claim_cells": {
+        "1": 10,
+        "2": 10,
+        "4": 10,
+        "8": 10
+      },
+      "claim_matrix_complete": true,
+      "fairness_observations": 10,
+      "fairness_replication_complete": true,
+      "m0_replay_obligations_met": 2,
+      "required": 2.0
+    }
+  },
+  "roles": {
+    "implementer": "codex-omd-scheduler-m0-20260715-root",
+    "judge": "progress_judge.omd_scheduler_m0"
+  },
+  "schema": "omd-scheduler-m0-judge-response/v1",
+  "status": "judged"
+}

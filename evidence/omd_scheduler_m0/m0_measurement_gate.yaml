@@ -1,0 +1,14 @@
+# M0 measurement receipt gate. Green means the real Coordinator probe and
+# independent backend readback exposed the locked pre-M1 defect. It does not
+# mean the scheduler is fair.
+cid: omd-scheduler-m0-ooptdd-fresh
+service: omd
+expect:
+  - event: scheduler_fairness_probe_completed
+    where:
+      older_waiter_state: PENDING
+      newer_claim_state: HELD
+      no_overtaking_passed: false
+      store_readback_complete: true
+    op: "=="
+    count: 1
