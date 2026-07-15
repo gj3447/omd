@@ -1,0 +1,15 @@
+# 이 저장소의 모든 커밋은 동일인(라경준 / Gyeongjun Ra)이 작성했다.
+# 여러 머신·git config(개인 계정, 회사 노트북 메일, 로컬 호스트명)를 거치며 신원이 갈렸을 뿐이다.
+# 이 파일은 `git log --use-mailmap` / `git shortlog -e` 등 git 도구에서 신원을 통일한다.
+#
+# 주의: GitHub 은 .mailmap 을 읽지 않는다. GitHub 기여자 그래프는 커밋의 raw 이메일로
+# 계정을 매칭하므로, GitHub 측 귀속까지 원하면 계정 설정에 해당 이메일을 추가해야 한다
+# (메일함 접근 권한 불필요).
+#
+# noreply@github.com (GitHub 웹 머지 커밋)은 의도적으로 매핑하지 않는다 — 그건 GitHub 이지 저자가 아니다.
+
+Gyeongjun Ra <gj3447@users.noreply.github.com> <gira@airobotics.im>
+Gyeongjun Ra <gj3447@users.noreply.github.com> <gj3447@gmail.com>
+Gyeongjun Ra <gj3447@users.noreply.github.com> <lagyeongjun@lagyeongjun-ui-Macmini.local>
+Gyeongjun Ra <gj3447@users.noreply.github.com> <64730635+gj3447@users.noreply.github.com>
+Gyeongjun Ra <gj3447@users.noreply.github.com> <gj3447@users.noreply.github.com>
