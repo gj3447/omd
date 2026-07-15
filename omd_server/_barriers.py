@@ -12,6 +12,7 @@ import uuid
 
 from . import fsm
 from ._const import MERGE_PIN_GRACE_S, WRITE_MODES
+from .gitio import GitError
 
 class BarrierMixin:
     # ---- D5 배리어: 세대-스탬프 응결 랑데부 + BROKEN 종단 (§D5, §1.2, §3.D) ----
@@ -466,7 +467,21 @@ class BarrierMixin:
                         "reason": "stale fence: lease changed since arrival",
                         "stale": stale}
             write_globs = self._claimed_write_globs(task_id, writes)
-            offending = self._writeset_audit(task_id, t["branch"], write_globs)
+            try:
+                branch_tip, integration_base, offending = \
+                    self._snapshot_connect_candidate(
+                        task_id, t["branch"], write_globs
+                    )
+            except GitError as exc:
+                self._emit(
+                    "connect_rejected", task_id,
+                    reason="writeset_audit_unavailable", error=str(exc),
+                    via="barrier",
+                )
+                return {
+                    "ok": False, "reason": "writeset_audit_unavailable",
+                    "retryable": True, "error": str(exc), "task_id": task_id,
+                }
             if offending:
                 return {"ok": False, "reason": "writeset_violation",
                         "offending": offending, "task_id": task_id}
@@ -489,11 +504,6 @@ class BarrierMixin:
                 return {"ok": False, "reason": f"task not connectable: {s}"}
             cap_fence = max((o["fence"] for o in writes if o["fence"] is not None),
                             default=None)
-            branch_tip = None
-            integration_base = None
-            if self.git and t["branch"]:
-                branch_tip = self.git.branch_tip(t["branch"])
-                integration_base = self.git.branch_tip(self.integration_branch)
             self.store.set_task(task_id, state=s, connect_fence=cap_fence,
                                 connect_intent_at=time.time(), branch_tip_sha=branch_tip,
                                 integration_base_sha=integration_base,
@@ -512,11 +522,13 @@ class BarrierMixin:
                        via="barrier")
             intent = {"task_id": task_id, "branch": t["branch"], "worktree": t["worktree"],
                       "writes": [o["orbit_id"] for o in writes],
+                      "branch_tip_sha": branch_tip,
                       "integration_base_sha": integration_base,
                       "attempt_id": attempt_id,
                       "owner_instance": self.instance_id,
                       "owner_generation": owner_generation,
                       "token_id": token_id,
+                      "token_agent": owner,
                       "request_id": None, "request_agent": None,
                       "request_arg_hash": None,
                       "repo_bound": bool(self.git)}

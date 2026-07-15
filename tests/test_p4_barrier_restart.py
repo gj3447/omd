@@ -96,6 +96,7 @@ def test_restart_forward_completes_fully_merged_trip(tmp_path, monkeypatch):
     assert omd.store.get_task("B")["state"] == "MERGED"
     assert omd.store.barrier_by_name("rc")["state"] == "TRIPPING", "크래시 잔해"
 
+    omd.resign()
     omd2 = _mk(tmp_path)                                         # 재기동(같은 db/coordinator_id)
     st = omd2.barrier_status("rc")
     assert st["state"] == "TRIPPED", (
@@ -131,6 +132,7 @@ def test_restart_breaks_partially_tripped_barrier_fail_loud(tmp_path):
     assert len(merged) == 1, f"정확히 한 task 만 응결된 반쪽 상태여야: {merged}"
     assert omd.store.barrier_by_name("rc")["state"] == "TRIPPING"
 
+    omd.resign()
     omd2 = _mk(tmp_path)                                         # 재기동
     st = omd2.barrier_status("rc")
     assert st["state"] == "BROKEN", (
@@ -152,6 +154,7 @@ def test_restart_leaves_healthy_armed_barrier_untouched(tmp_path):
     fa, _fb = _arm_two(omd)
     omd.barrier_arrive("rc", "agA", "A", fence=fa)               # 부분 도착(대기중)
 
+    omd.resign()
     omd2 = _mk(tmp_path)                                         # 재기동
     st = omd2.barrier_status("rc")
     assert st["state"] == "ARMED" and st["arrived"] == 1 and st["parties"] == 2, st

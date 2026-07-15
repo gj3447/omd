@@ -15,7 +15,7 @@ from omd_server.store import Store
 # ---- store.tx() 원자성 ----
 def test_tx_atomic_rollback(tmp_path):
     """tx 안의 실패는 fence 증가 + orbit 삽입을 통째로 롤백한다(부분쓰기 없음)."""
-    s = Store(str(tmp_path / "x.db"))
+    s = Store(str(tmp_path / "x.db"), initialize=True)
     f0 = s.current_fence()
     with pytest.raises(RuntimeError):
         with s.tx():
@@ -28,7 +28,7 @@ def test_tx_atomic_rollback(tmp_path):
 
 
 def test_tx_commit_persists(tmp_path):
-    s = Store(str(tmp_path / "x.db"))
+    s = Store(str(tmp_path / "x.db"), initialize=True)
     with s.tx():
         fence = s.next_fence()
         oid = s.add_orbit(task_id=None, agent_id="a", pathspec=["p/**"],
@@ -40,7 +40,7 @@ def test_tx_commit_persists(tmp_path):
 def test_duplicate_fence_rejected_by_unique_index(tmp_path):
     """P0-2 백스톱: 코드 회귀로 같은 fence를 두 번 발급하면 UNIQUE 인덱스가 fail-closed."""
     import sqlite3
-    s = Store(str(tmp_path / "x.db"))
+    s = Store(str(tmp_path / "x.db"), initialize=True)
     s.add_orbit(task_id=None, agent_id="a", pathspec=["p/**"], mode="write",
                 state="HELD", fence=5)
     with pytest.raises(sqlite3.IntegrityError):

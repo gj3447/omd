@@ -247,6 +247,7 @@ class GitSplitPhaseMachine(RuleBasedStateMachine):
         `_recover()` reconciles every CONNECTING task with git truth (trailer-probe): merged-in-git
         → forward to MERGED; otherwise roll back to DONE. Dangling merge tokens are aborted."""
         old_epoch = self.omd.leader_epoch
+        self.omd.resign()
         self.omd.store.db.close()
         self.omd = self._open()
         # §D14: a fresh leader takes a strictly higher epoch — no ghost writer.

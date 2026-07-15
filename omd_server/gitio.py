@@ -224,10 +224,12 @@ class GitRepo:
         self._git(*self._IDENT, "commit", "-m", msg, cwd=worktree)
         return self._git("rev-parse", "HEAD", cwd=worktree)
 
-    def branch_tip(self, branch: str) -> str | None:
+    def branch_tip(self, branch: str, *, strict: bool = False) -> str | None:
         try:
             return self._git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
         except GitError:
+            if strict:
+                raise
             return None
 
     def changed_paths(self, branch: str, base: str) -> list[str]:
@@ -243,12 +245,22 @@ class GitRepo:
                         "--no-renames", f"{base}...{branch}")
         return [ln for ln in out.splitlines() if ln.strip()]
 
+    def assert_ancestor(self, ancestor: str, descendant: str, *, cwd=None) -> None:
+        """Fail closed unless ``ancestor`` is contained in ``descendant``.
+
+        Connect trailers prove that an attempt wrote an integration commit;
+        this separate graph proof binds that commit to the exact candidate SHA
+        audited in Phase A.  Exit status 1 (not an ancestor) and repository
+        read errors are both unsafe here, so both remain :class:`GitError`.
+        """
+        self._git("merge-base", "--is-ancestor", ancestor, descendant, cwd=cwd)
+
     def merge_into(self, integration_worktree: str, integration_branch: str,
                    branch: str, msg: str, *, timeout: float | None = None,
                    check_argv: Sequence[str] | None = None,
                    check_timeout: float = 300.0,
                    check_output_limit: int = 16_384) -> str:
-        """전용 통합 worktree에서 integration_branch에 branch를 --no-ff merge(§D11).
+        """전용 통합 worktree에서 integration_branch에 branch/ref를 --no-ff merge(§D11).
         Phase B 본체 — **락 밖**에서 호출된다. 충돌/타임아웃이면 `merge --abort` 후 raise.
         msg에 고유 trailer를 넣어 두면 복구가 통합 브랜치에서 머지 여부를 trailer-probe 한다."""
         if check_argv is not None:

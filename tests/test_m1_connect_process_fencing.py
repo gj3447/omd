@@ -9,6 +9,7 @@ SHA is backed by the exact task trailer in the integration branch.
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 import threading
 from pathlib import Path
@@ -17,6 +18,7 @@ import pytest
 
 from omd_server import Coordinator
 from omd_server.gitio import GitError, GitRepo, GitTimeout
+from omd_server.store import Store
 
 
 class _CrashCut(RuntimeError):
@@ -379,20 +381,318 @@ def test_legacy_git_intent_migration_backfills_repo_bound_before_recovery(tmp_pa
     _init_repo(repo)
     original = _repo_coordinator(tmp_path, repo, "original")
     fence = _ready_repo_task(original)
-    _cut_after_phase_b(original, "legacy-mode", agent="ag", fence=fence)
+    task = _cut_after_phase_b(original, "legacy-mode", agent="ag", fence=fence)
+    token_id = task["connect_token_id"]
     with original.store.tx():
-        original.store.set_task("T", connect_repo_bound=0)
+        # Model the actual pre-generation schema: the Git intent fields exist,
+        # while every modern task/token/idempotency binding is absent.
+        original.store.set_task(
+            "T", connect_repo_bound=0, connect_attempt_id=None,
+            connect_owner_instance=None, connect_owner_generation=0,
+            connect_token_id=None, connect_request_id=None,
+            connect_arg_hash=None,
+        )
+        original.store.set_orbit(
+            token_id, operation_id=None, owner_instance=None,
+            owner_generation=None,
+        )
+        original.store.clear_idem("legacy-mode")
+    _close(original)
+
+    # Model the actual predecessor schema: the mode column itself did not
+    # exist.  Adding it may infer legacy Git authority exactly once.
+    db_path = tmp_path / "omd.db"
+    with sqlite3.connect(db_path) as legacy:
+        legacy.execute("DELETE FROM meta WHERE key='schema_version'")
+        legacy.execute("ALTER TABLE tasks DROP COLUMN connect_repo_bound")
+
+    migrated = Store(str(db_path), initialize=True)
+    task = migrated.get_task("T")
+    assert task["connect_repo_bound"] == 1
+    assert task["state"] == "CONNECTING"
+    assert task["connect_attempt_id"] is None
+    migrated.set_task("T", connect_repo_bound=0)
+    migrated.db.close()
+
+    reopened = Store(str(db_path), initialize=True)
+    assert reopened.get_task("T")["connect_repo_bound"] == 0
+    reopened.db.close()
+
+
+def test_modern_db_only_mode_survives_repeated_reopen_with_stale_repo_fields(
+    tmp_path,
+):
+    db_path = tmp_path / "omd.db"
+    original = Coordinator(
+        db_path=str(db_path), enforce_single_coordinator=False, agent_ttl=None
+    )
+    _ready_db_task(original)
+    _cut_after_phase_c(original, "db-only-modern")
+    with original.store.tx():
+        original.store.set_task(
+            "T", branch="stale/branch", worktree="/stale/worktree"
+        )
+    attempt_id = original.store.get_task("T")["connect_attempt_id"]
+    assert attempt_id
+    assert original.store.get_task("T")["connect_repo_bound"] == 0
+    _close(original)
+
+    for _ in range(2):
+        reopened = Coordinator(
+            db_path=str(db_path), enforce_single_coordinator=False,
+            agent_ttl=None,
+        )
+        task = reopened.store.get_task("T")
+        assert task["state"] == "MERGED"
+        assert task["connect_attempt_id"] == attempt_id
+        assert task["connect_repo_bound"] == 0
+        _close(reopened)
+
+
+def _modern_db_connecting_attempt(omd: Coordinator, request_id: str):
+    _ready_db_task(omd)
+    args = ["T", None, None, None, None]
+    arg_hash = omd._arg_hash("connect", args)
+    with omd._cs():
+        with omd._idem(request_id, None, "connect", args) as slot:
+            slot.defer()
+    phase_a = omd._connect_phase_a(
+        "T", None, None, request_id=request_id, request_agent=None,
+        request_arg_hash=arg_hash,
+    )
+    assert phase_a["ok"] is True
+    return phase_a
+
+
+def test_modern_recovery_does_not_adopt_foreign_sole_merge_token(tmp_path):
+    db_path = tmp_path / "omd.db"
+    original = Coordinator(
+        db_path=str(db_path), enforce_single_coordinator=False, agent_ttl=None
+    )
+    phase_a = _modern_db_connecting_attempt(original, "modern-token")
+    token_id = phase_a["token_id"]
+    with original.store.tx():
+        original.store.set_task("T", connect_token_id=None)
+        original.store.set_orbit(
+            token_id, operation_id="foreign-operation",
+            owner_instance="foreign-owner", owner_generation=99,
+        )
+    task_before = original.store.get_task("T")
+    token_before = original.store.get_orbit(token_id)
+    idem_before = original.store.get_idem("modern-token")
     _close(original)
 
     recovered = Coordinator(
+        db_path=str(db_path), enforce_single_coordinator=False, agent_ttl=None
+    )
+
+    assert recovered.store.get_task("T") == task_before
+    assert recovered.store.get_orbit(token_id) == token_before
+    assert recovered.store.get_idem("modern-token") == idem_before
+    assert recovered.store.get_task("T")["state"] == "CONNECTING"
+    assert recovered.store.get_orbit(token_id)["state"] == "HELD"
+    _close(recovered)
+
+
+def test_modern_recovery_does_not_synthesize_operationless_idempotency_binding(
+    tmp_path,
+):
+    db_path = tmp_path / "omd.db"
+    original = Coordinator(
+        db_path=str(db_path), enforce_single_coordinator=False, agent_ttl=None
+    )
+    phase_a = _modern_db_connecting_attempt(original, "modern-idem")
+    token_id = phase_a["token_id"]
+    with original.store.tx():
+        original.store.db.execute(
+            "UPDATE idempotency SET operation_id=NULL,owner_instance=NULL,"
+            "owner_generation=NULL WHERE request_id=?",
+            ("modern-idem",),
+        )
+    task_before = original.store.get_task("T")
+    token_before = original.store.get_orbit(token_id)
+    idem_before = original.store.get_idem("modern-idem")
+    _close(original)
+
+    recovered = Coordinator(
+        db_path=str(db_path), enforce_single_coordinator=False, agent_ttl=None
+    )
+
+    assert recovered.store.get_task("T") == task_before
+    assert recovered.store.get_orbit(token_id) == token_before
+    assert recovered.store.get_idem("modern-idem") == idem_before
+    assert recovered.store.get_idem("modern-idem")["operation_id"] is None
+    _close(recovered)
+
+
+def test_modern_recovery_rejects_null_owner_generation_tuple(tmp_path):
+    db_path = tmp_path / "omd.db"
+    original = Coordinator(
+        db_path=str(db_path), enforce_single_coordinator=False, agent_ttl=None
+    )
+    phase_a = _modern_db_connecting_attempt(original, "null-modern-owner")
+    token_id = phase_a["token_id"]
+    with original.store.tx():
+        original.store.set_task(
+            "T", connect_owner_instance=None, connect_owner_generation=0
+        )
+        original.store.set_orbit(
+            token_id, owner_instance=None, owner_generation=None
+        )
+        original.store.db.execute(
+            "UPDATE idempotency SET owner_instance=NULL,owner_generation=NULL "
+            "WHERE request_id=?",
+            ("null-modern-owner",),
+        )
+    task_before = original.store.get_task("T")
+    token_before = original.store.get_orbit(token_id)
+    idem_before = original.store.get_idem("null-modern-owner")
+    _close(original)
+
+    recovered = Coordinator(
+        db_path=str(db_path), enforce_single_coordinator=False, agent_ttl=None
+    )
+
+    assert recovered.store.get_task("T") == task_before
+    assert recovered.store.get_orbit(token_id) == token_before
+    assert recovered.store.get_idem("null-modern-owner") == idem_before
+    assert recovered.store.get_task("T")["state"] == "CONNECTING"
+    _close(recovered)
+
+
+def test_legacy_recovery_rejects_partial_modern_owner_tuple(tmp_path):
+    db_path = tmp_path / "omd.db"
+    original = Coordinator(
+        db_path=str(db_path), enforce_single_coordinator=False, agent_ttl=None
+    )
+    phase_a = _modern_db_connecting_attempt(original, "partial-legacy-owner")
+    token_id = phase_a["token_id"]
+    with original.store.tx():
+        original.store.set_task(
+            "T", connect_attempt_id=None, connect_owner_instance="partial-owner",
+            connect_owner_generation=4, connect_request_id=None,
+            connect_arg_hash=None,
+        )
+        original.store.set_orbit(
+            token_id, operation_id=None, owner_instance=None,
+            owner_generation=None,
+        )
+        original.store.clear_idem("partial-legacy-owner")
+    task_before = original.store.get_task("T")
+    token_before = original.store.get_orbit(token_id)
+    _close(original)
+
+    recovered = Coordinator(
+        db_path=str(db_path), enforce_single_coordinator=False, agent_ttl=None
+    )
+
+    assert recovered.store.get_task("T") == task_before
+    assert recovered.store.get_orbit(token_id) == token_before
+    assert recovered.store.get_task("T")["state"] == "CONNECTING"
+    _close(recovered)
+
+
+@pytest.mark.parametrize("request_id", ["", 7])
+def test_connect_rejects_invalid_request_id_without_mutation(tmp_path, request_id):
+    omd = Coordinator(
         db_path=str(tmp_path / "omd.db"), enforce_single_coordinator=False,
         agent_ttl=None,
     )
+    _ready_db_task(omd)
+    task_before = omd.store.get_task("T")
+    orbits_before = omd.store.orbits_for_task("T")
+    fence_before = omd.store.current_fence()
+    seq_before = omd.store.current_seq()
+
+    result = omd.connect("T", request_id=request_id)
+
+    assert result == {
+        "ok": False, "state": "REJECTED", "reason": "invalid_request_id"
+    }
+    assert omd.store.get_task("T") == task_before
+    assert omd.store.orbits_for_task("T") == orbits_before
+    assert omd.store.current_fence() == fence_before
+    assert omd.store.current_seq() == seq_before
+    assert omd.store.all_held_merge_tokens() == []
+    assert omd.store.inflight_idem() == []
+    _close(omd)
+
+
+def test_recovery_preserves_empty_request_landed_attempt_without_partial_takeover(
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    original = _repo_coordinator(tmp_path, repo, "original")
+    fence = _ready_repo_task(original)
+    args = ["T", "ag", fence, None, None]
+    arg_hash = original._arg_hash("connect", args)
+    with original._cs():
+        with original._idem("", "ag", "connect", args) as slot:
+            slot.defer()
+    phase_a = original._connect_phase_a(
+        "T", "ag", fence, request_id="", request_agent="ag",
+        request_arg_hash=arg_hash,
+    )
+    assert phase_a["ok"] is True
+    merge_sha, error = original._connect_phase_b(phase_a["intent"])
+    assert error is None and merge_sha
+    token_id = phase_a["token_id"]
+    task_before = original.store.get_task("T")
+    token_before = original.store.get_orbit(token_id)
+    idem_before = original.store.get_idem("")
+    _close(original)
+
+    recovered = _repo_coordinator(tmp_path, repo, "recovery")
+
+    assert recovered.store.get_task("T") == task_before
+    assert recovered.store.get_orbit(token_id) == token_before
+    assert recovered.store.get_idem("") == idem_before
+    assert recovered.store.get_task("T")["state"] == "CONNECTING"
+    assert recovered.store.get_orbit(token_id)["state"] == "HELD"
+    _close(recovered)
+
+
+def test_recovery_rejects_exact_attempt_trailer_without_candidate_ancestry(
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    original = _repo_coordinator(tmp_path, repo, "original")
+    fence = _ready_repo_task(original)
+    args = ["T", "ag", fence, None, None]
+    arg_hash = original._arg_hash("connect", args)
+    with original._cs():
+        with original._idem("forged-proof", "ag", "connect", args) as slot:
+            slot.defer()
+    phase_a = original._connect_phase_a(
+        "T", "ag", fence, request_id="forged-proof", request_agent="ag",
+        request_arg_hash=arg_hash,
+    )
+    assert phase_a["ok"] is True
+    intent = phase_a["intent"]
+    wt = original._ensure_integration_wt()
+    forged_sha = original.git.commit_empty_integration(
+        wt,
+        f"forged proof only\n\n{original._trailer('T')}\n"
+        f"{original._trailer('T', intent['attempt_id'])}",
+    )
+    with pytest.raises(GitError):
+        original.git.assert_ancestor(intent["branch_tip_sha"], forged_sha, cwd=wt)
+    token_id = phase_a["token_id"]
+    _close(original)
+
+    recovered = _repo_coordinator(tmp_path, repo, "recovery")
 
     task = recovered.store.get_task("T")
-    assert task["connect_repo_bound"] == 1
+    token = recovered.store.get_orbit(token_id)
+    idem = recovered.store.get_idem("forged-proof")
     assert task["state"] == "CONNECTING"
-    assert recovered.store.get_idem("legacy-mode")["status"] == "INFLIGHT"
+    assert task["merge_sha"] is None
+    assert token["state"] == "HELD"
+    assert token["operation_id"] == task["connect_attempt_id"]
+    assert recovered.store.pinned_orbits_for_task("T")
+    assert idem["status"] == "INFLIGHT"
     _close(recovered)
 
 

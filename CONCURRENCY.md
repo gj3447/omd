@@ -668,6 +668,13 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
 - **DB 리더-lease**(`meta.leader_lease` JSON: coordinator_id/epoch/last_heartbeat/ttl). 기동 시
   `_acquire_leadership()` 가 `_cs`(BEGIN IMMEDIATE) 안에서 CAS 획득. 살아있는 다른 리더(heartbeat 가
   **incumbent 가 선언한 TTL** 안)면 `CoordinatorConflict` 거부 = actor 둘(=writer 둘) 차단.
+- **관측 라벨은 권위가 아님**: 같은 `coordinator_id`를 재사용한 새 process도 live incumbent를
+  takeover할 수 없다. `resign()` 뒤 `leader_epoch=None`인 옛 객체의 모든 일반 변이도 `_cs`에서
+  fence-out되며, idempotent resign은 정확한 `(coordinator_id, epoch)`만 만진다.
+- **startup migration 권위**: `schema_version`은 `없음(legacy) / 현재 / 알 수 없음`으로 구분한다.
+  현재 버전은 leader admission 전 migration 무변이 fast path, legacy는 same-DB process/file effect
+  fence와 임시 leader generation을 모두 얻은 뒤에만 migration하며 최종 완료점에 marker를 쓴다.
+  unknown/future 버전과 live effect/leader 아래 migration은 무변이 거부한다.
 - **죽은 리더 takeover**: heartbeat TTL 초과 시 epoch +1 로 fence 하며 takeover. `coordinator_heartbeat()`
   keepalive(권장 ttl/3), `resign()` graceful(즉시 takeover 허용).
 - **leader-fence**: `_cs()` 가 트랜잭션 연 직후 `_assert_leader()` — takeover 된 좀비 리더(epoch/id

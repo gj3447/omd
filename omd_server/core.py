@@ -180,7 +180,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 "OMD requires a persistent DB path (got ':memory:'). An in-memory DB "
                 "resets fence/leader epoch to 0 on every restart, colliding with stale "
                 "tokens. Pass a file path, or allow_memory_db=True for single-process tests.")
-        self.store = Store(db_path)
+        # Open only the bootstrap meta table here.  Domain schema migration is
+        # authority-gated below, after the effect domains and leader admission
+        # machinery exist.  A rejected second Coordinator must not migrate.
+        self.store = Store(db_path, initialize=False)
         self.git = GitRepo(repo) if repo else None
         self.coordinator_id = coordinator_id or f"coord-{uuid.uuid4().hex[:12]}"
         # A caller-provided coordinator_id is an observability label and can be
@@ -188,12 +191,13 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         self.instance_id = f"inst-{uuid.uuid4().hex}"
         effect_domains = []
         if db_path == ":memory:":
-            effect_domains.append((f"memory:{id(self.store)}", None))
+            db_effect_domain = (f"memory:{id(self.store)}", None)
         else:
             durable_db = os.path.realpath(db_path)
-            effect_domains.append(
-                (f"db:{durable_db}", durable_db + ".connect-effect.lock")
+            db_effect_domain = (
+                f"db:{durable_db}", durable_db + ".connect-effect.lock"
             )
+        effect_domains.append(db_effect_domain)
         durable_repo = None
         if self.git is not None:
             durable_repo = self.git.common_dir()
@@ -212,6 +216,13 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         self._effect_lock_paths = [
             path for _, path in effect_domains if path is not None
         ]
+        # Schema migration shares the DB half of the split-effect fence, but
+        # must not claim the repository half: an unrelated DB may initialize
+        # safely while another coordinator uses the same Git repository.
+        self._schema_effect_process_lock = _process_effect_lock(
+            db_effect_domain[0]
+        )
+        self._schema_effect_lock_path = db_effect_domain[1]
         # M1 request identity needs a stable authority domain.  Compute a seed here,
         # then persist/read it after leadership acquisition so moving/restoring the
         # DB cannot silently change request identity.
@@ -234,11 +245,37 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         self._sweep_interval = sweep_interval
         self._sweep_stop = threading.Event()
         self._sweep_thread = None
-        # §D14: 리더 lease 획득 — 살아있는 다른 코디네이터가 있으면 CoordinatorConflict 거부.
-        # 이 호출 *전*엔 어떤 변이도(특히 _recover 의 git↔DB 조정) 하면 안 된다(writer 둘 방지).
-        # _lock/events/store 가 필요하므로 그것들 뒤에 둔다.
-        if self.enforce_single_coordinator:
-            self._acquire_leadership()
+        # §D14 + schema authority: current-version startup is a read-only fast
+        # path until leader admission.  A pending migration first fences every
+        # split effect on the same DB, then acquires leadership, then mutates schema.
+        # Thus a rejected peer and a process racing a live Git child are both
+        # unable to exercise migration authority.
+        if not self.store.schema_requires_migration():
+            if self.enforce_single_coordinator:
+                self._acquire_leadership()
+        else:
+            with self._schema_effect(blocking=False) as owns_effect:
+                if not owns_effect:
+                    self._emit(
+                        "schema_migration_blocked", self.coordinator_id,
+                        reason="live_effect_lock_held",
+                    )
+                    raise RuntimeError(
+                        "OMD schema migration requires exclusive split-effect "
+                        "authority; a live external effect still holds the fence"
+                    )
+                # Migration always takes a real leader generation, even for a
+                # runtime that will subsequently operate with singleton
+                # enforcement disabled.  This closes the check-to-migrate race.
+                self._acquire_leadership()
+                try:
+                    self.store.initialize()
+                except BaseException:
+                    if self.leader_epoch is not None:
+                        self.resign()
+                    raise
+                if not self.enforce_single_coordinator:
+                    self.resign()
         with self.store.tx():
             persisted_repository_id = self.store.get_meta("repository_id")
             if persisted_repository_id is None:
@@ -330,8 +367,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         leader_guard=False 는 리더십 *획득 중*(아직 epoch 미설정)에만 쓴다."""
         with self._lock:
             with self.store.tx():
-                if (self.enforce_single_coordinator and leader_guard
-                        and self.leader_epoch is not None):
+                if self.enforce_single_coordinator and leader_guard:
                     self._assert_leader()
                 yield
 
@@ -377,26 +413,59 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             for lock in reversed(acquired_locks):
                 lock.release()
 
+    @contextmanager
+    def _schema_effect(self, *, blocking=False):
+        """Fence schema migration against split effects on this exact DB.
+
+        Repository effects from a different DB are unrelated to SQLite schema
+        authority and therefore deliberately excluded.
+        """
+        acquired = self._schema_effect_process_lock.acquire(blocking)
+        if not acquired:
+            yield False
+            return
+        fd = None
+        try:
+            path = self._schema_effect_lock_path
+            if path is not None:
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+                op = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+                try:
+                    fcntl.flock(fd, op)
+                except BlockingIOError:
+                    yield False
+                    return
+            yield True
+        finally:
+            if fd is not None:
+                os.close(fd)
+            self._schema_effect_process_lock.release()
+
     def _emit(self, event, cid, **attrs):
         self.events.emit(event, cid, **attrs)
 
     # ---- D14 코디네이터 singleton / HA 입장 (§D14) ----
+    @staticmethod
+    def _leader_alive(cur, now=None) -> bool:
+        if cur is None:
+            return False
+        now = time.time() if now is None else now
+        incumbent_ttl = cur.get("ttl", LEADER_TTL_S)
+        return (now - cur.get("last_heartbeat", 0)) <= incumbent_ttl
+
     def _acquire_leadership(self):
         """기동 시 리더 lease 획득. 살아있는 다른 코디네이터(heartbeat 가 TTL 안)가 있으면
         CoordinatorConflict 로 거부 — 한 DB 에 코디네이터 둘(=writer 둘)을 막는다.
         죽은(=heartbeat 가 TTL 초과한) 리더는 takeover(epoch +1 로 fence — 옛 리더가 GC-pause
         뒤 깨어나 변이하려 해도 stale leader_epoch 로 차단). CAS 는 _cs(BEGIN IMMEDIATE) 안에서
         돌아 동시 기동 둘 중 하나만 성공한다(멀티프로세스 row-lock + 단일 writer)."""
-        with self._cs():
+        with self._cs(leader_guard=False):
             now = time.time()
             cur = self.store.get_leader()
             if cur is not None:
-                # liveness 는 **incumbent 가 선언한 TTL** 로 판정(레코드에 저장된 ttl) — 신규자
-                # 자기 TTL 로 보면 안 됨. 레코드에 ttl 없으면(구버전) 신규자 TTL 로 폴백.
-                inc_ttl = cur.get("ttl", self.leader_ttl)
-                alive = (now - cur.get("last_heartbeat", 0)) <= inc_ttl
-                if alive and cur.get("coordinator_id") != self.coordinator_id:
-                    # 살아있는 다른 리더 — 거부(단일 인스턴스 강제).
+                # coordinator_id는 재사용 가능한 관측 라벨이다. 같은 라벨의
+                # 새 process instance도 live incumbent가 아니므로 항상 거부한다.
+                if self._leader_alive(cur, now):
                     self._emit("leader_conflict", self.coordinator_id,
                                incumbent=cur.get("coordinator_id"),
                                last_heartbeat=cur.get("last_heartbeat"))
@@ -447,9 +516,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
     def resign(self) -> dict:
         """자발적 리더십 반납(graceful shutdown). lease 를 비워(epoch 유지) 다음 코디네이터가
         TTL 대기 없이 즉시 takeover. 우리가 리더가 아니면 no-op."""
-        with self._cs():
+        with self._cs(leader_guard=False):
             cur = self.store.get_leader()
-            if cur is None or cur.get("coordinator_id") != self.coordinator_id:
+            if (cur is None or cur.get("coordinator_id") != self.coordinator_id
+                    or cur.get("epoch") != self.leader_epoch):
                 return {"ok": True, "noop": True}
             # last_heartbeat=0 으로 만들어 즉시 만료 처리(epoch 는 보존 → 다음 리더가 +1).
             cur["last_heartbeat"] = 0
@@ -1283,45 +1353,135 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     wt = None
             for t in self.store.tasks_by_state(["CONNECTING"]):
                 # The effect lock proves the previous executor is gone.  Take
-                # over its durable generation before interpreting Git truth.
-                legacy_attempt = not t.get("connect_attempt_id")
-                attempt_id = t.get("connect_attempt_id") or f"recover-{uuid.uuid4().hex}"
+                # over its durable generation only after validating every
+                # modern binding.  Phase A writes task/token/idempotency in one
+                # transaction, so a partial modern tuple is corruption rather
+                # than a legitimate crash cut and must remain fail-stopped.
+                stored_attempt_id = t.get("connect_attempt_id")
+                legacy_attempt = stored_attempt_id is None
+                attempt_id = (f"recover-{uuid.uuid4().hex}"
+                              if legacy_attempt else stored_attempt_id)
                 previous_owner = t.get("connect_owner_instance")
                 previous_generation = int(t.get("connect_owner_generation") or 0)
                 owner_generation = previous_generation + 1
                 token_id = t.get("connect_token_id")
                 token = self.store.get_orbit(token_id) if token_id else None
-                if token is None:
-                    candidates = self.store.all_held_merge_tokens()
-                    token = candidates[0] if len(candidates) == 1 else None
-                    token_id = token["orbit_id"] if token else None
-                self.store.set_task(
-                    t["task_id"], connect_attempt_id=attempt_id,
-                    connect_owner_instance=self.instance_id,
-                    connect_owner_generation=owner_generation,
-                    connect_token_id=token_id,
+                binding_error = None
+                if legacy_attempt and (
+                        previous_owner is not None or previous_generation != 0):
+                    binding_error = "legacy_attempt_binding_mismatch"
+                if not legacy_attempt and (
+                        not isinstance(attempt_id, str) or not attempt_id
+                        or not isinstance(previous_owner, str) or not previous_owner
+                        or previous_generation <= 0):
+                    binding_error = "modern_attempt_binding_invalid"
+                token_agents = {
+                    value for value in (
+                        t.get("agent_id"), f"connect:{t['task_id']}",
+                        f"barrier:{t['task_id']}",
+                    ) if value is not None
+                }
+                if legacy_attempt and token is None:
+                    candidates = [
+                        candidate for candidate in self.store.all_held_merge_tokens()
+                        if candidate.get("resource_key") == self.merge_resource
+                    ]
+                    candidate = candidates[0] if len(candidates) == 1 else None
+                    if (candidate is not None
+                            and candidate["state"] == "HELD"
+                            and candidate.get("agent_id") in token_agents
+                            and candidate.get("operation_id") is None
+                            and candidate.get("owner_instance") is None
+                            and candidate.get("owner_generation") is None):
+                        token = candidate
+                        token_id = candidate["orbit_id"]
+                if legacy_attempt:
+                    if token is not None and (
+                            token["state"] != "HELD"
+                            or token.get("kind") != "merge_token"
+                            or token.get("resource_key") != self.merge_resource
+                            or token.get("agent_id") not in token_agents
+                            or token.get("operation_id") is not None
+                            or token.get("owner_instance") is not None
+                            or token.get("owner_generation") is not None):
+                        binding_error = "legacy_token_binding_mismatch"
+                elif token is None:
+                    binding_error = "modern_token_missing"
+                elif not (
+                        token["state"] == "HELD"
+                        and token.get("kind") == "merge_token"
+                        and token.get("resource_key") == self.merge_resource
+                        and token.get("agent_id") in token_agents
+                        and token.get("operation_id") == attempt_id
+                        and token.get("owner_instance") == previous_owner
+                        and int(token.get("owner_generation") or 0)
+                        == previous_generation):
+                    binding_error = "modern_token_binding_mismatch"
+
+                request_id = t.get("connect_request_id")
+                request_arg_hash = t.get("connect_arg_hash")
+                has_request_binding = (
+                    request_id is not None or request_arg_hash is not None
                 )
-                if token is not None and token["state"] == "HELD":
+                row = None
+                if has_request_binding:
+                    if (not isinstance(request_id, str) or not request_id
+                            or not isinstance(request_arg_hash, str)
+                            or not request_arg_hash):
+                        binding_error = binding_error or "invalid_request_binding"
+                    else:
+                        row = self.store.get_idem(request_id)
+                        if (row is None or row["status"] != "INFLIGHT"
+                                or row["verb"] != "connect"
+                                or row["arg_hash"] != request_arg_hash):
+                            binding_error = binding_error or "idempotency_binding_missing"
+                        elif legacy_attempt:
+                            if (row.get("operation_id") is not None
+                                    or row.get("owner_instance") is not None
+                                    or row.get("owner_generation") is not None):
+                                binding_error = (
+                                    binding_error or
+                                    "legacy_idempotency_binding_mismatch"
+                                )
+                        elif not (
+                                row.get("operation_id") == attempt_id
+                                and row.get("owner_instance") == previous_owner
+                                and int(row.get("owner_generation") or 0)
+                                == previous_generation):
+                            binding_error = (
+                                binding_error or
+                                "modern_idempotency_binding_mismatch"
+                            )
+
+                if binding_error is not None:
+                    unresolved_connect = True
+                    # Under a malformed modern tuple we cannot prove which
+                    # HELD token is unrelated.  Preserve all as forensic
+                    # authority instead of expiring or adopting one.
+                    protected_token_ids.update(
+                        mt["orbit_id"] for mt in self.store.all_held_merge_tokens()
+                    )
+                    for orbit in self.store.pinned_orbits_for_task(t["task_id"]):
+                        self.store.set_orbit(orbit["orbit_id"], merge_deadline=None)
+                    self._emit(
+                        "connect_recovery_unresolved", t["task_id"],
+                        reason=binding_error, attempt_id=attempt_id,
+                    )
+                    continue
+
+                if not legacy_attempt:
+                    self.store.set_task(
+                        t["task_id"], connect_attempt_id=attempt_id,
+                        connect_owner_instance=self.instance_id,
+                        connect_owner_generation=owner_generation,
+                        connect_token_id=token_id,
+                    )
                     self.store.set_orbit(
                         token_id, operation_id=attempt_id,
                         owner_instance=self.instance_id,
                         owner_generation=owner_generation,
                     )
-                request_id = t.get("connect_request_id")
-                request_arg_hash = t.get("connect_arg_hash")
-                if request_id and request_arg_hash:
-                    row = self.store.get_idem(request_id)
-                    if row is None or row["status"] != "INFLIGHT":
-                        raise RuntimeError(
-                            f"connect recovery lost idempotency row {request_id}"
-                        )
-                    if row.get("operation_id") is None:
-                        bound = self.store.bind_idem_operation_exact(
-                            request_id, row["agent_id"], "connect", request_arg_hash,
-                            operation_id=attempt_id, owner_instance=self.instance_id,
-                            owner_generation=owner_generation,
-                        )
-                    else:
+                    if has_request_binding:
                         bound = self.store.takeover_idem_operation_exact(
                             request_id, row["agent_id"], "connect", request_arg_hash,
                             operation_id=attempt_id, previous_owner=previous_owner,
@@ -1329,10 +1489,14 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                             owner_instance=self.instance_id,
                             owner_generation=owner_generation,
                         )
-                    if not bound:
-                        raise RuntimeError(
-                            f"connect recovery ownership CAS lost {request_id}"
-                        )
+                        if not bound:
+                            raise RuntimeError(
+                                f"connect recovery ownership CAS lost {request_id}"
+                            )
+                # Legacy rows have only task trailers as proof.  Do not mint a
+                # synthetic modern attempt identity: retaining NULL bindings
+                # lets later unresolved restarts and legacy idempotency proof
+                # continue to use that original authority honestly.
                 t = self.store.get_task(t["task_id"])
                 merged_sha = None
                 repo_bound = bool(t.get("connect_repo_bound"))
@@ -1369,6 +1533,28 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                         )
                         continue
                 if merged_sha:
+                    if not legacy_attempt:
+                        candidate_sha = t.get("branch_tip_sha")
+                        try:
+                            if not candidate_sha:
+                                raise GitError("missing audited branch tip")
+                            self.git.assert_ancestor(
+                                candidate_sha, merged_sha, cwd=wt
+                            )
+                        except GitError as exc:
+                            unresolved_connect = True
+                            if token_id is not None:
+                                protected_token_ids.add(token_id)
+                            for orbit in self.store.pinned_orbits_for_task(t["task_id"]):
+                                self.store.set_orbit(
+                                    orbit["orbit_id"], merge_deadline=None
+                                )
+                            self._emit(
+                                "connect_recovery_unresolved", t["task_id"],
+                                reason="candidate_ancestry_unproven", error=str(exc),
+                                attempt_id=attempt_id,
+                            )
+                            continue
                     # git 진실: 이미 응결됨 → 전진수정(P0-6: merge_sha 기록 후 해제).
                     now = time.time()
                     self.store.set_task(t["task_id"], merge_sha=merged_sha,
@@ -1499,7 +1685,17 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             )
         except GitError as exc:
             return False, f"git_proof_unavailable:{exc}"
-        return proven == merge_sha, (None if proven == merge_sha else "trailer_sha_mismatch")
+        if proven != merge_sha:
+            return False, "trailer_sha_mismatch"
+        if attempt_id:
+            candidate_sha = task.get("branch_tip_sha")
+            if not candidate_sha:
+                return False, "candidate_sha_missing"
+            try:
+                self.git.assert_ancestor(candidate_sha, proven, cwd=wt)
+            except GitError as exc:
+                return False, f"candidate_ancestry_unproven:{exc}"
+        return True, None
 
     def _barrier_recover(self):
         """§3.D: TRIPPING 중 크래시한 배리어를 *단위*로 조정(임계구역 안, _recover 말미).
@@ -1695,19 +1891,44 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 globs.append(g)
         return globs
 
-    def _writeset_audit(self, task_id, branch, write_globs) -> list[str]:
-        """branch가 통합 base 대비 건드린 파일 중 **claimed write-set 밖** 경로들(있으면 위반).
-        §D10 option 2(저비용 pre-connect 감사): `git diff --name-only base...branch`의 모든
+    def _writeset_audit(self, task_id, candidate_ref, write_globs, *,
+                        base_ref=None) -> list[str]:
+        """candidate가 exact base 대비 건드린 파일 중 claimed write-set 밖 경로들.
+
+        §D10 option 2(저비용 pre-connect 감사): `git diff --name-only base...candidate`의 모든
         경로가 claimed write-globs 에 정확히 덮여야 한다. 안 덮인 경로 = 분열 위험 = 거부 대상.
-        repo 미바인딩이거나 branch 없으면 감사 불가 → 빈 리스트(감사 skip, 보수적으로 통과)."""
-        if not self.git or not branch:
+        DB-only coordinator만 명시적으로 감사를 건너뛴다. Repo-bound authority에서 ref가
+        없거나 Git 읽기가 실패하면 예외를 유지해 Phase A가 token/state 변이 전에 fail closed한다.
+        """
+        if not self.git:
             return []
-        try:
-            changed = self.git.changed_paths(branch, self.integration_branch)
-        except GitError:
-            return []   # diff 실패(브랜치 없음 등) — 다른 게이트가 처리. 감사 위반은 아님.
+        if not candidate_ref or not base_ref:
+            raise GitError(
+                f"write-set audit refs unavailable for {task_id}: "
+                f"base={base_ref!r} candidate={candidate_ref!r}"
+            )
+        changed = self.git.changed_paths(candidate_ref, base_ref)
         # path_in_globs = 정확매칭(soundness: 덮인다를 절대 거짓-양성으로 안 냄). 안 덮이면 위반.
         return [p for p in changed if not path_in_globs(p, write_globs)]
+
+    def _snapshot_connect_candidate(self, task_id, branch, write_globs):
+        """Capture and audit the immutable Git inputs for one connect attempt.
+
+        Resolving before the audit closes the mutable-branch TOCTOU: later
+        commits may advance the task branch, but Phase B merges only the SHA
+        returned here.  The integration base is also exact so the audit and
+        rollback proof describe the same candidate generation.
+        """
+        if not self.git:
+            return None, None, []
+        if not branch:
+            raise GitError(f"task {task_id} has no branch for repo-bound connect")
+        branch_tip = self.git.branch_tip(branch, strict=True)
+        integration_base = self.git.branch_tip(self.integration_branch, strict=True)
+        offending = self._writeset_audit(
+            task_id, branch_tip, write_globs, base_ref=integration_base
+        )
+        return branch_tip, integration_base, offending
 
     def _release_task_write_orbits(self, task_id):
         """task의 HELD write-orbit 전부 해제 + unpin(merge_sha 기록 *후* 호출 — P0-6 순서)."""
@@ -2440,8 +2661,22 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     self._emit("commit_rejected", task_id, reason=bad["reason"])
                     return cache.set(bad)
                 t = self.store.get_task(task_id)
+                if t is None:
+                    return cache.set({"ok": False, "reason": "no such task"})
                 writes = [o for o in self.store.orbits_for_task(task_id)
                           if o["mode"] in WRITE_MODES and o["state"] == "HELD"]
+                if t["state"] in ("CONNECTING", "MERGED") or any(
+                        o.get("merging") for o in writes):
+                    # Phase A captured an immutable candidate.  Refuse the
+                    # public writer as well so callers do not strand a later
+                    # commit on a branch whose audited generation is already
+                    # being connected.  Exact-SHA Phase B remains the final
+                    # authority against out-of-band Git ref movement.
+                    self._emit("commit_rejected", task_id, reason="connect_in_progress")
+                    return cache.set({
+                        "ok": False, "reason": "connect_in_progress",
+                        "task_id": task_id, "state": t["state"],
+                    })
                 write_globs = self._claimed_write_globs(task_id, writes)
                 if self.strict_writeset:
                     # P5 strict: 궤도-밖 경로를 **commit 전에** staged 에서 제외 → 위반이 history
@@ -2468,8 +2703,23 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 # ---- advisory(기본) 경로 — 기존 동작 불변(commit 후 자문 감사, connect가 권위 거부) ----
                 sha = self.git.commit_all(t["worktree"], msg)
                 self._emit("task_committed", t["agent_id"], task=task_id, sha=sha)
-                offending = self._writeset_audit(task_id, t["branch"], write_globs)
                 res = {"ok": True, "sha": sha}
+                try:
+                    branch_tip, integration_base, offending = \
+                        self._snapshot_connect_candidate(
+                            task_id, t["branch"], write_globs
+                        )
+                except GitError as exc:
+                    # commit-time audit is advisory, but a failed observation
+                    # must never be reported as a successful clean audit.
+                    self._emit(
+                        "commit_writeset_audit_unavailable", task_id, error=str(exc)
+                    )
+                    res["writeset_audit_unavailable"] = True
+                    res["writeset_audit_error"] = str(exc)
+                    return cache.set(res)
+                res["audited_branch_tip_sha"] = branch_tip
+                res["audited_integration_base_sha"] = integration_base
                 if offending:
                     # 자문 경고 — connect에서 거부될 것임. 물방울은 지금 바로잡아야 한다.
                     self._emit("commit_writeset_warning", task_id, offending=offending)
@@ -2629,6 +2879,13 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
     # ---- CLOUD CONNECT — split-phase A–B–C (§3.B/§D8/§D11) ----
     def connect(self, task_id, agent_id=None, fence=None, push=None, *, request_id=None,
                 bail_epoch=None):
+        if request_id is not None and (
+            not isinstance(request_id, str) or not request_id
+        ):
+            # Reserve no split-effect authority for an envelope recovery cannot
+            # identify exactly.  This mirrors claim() and is deliberately before
+            # the process/repo effect lock and every DB/Git mutation.
+            return {"ok": False, "state": "REJECTED", "reason": "invalid_request_id"}
         idem_args = [task_id, agent_id, fence, push, bail_epoch]
         deadline = time.time() + max(self.merge_timeout, 5.0) + 10.0
         while True:
@@ -2691,7 +2948,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     task_id, agent_id, fence, bail_epoch,
                     request_id=request_id,
                     request_agent=agent_id,
-                    request_arg_hash=self._arg_hash("connect", idem_args),
+                    request_arg_hash=(
+                        self._arg_hash("connect", idem_args)
+                        if request_id is not None else None
+                    ),
                 )
                 if not a["ok"]:
                     if a.get("retry") and time.time() < deadline:
@@ -2962,7 +3222,20 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             # **밖**의 파일을 건드렸으면 거부(merge 안 함, 토큰 안 잡음, 상태 불변). 이것으로
             # SINGULON 토대 (c)가 성립: 선언상 서로소 write-set이 *실제* write-set이 된다.
             write_globs = self._claimed_write_globs(task_id, writes)
-            offending = self._writeset_audit(task_id, t["branch"], write_globs)
+            try:
+                branch_tip, integration_base, offending = \
+                    self._snapshot_connect_candidate(
+                        task_id, t["branch"], write_globs
+                    )
+            except GitError as exc:
+                self._emit(
+                    "connect_rejected", task_id,
+                    reason="writeset_audit_unavailable", error=str(exc),
+                )
+                return {
+                    "ok": False, "reason": "writeset_audit_unavailable",
+                    "retryable": True, "error": str(exc), "task_id": task_id,
+                }
             if offending:
                 self._emit("connect_rejected", task_id, reason="writeset_violation",
                            offending=offending)
@@ -3004,11 +3277,6 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 self._release_merge_token_locked(token_id)
                 return {"ok": False, "reason": f"task not connectable: {s}"}
             cap_fence = max((o["fence"] for o in writes if o["fence"] is not None), default=None)
-            branch_tip = None
-            integration_base = None
-            if self.git and t["branch"]:
-                branch_tip = self.git.branch_tip(t["branch"])
-                integration_base = self.git.branch_tip(self.integration_branch)
             self.store.set_task(task_id, state=s, connect_fence=cap_fence,
                                 connect_intent_at=time.time(), branch_tip_sha=branch_tip,
                                 integration_base_sha=integration_base,
@@ -3035,11 +3303,13 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             self._emit("connect_started", task_id, token_id=token_id, fence=cap_fence)
             intent = {"task_id": task_id, "branch": t["branch"], "worktree": t["worktree"],
                       "writes": [o["orbit_id"] for o in writes],
+                      "branch_tip_sha": branch_tip,
                       "integration_base_sha": integration_base,
                       "attempt_id": attempt_id,
                       "owner_instance": self.instance_id,
                       "owner_generation": owner_generation,
                       "token_id": token_id,
+                      "token_agent": owner,
                       "request_id": request_id,
                       "request_agent": request_agent,
                       "request_arg_hash": request_arg_hash,
@@ -3076,10 +3346,24 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             return None, None   # repo 미바인딩 — DB-only 응결(테스트/드라이런)
         task_id, branch = intent["task_id"], intent["branch"]
         try:
+            candidate_ref = intent.get("branch_tip_sha")
+            if not isinstance(candidate_ref, str) or not candidate_ref:
+                raise GitError(
+                    f"connect intent for {task_id} has no audited branch tip"
+                )
+            expected_base = intent.get("integration_base_sha")
+            current_base = self.git.branch_tip(
+                self.integration_branch, strict=True
+            )
+            if not expected_base or current_base != expected_base:
+                raise GitIntegrationPreconditionError(
+                    f"integration branch drifted before connect {task_id}: "
+                    f"expected {expected_base}, found {current_base}"
+                )
             wt = self._ensure_integration_wt()
             msg = (f"CLOUD CONNECT {task_id}\n\n{self._trailer(task_id)}\n"
                    f"{self._trailer(task_id, intent['attempt_id'])}")
-            sha = self.git.merge_into(wt, self.integration_branch, branch, msg,
+            sha = self.git.merge_into(wt, self.integration_branch, candidate_ref, msg,
                                       timeout=self.merge_timeout,
                                       check_argv=self.integration_check,
                                       check_timeout=self.integration_check_timeout,
@@ -3091,6 +3375,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 # the branch is an ancestor.  Persist an empty evidence commit
                 # so this exact generation remains recoverable after a crash.
                 sha = self.git.commit_empty_integration(wt, msg)
+            self.git.assert_ancestor(candidate_ref, sha, cwd=wt)
             # 연결=merge 직후 remote sync(operator "커밋하면 바로 sync"의 OMD 내장판).
             # opt-in(push override > self.auto_push). fail-soft: push 실패해도 merge 는 로컬
             # 반영됨이라 connect 는 성공 유지(다음 connect/수동 push 가 따라잡음). 강제 push 안 함.
@@ -3124,9 +3409,19 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     strict=True,
                 )
                 if proven_sha:
+                    candidate_sha = intent.get("branch_tip_sha")
+                    if not candidate_sha:
+                        raise GitError("missing audited branch tip")
+                    self.git.assert_ancestor(candidate_sha, proven_sha, cwd=wt)
                     # Exact Git truth dominates a timeout/error returned after
                     # ref update.  Forward-complete this generation once.
                     merge_sha, err = proven_sha, None
+                elif isinstance(err, GitIntegrationPreconditionError):
+                    # The exact base-drift guard runs before merge_into(), and
+                    # gitio precondition failures either precede mutation or
+                    # return only after their own verified abort.  No rollback
+                    # to the now-stale Phase-A base is required here.
+                    rollback_verified = True
                 elif err is not None and not isinstance(err, GitRollbackError):
                     integration_base = intent.get("integration_base_sha")
                     if integration_base is None:
@@ -3146,6 +3441,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 and task.get("connect_owner_generation") == intent.get("owner_generation")
                 and task.get("connect_token_id") == token_id
                 and token is not None and token["state"] == "HELD"
+                and token.get("kind") == "merge_token"
+                and token.get("resource_key") == self.merge_resource
+                and token.get("agent_id") == intent.get("token_agent")
                 and token.get("operation_id") == intent.get("attempt_id")
                 and token.get("owner_instance") == intent.get("owner_instance")
                 and token.get("owner_generation") == intent.get("owner_generation")
@@ -3270,7 +3568,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 # 실패는 유지하되 '왜/무엇 때문에'의 보고가 복구 UX 의 본체.
                 if isinstance(err, GitMergeConflict):
                     out["conflict_files"] = err.conflicts
-                    out["culprits"] = self._diagnose_conflict(intent.get("branch"),
+                    out["culprits"] = self._diagnose_conflict(
+                                                              intent.get("branch_tip_sha")
+                                                              or intent.get("branch"),
                                                               err.conflicts)
                 # P2 shared 레인: shared 궤도를 쥔 task 의 merge conflict 는 불변식 버그가
                 # 아니라 **정상사건**(같은 hunk 동시편집) — 경보 대신 rebase 복구 힌트(P3).

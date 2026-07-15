@@ -14,14 +14,31 @@
 정상경로 + 크래시(죽은 리더 takeover) + 오추방(takeover 된 좀비 리더의 변이 차단) + 거부.
 """
 
+import sqlite3
+
 import pytest
 
 from omd_server import Coordinator
 from omd_server.core import CoordinatorConflict
+from omd_server.store import Store, UnsupportedSchemaVersion
 
 
 def _db(tmp_path):
     return str(tmp_path / "omd.db")
+
+
+def _db_authority_snapshot(db_path):
+    with sqlite3.connect(db_path) as db:
+        return {
+            "schema_version": db.execute("PRAGMA schema_version").fetchone()[0],
+            "meta": db.execute(
+                "SELECT key,value FROM meta ORDER BY key"
+            ).fetchall(),
+            "schema": db.execute(
+                "SELECT type,name,sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+            ).fetchall(),
+        }
 
 
 # ---------- 1) :memory: 디폴트 금지 (영속 DB 강제) ----------
@@ -50,6 +67,155 @@ def test_second_live_coordinator_is_refused(tmp_path):
         Coordinator(db_path=db, coordinator_id="b")     # a 가 살아있음 → 거부
     # a 는 정상 동작.
     assert a.claim("ag", ["x/**"], "write")["state"] == "HELD"
+
+
+def test_current_schema_peer_is_rejected_without_running_migration(
+    tmp_path, monkeypatch
+):
+    db = _db(tmp_path)
+    Coordinator(db_path=db, coordinator_id="a")
+    before = _db_authority_snapshot(db)
+    calls = []
+
+    def forbidden_initialize(self):
+        calls.append(self)
+        raise AssertionError("current-schema peer attempted migration")
+
+    monkeypatch.setattr(Store, "initialize", forbidden_initialize)
+    with pytest.raises(CoordinatorConflict, match="single-instance"):
+        Coordinator(db_path=db, coordinator_id="b")
+
+    assert calls == []
+    assert _db_authority_snapshot(db) == before
+
+
+def test_pending_migration_cannot_run_before_live_leader_rejection(
+    tmp_path, monkeypatch
+):
+    db = _db(tmp_path)
+    leader = Coordinator(db_path=db, coordinator_id="a")
+    with leader.store.tx():
+        leader.store.db.execute("DELETE FROM meta WHERE key='schema_version'")
+    before = _db_authority_snapshot(db)
+    calls = []
+
+    def forbidden_initialize(self):
+        calls.append(self)
+        raise AssertionError("migration ran before leader admission")
+
+    monkeypatch.setattr(Store, "initialize", forbidden_initialize)
+    with pytest.raises(CoordinatorConflict, match="single-instance"):
+        Coordinator(db_path=db, coordinator_id="b")
+
+    assert calls == []
+    assert _db_authority_snapshot(db) == before
+
+
+def test_leadership_disabled_peer_still_cannot_migrate_under_live_leader(
+    tmp_path, monkeypatch
+):
+    db = _db(tmp_path)
+    leader = Coordinator(db_path=db, coordinator_id="a")
+    with leader.store.tx():
+        leader.store.db.execute("DELETE FROM meta WHERE key='schema_version'")
+    before = _db_authority_snapshot(db)
+    calls = []
+
+    def forbidden_initialize(self):
+        calls.append(self)
+        raise AssertionError("leadership-disabled peer migrated under live leader")
+
+    monkeypatch.setattr(Store, "initialize", forbidden_initialize)
+    with pytest.raises(CoordinatorConflict, match="single-instance"):
+        Coordinator(
+            db_path=db, coordinator_id="b", enforce_single_coordinator=False
+        )
+
+    assert calls == []
+    assert _db_authority_snapshot(db) == before
+
+
+def test_reused_coordinator_label_cannot_take_over_live_instance(tmp_path):
+    db = _db(tmp_path)
+    leader = Coordinator(db_path=db, coordinator_id="same-label")
+    before = _db_authority_snapshot(db)
+
+    with pytest.raises(CoordinatorConflict, match="single-instance"):
+        Coordinator(db_path=db, coordinator_id="same-label")
+
+    assert leader.leader_epoch == 1
+    assert _db_authority_snapshot(db) == before
+
+
+def test_unknown_schema_version_is_rejected_without_mutation(tmp_path):
+    db = _db(tmp_path)
+    original = Coordinator(db_path=db, coordinator_id="original")
+    original.resign()
+    with original.store.tx():
+        original.store.set_meta("schema_version", "omd/future-999")
+    before = _db_authority_snapshot(db)
+
+    with pytest.raises(UnsupportedSchemaVersion, match="unsupported OMD schema"):
+        Coordinator(db_path=db, coordinator_id="probe")
+
+    assert _db_authority_snapshot(db) == before
+
+
+def test_post_migration_activation_failure_is_retryable_and_releases_leader(
+    tmp_path, monkeypatch
+):
+    db = _db(tmp_path)
+    real_migrate = Store._migrate
+
+    def migrate_then_fail(self):
+        real_migrate(self)
+        raise RuntimeError("injected post-migration activation failure")
+
+    monkeypatch.setattr(Store, "_migrate", migrate_then_fail)
+    with pytest.raises(RuntimeError, match="injected post-migration"):
+        Coordinator(db_path=db, coordinator_id="failed-start")
+
+    with sqlite3.connect(db) as raw:
+        assert raw.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone() is None
+        leader = raw.execute(
+            "SELECT value FROM meta WHERE key='leader_lease'"
+        ).fetchone()[0]
+    assert '"last_heartbeat": 0' in leader
+
+    monkeypatch.setattr(Store, "_migrate", real_migrate)
+    recovered = Coordinator(db_path=db, coordinator_id="recovered-start")
+    assert recovered.store.schema_current() is True
+
+
+def test_pending_migration_cannot_cross_live_split_effect(
+    tmp_path, monkeypatch
+):
+    db = _db(tmp_path)
+    holder = Coordinator(
+        db_path=db, coordinator_id="holder", enforce_single_coordinator=False
+    )
+    with holder.store.tx():
+        holder.store.db.execute("DELETE FROM meta WHERE key='schema_version'")
+    before = _db_authority_snapshot(db)
+    calls = []
+
+    def forbidden_initialize(self):
+        calls.append(self)
+        raise AssertionError("migration crossed a live split effect")
+
+    monkeypatch.setattr(Store, "initialize", forbidden_initialize)
+    with holder._connect_effect(blocking=True) as acquired:
+        assert acquired is True
+        with pytest.raises(RuntimeError, match="exclusive split-effect authority"):
+            Coordinator(
+                db_path=db, coordinator_id="probe",
+                enforce_single_coordinator=False,
+            )
+
+    assert calls == []
+    assert _db_authority_snapshot(db) == before
 
 
 # ---------- 4) 죽은 리더는 takeover (크래시 → 새 코디네이터 입장) ----------
@@ -101,6 +267,9 @@ def test_resign_allows_immediate_takeover(tmp_path):
     # 사임한 a 는 더 이상 변이 못 함(좀비 리더).
     with pytest.raises(CoordinatorConflict):
         a.coordinator_heartbeat()
+    with pytest.raises(CoordinatorConflict):
+        a.claim("resigned-agent", ["resigned/**"])
+    assert a.resign()["noop"] is True
 
 
 # ---------- 8) 좀비 리더가 heartbeat 로 부활 못 함 (epoch fence) ----------

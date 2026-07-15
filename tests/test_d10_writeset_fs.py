@@ -22,6 +22,7 @@ import pytest
 
 from omd_server import Coordinator
 from omd_server.disjoint import path_in_globs, path_matches_glob
+from omd_server.gitio import GitError, GitIntegrationPreconditionError
 
 
 def _git(args, cwd):
@@ -88,6 +89,223 @@ def test_out_of_bounds_write_is_rejected(tmp_path):
     assert omd.store.get_task("A")["state"] != "MERGED"
     # merge_token 누수 0 (거부 시 토큰 안 잡았어야).
     assert omd.store.all_held_merge_tokens() == []
+
+
+def test_connect_audit_git_failure_is_fail_closed_before_authority_mutation(
+    tmp_path, monkeypatch
+):
+    """A Git read failure is not evidence that the candidate is in-bounds."""
+    _init_repo(tmp_path / "repo")
+    omd = _mk(tmp_path)
+    omd.declare("A", writes=["a/**"])
+    omd.next_task("agA")
+    claimed = omd.claim("agA", ["a/**"], task_id="A")
+    started = omd.start("A", "agA")
+    _write(started["worktree"], "a/x.py")
+    assert omd.commit("A", "feat: a/x")["ok"] is True
+    omd.finish("A")
+    task_before = omd.store.get_task("A")
+    orbit_before = omd.store.get_orbit(claimed["orbit_id"])
+
+    def unavailable(*_args, **_kwargs):
+        raise GitError("diff authority unavailable")
+
+    monkeypatch.setattr(omd.git, "changed_paths", unavailable)
+    result = omd.connect("A")
+
+    assert result["ok"] is False
+    assert result["reason"] == "writeset_audit_unavailable"
+    assert omd.store.get_task("A") == task_before
+    assert omd.store.get_orbit(claimed["orbit_id"]) == orbit_before
+    assert omd.store.all_held_merge_tokens() == []
+
+
+def test_barrier_audit_git_failure_is_fail_closed_before_authority_mutation(
+    tmp_path, monkeypatch
+):
+    _init_repo(tmp_path / "repo")
+    omd = _mk(tmp_path)
+    omd.declare("A", writes=["a/**"])
+    omd.next_task("agA")
+    claimed = omd.claim("agA", ["a/**"], task_id="A")
+    started = omd.start("A", "agA")
+    _write(started["worktree"], "a/x.py")
+    omd.commit("A", "feat: a/x")
+    omd.finish("A")
+    task_before = omd.store.get_task("A")
+    orbit_before = omd.store.get_orbit(claimed["orbit_id"])
+
+    def unavailable(*_args, **_kwargs):
+        raise GitError("barrier diff authority unavailable")
+
+    monkeypatch.setattr(omd.git, "changed_paths", unavailable)
+    result = omd._barrier_connect_phase_a("A", claimed["fence"])
+
+    assert result["ok"] is False
+    assert result["reason"] == "writeset_audit_unavailable"
+    assert omd.store.get_task("A") == task_before
+    assert omd.store.get_orbit(claimed["orbit_id"]) == orbit_before
+    assert omd.store.all_held_merge_tokens() == []
+
+
+def test_normal_connect_merges_only_the_audited_candidate_sha(tmp_path):
+    """A late out-of-band branch commit cannot ride an already-audited intent."""
+    _init_repo(tmp_path / "repo")
+    omd = _mk(tmp_path)
+    omd.declare("A", writes=["a/**"])
+    omd.next_task("agA")
+    omd.claim("agA", ["a/**"], task_id="A")
+    started = omd.start("A", "agA")
+    _write(started["worktree"], "a/x.py")
+    omd.commit("A", "feat: audited a/x")
+    omd.finish("A")
+
+    phase_a = omd._connect_phase_a("A", None, None)
+    assert phase_a["ok"] is True
+    intent = phase_a["intent"]
+    audited_tip = intent["branch_tip_sha"]
+
+    _write(started["worktree"], "b/late.py", "LATE = True\n")
+    _git(["add", "-A"], started["worktree"])
+    _git(["commit", "-m", "late out-of-orbit commit"], started["worktree"])
+    assert omd.git.branch_tip("omd/A") != audited_tip
+
+    merge_sha, error = omd._connect_phase_b(intent)
+    assert error is None
+    result = omd._connect_phase_c(
+        "A", phase_a["token_id"], intent, merge_sha, error
+    )
+
+    assert result["ok"] is True and result["state"] == "MERGED"
+    integration = Path(omd.integration_worktree)
+    assert (integration / "a" / "x.py").exists()
+    assert not (integration / "b" / "late.py").exists()
+    omd.git.assert_ancestor(audited_tip, result["merge_sha"], cwd=integration)
+
+
+def test_barrier_connect_merges_only_the_audited_candidate_sha(tmp_path):
+    """Barrier Phase A' carries the same immutable candidate authority."""
+    _init_repo(tmp_path / "repo")
+    omd = _mk(tmp_path)
+    omd.declare("A", writes=["a/**"])
+    omd.next_task("agA")
+    claimed = omd.claim("agA", ["a/**"], task_id="A")
+    started = omd.start("A", "agA")
+    _write(started["worktree"], "a/x.py")
+    omd.commit("A", "feat: audited barrier candidate")
+    omd.finish("A")
+
+    phase_a = omd._barrier_connect_phase_a("A", claimed["fence"])
+    assert phase_a["ok"] is True
+    intent = phase_a["intent"]
+    audited_tip = intent["branch_tip_sha"]
+
+    _write(started["worktree"], "b/barrier-late.py", "LATE = True\n")
+    _git(["add", "-A"], started["worktree"])
+    _git(["commit", "-m", "late barrier branch advance"], started["worktree"])
+    assert omd.git.branch_tip("omd/A") != audited_tip
+
+    merge_sha, error = omd._connect_phase_b(intent)
+    assert error is None
+    result = omd._connect_phase_c(
+        "A", phase_a["token_id"], intent, merge_sha, error
+    )
+
+    assert result["ok"] is True and result["state"] == "MERGED"
+    integration = Path(omd.integration_worktree)
+    assert (integration / "a" / "x.py").exists()
+    assert not (integration / "b" / "barrier-late.py").exists()
+    omd.git.assert_ancestor(audited_tip, result["merge_sha"], cwd=integration)
+
+
+def test_public_commit_is_rejected_after_connect_candidate_is_captured(tmp_path):
+    _init_repo(tmp_path / "repo")
+    omd = _mk(tmp_path)
+    omd.declare("A", writes=["a/**"])
+    omd.next_task("agA")
+    omd.claim("agA", ["a/**"], task_id="A")
+    started = omd.start("A", "agA")
+    _write(started["worktree"], "a/x.py")
+    omd.commit("A", "feat: candidate")
+    omd.finish("A")
+    phase_a = omd._connect_phase_a("A", None, None)
+    assert phase_a["ok"] is True
+    tip_before = omd.git.branch_tip("omd/A")
+
+    _write(started["worktree"], "a/late.py")
+    result = omd.commit("A", "must not advance captured candidate")
+
+    assert result["ok"] is False
+    assert result["reason"] == "connect_in_progress"
+    assert omd.git.branch_tip("omd/A") == tip_before
+
+
+def test_integration_base_drift_releases_attempt_for_retry(tmp_path):
+    """An unrelated integration advance is a no-effect retry, not a stuck attempt."""
+    _init_repo(tmp_path / "repo")
+    omd = _mk(tmp_path)
+    omd.declare("A", writes=["a/**"])
+    omd.next_task("agA")
+    claimed = omd.claim("agA", ["a/**"], task_id="A")
+    started = omd.start("A", "agA")
+    _write(started["worktree"], "a/x.py")
+    omd.commit("A", "feat: candidate")
+    omd.finish("A")
+    phase_a = omd._connect_phase_a("A", "agA", claimed["fence"])
+    assert phase_a["ok"] is True
+
+    integration = omd._ensure_integration_wt()
+    foreign_tip = omd.git.commit_empty_integration(
+        integration, "independent integration advance"
+    )
+    merge_sha, error = omd._connect_phase_b(phase_a["intent"])
+    assert merge_sha is None
+    assert isinstance(error, GitIntegrationPreconditionError)
+
+    result = omd._connect_phase_c(
+        "A", phase_a["token_id"], phase_a["intent"], merge_sha, error
+    )
+
+    assert result["ok"] is False
+    assert result["state"] == "DONE" and result["retryable"] is True
+    assert result["reason"] == "integration_precondition_failed"
+    assert omd.git.branch_tip("main") == foreign_tip
+    assert omd.store.all_held_merge_tokens() == []
+    orbit = omd.store.get_orbit(claimed["orbit_id"])
+    assert orbit["state"] == "HELD" and orbit["merging"] == 0
+
+
+def test_barrier_integration_base_drift_releases_attempt_for_retry(tmp_path):
+    _init_repo(tmp_path / "repo")
+    omd = _mk(tmp_path)
+    omd.declare("A", writes=["a/**"])
+    omd.next_task("agA")
+    claimed = omd.claim("agA", ["a/**"], task_id="A")
+    started = omd.start("A", "agA")
+    _write(started["worktree"], "a/x.py")
+    omd.commit("A", "feat: barrier candidate")
+    omd.finish("A")
+    phase_a = omd._barrier_connect_phase_a("A", claimed["fence"])
+    assert phase_a["ok"] is True
+
+    integration = omd._ensure_integration_wt()
+    foreign_tip = omd.git.commit_empty_integration(
+        integration, "independent barrier integration advance"
+    )
+    merge_sha, error = omd._connect_phase_b(phase_a["intent"])
+    assert merge_sha is None
+    assert isinstance(error, GitIntegrationPreconditionError)
+
+    result = omd._connect_phase_c(
+        "A", phase_a["token_id"], phase_a["intent"], merge_sha, error
+    )
+
+    assert result["state"] == "DONE" and result["retryable"] is True
+    assert result["reason"] == "integration_precondition_failed"
+    assert omd.git.branch_tip("main") == foreign_tip
+    assert omd.store.all_held_merge_tokens() == []
+    orbit = omd.store.get_orbit(claimed["orbit_id"])
+    assert orbit["state"] == "HELD" and orbit["merging"] == 0
 
 
 # ---------- 2) 궤도 안 쓰기만 → MERGED ----------

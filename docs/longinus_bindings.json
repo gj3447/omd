@@ -164,10 +164,10 @@
       "file": "omd_server/core.py",
       "symbol": "_writeset_audit",
       "kind": "function",
-      "line_hint": 651,
-      "sha256": "f843d7757e9a15f5",
+      "line_hint": 1894,
+      "sha256": "b15fd7f809276060",
       "layer": "domain-policy",
-      "frege_sinn": "branch 변경경로 중 claimed write-globs 밖(분열위험) 검출 — pre-connect 감사(P0-11/§D10)"
+      "frege_sinn": "고정된 candidate/base SHA의 변경경로 중 claimed write-globs 밖(분열위험) 검출; Git 권위 읽기 실패는 fail-closed(P0-11/§D10)"
     },
     {
       "sourceId": "core._connect_phase_a",

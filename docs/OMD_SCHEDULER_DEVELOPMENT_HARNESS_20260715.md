@@ -421,6 +421,15 @@ trace, and the queue-order part of item 8:
   attempt trailer read back from the integration branch; explicit DB-only mode
   permits `merge_sha=null`. A second live Coordinator therefore skips recovery
   rather than stealing a peer's CONNECTING state, token, pin or INFLIGHT row;
+- Phase A audits exact candidate/base SHAs and fails closed on Git read errors;
+  Phase B merges the immutable candidate, while Phase C and restart proof also
+  require candidate ancestry. Integration-base drift is a clean retry for both
+  direct and barrier Connect, not an unprovable rollback;
+- schema initialization uses a durable version marker written only after
+  schema migration and WAL activation. Missing-marker migration requires the
+  same-DB effect fence plus a leader generation even on leadership-disabled
+  surfaces; current schema performs no migration before leader admission and
+  unknown versions are rejected read-only;
 - a task-bound claim checks task admission eligibility before transport-cache or
   live-orbit replay, so cancel/merge cannot replay an old HELD fence. Barrier
   trip checks its generation and `TRIPPING` state before every member effect and

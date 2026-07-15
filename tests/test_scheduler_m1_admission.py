@@ -209,6 +209,7 @@ def test_legacy_pending_rows_are_backfilled_once_in_stable_order(tmp_path):
     first = omd.claim("first", ["a/**"])
     second = omd.claim("second", ["a/**"])
     with omd.store.tx():
+        omd.store.db.execute("DELETE FROM meta WHERE key='schema_version'")
         omd.store.db.execute(
             "UPDATE orbits SET queue_seq=NULL, requested_ttl=NULL, "
             "policy_version=NULL, pathspec_digest=NULL, request_id=NULL, "

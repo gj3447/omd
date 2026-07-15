@@ -1,5 +1,6 @@
 """FastMCP 서버 빌드 스모크 — fastmcp 설치 시 툴 스키마가 유효하게 구성되는지."""
 
+import json
 import sys
 import sqlite3
 from datetime import timedelta
@@ -221,7 +222,10 @@ def test_server_stdio_does_not_take_singleton_leader(tmp_path):
 
     con = sqlite3.connect(db)
     raw = con.execute("SELECT value FROM meta WHERE key='leader_lease'").fetchone()
-    assert raw is None
+    # Fresh-schema migration briefly takes a fenced leader generation even in
+    # stdio mode, then immediately resigns before serving concurrent clients.
+    assert raw is not None
+    assert json.loads(raw[0])["last_heartbeat"] == 0
 
 
 def test_server_stdio_allows_concurrent_clients_on_same_db(tmp_path):

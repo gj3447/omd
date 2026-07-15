@@ -189,6 +189,7 @@ def test_partial_index_upgrade_renumbers_history_and_keeps_live_request_latest(t
     # Recreate the exact authority shape accepted by the earlier partial index:
     # terminal history may reuse generation zero, while at most one live row does.
     with sqlite3.connect(db_path) as legacy:
+        legacy.execute("DELETE FROM meta WHERE key='schema_version'")
         legacy.execute("DROP INDEX uq_orbits_request_generation")
         legacy.executemany(
             "UPDATE orbits SET request_id='legacy-reused', "

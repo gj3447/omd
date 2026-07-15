@@ -350,6 +350,17 @@ Implemented fairness slice:
 - a live second Coordinator cannot recover that attempt. Once the effect lock
   proves the old process tree is gone, repo-bound recovery requires exact
   attempt-trailer plus merge-SHA readback; DB-only execution remains explicit;
+- Connect Phase A now resolves an immutable candidate SHA and integration-base
+  SHA before auditing. Git authority failures fail closed before token/state
+  mutation; normal and barrier Phase B merge only that audited candidate, and
+  Phase C/recovery require candidate ancestry before accepting an exact trailer.
+  A concurrent integration-base advance is a typed retry that releases the
+  attempt rather than leaving `CONNECTING` stuck;
+- startup schema work is versioned and authority-gated. Current schema is a
+  read-only fast path until leader admission; a legacy marker must first obtain
+  the same-DB effect fence and a real leader generation, while unknown/future
+  markers fail without mutation. Reused coordinator labels and resigned
+  instances cannot bypass the instance/epoch fence;
 - task cancel invalidates stale claim replay, and barrier trip revalidates its
   generation and `TRIPPING` state before every effect and final success;
 - the unchanged frozen gate is green normally, RED under a test-only pure

@@ -20,6 +20,12 @@ from contextlib import contextmanager
 
 from .admission import LEGACY_ADMISSION_POLICY_VERSION, pathspec_digest
 
+SCHEMA_VERSION = "omd/2026-07-15-m1"
+
+
+class UnsupportedSchemaVersion(RuntimeError):
+    """The DB declares a schema generation this binary cannot migrate safely."""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS orbits (
@@ -243,20 +249,63 @@ def _rows(c) -> list[dict]:
 
 
 class Store:
-    def __init__(self, db_path: str = ":memory:"):
+    def __init__(self, db_path: str = ":memory:", *, initialize: bool = False):
         # autocommit 모드: BEGIN을 우리가 명시 발행(tx()). 기본("") 모드는 DML 전 암묵 BEGIN을
         # 끼워넣어 BEGIN IMMEDIATE를 무력화하므로 반드시 None.
         self.db = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
-        # WAL: 동시 reader가 단일 writer를 안 막음 + 멀티프로세스 안전(BEGIN IMMEDIATE 백스톱).
         # busy_timeout: writer 경합 시 즉시 SQLITE_BUSY 대신 블록-재시도. (CONCURRENCY §D1)
-        self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA synchronous=NORMAL")
-        self.db.executescript(_SCHEMA)
-        self._migrate()
         self._txn_depth = 0
+        # Coordinator가 migration 전에 리더 lease를 획득할 수 있게 하는 최소 bootstrap.
+        # 기존 DB에서는 no-op이며, 실제 domain schema와 data migration은 initialize()만 쓴다.
+        meta_exists = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+        ).fetchone()
+        if meta_exists is None:
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
+            )
+        if initialize:
+            self.initialize()
+
+    def schema_current(self) -> bool:
+        """Pure startup probe used before Coordinator leadership admission."""
+        return self.get_meta("schema_version") == SCHEMA_VERSION
+
+    def schema_requires_migration(self) -> bool:
+        """Return legacy/current state and reject unknown generations read-only."""
+        version = self.get_meta("schema_version")
+        if version is None:
+            return True
+        if version == SCHEMA_VERSION:
+            return False
+        raise UnsupportedSchemaVersion(
+            f"unsupported OMD schema version {version!r}; "
+            f"this binary supports {SCHEMA_VERSION!r}"
+        )
+
+    def initialize(self) -> bool:
+        """Install or migrate the domain schema once; return whether it changed.
+
+        Production Coordinator calls this only after startup authority has been
+        established.  Direct Store users must opt in with ``initialize=True``.
+        The durable version makes a current-schema startup a read-only fast path.
+        """
+        changed = self.schema_requires_migration()
+        if changed:
+            self.db.executescript(_SCHEMA)
+            self._migrate()
+            # WAL activation is intentionally inside the authority-gated
+            # migration path because changing journal mode is persistent.
+            self.db.execute("PRAGMA journal_mode=WAL")
+            # Version is the final completion marker.  A crash before here
+            # leaves the DB explicitly legacy so idempotent migration retries.
+            with self.tx():
+                self.set_meta("schema_version", SCHEMA_VERSION)
+        return changed
 
     def _migrate(self):
         """Additive, crash-safe schema migration including durable queue order.
@@ -268,20 +317,27 @@ class Store:
         """
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            added_columns = set()
             for table, col, decl in _MIGRATIONS:
                 cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
                 if col not in cols:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                    added_columns.add((table, col))
             # The additive column defaults old rows to DB-only.  Recover the
             # durable mode for legacy Git attempts from fields that only a
             # repo-bound connect populated; otherwise a repo-less restart could
             # misclassify a committed external effect as a safe DB rollback.
-            self.db.execute(
-                "UPDATE tasks SET connect_repo_bound=1 "
-                "WHERE state IN ('CONNECTING','MERGED') AND connect_repo_bound=0 "
-                "AND (integration_base_sha IS NOT NULL OR branch_tip_sha IS NOT NULL "
-                "OR merge_sha IS NOT NULL OR worktree IS NOT NULL OR branch IS NOT NULL)"
-            )
+            # This is a one-shot interpretation of rows from the schema that
+            # did not have the mode column.  Re-running it on every startup
+            # would overwrite an explicit modern DB-only decision.
+            if ("tasks", "connect_repo_bound") in added_columns:
+                self.db.execute(
+                    "UPDATE tasks SET connect_repo_bound=1 "
+                    "WHERE state IN ('CONNECTING','MERGED') AND connect_repo_bound=0 "
+                    "AND connect_attempt_id IS NULL "
+                    "AND (integration_base_sha IS NOT NULL OR branch_tip_sha IS NOT NULL "
+                    "OR merge_sha IS NOT NULL OR worktree IS NOT NULL OR branch IS NOT NULL)"
+                )
             max_ticket = self.db.execute(
                 "SELECT MAX(queue_seq) AS n FROM orbits "
                 "WHERE kind='orbit' AND queue_seq IS NOT NULL"

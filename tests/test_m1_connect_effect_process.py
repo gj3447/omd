@@ -216,7 +216,9 @@ def test_repository_effect_lock_fences_recovery_across_different_databases(
             "DB B startup called ensure_integration_worktree while DB A owned the repo effect"
         )
         assert [item["event"] for item in probe["events"]] == [
-            "connect_recovery_skipped"
+            "leader_acquired",
+            "leader_resigned",
+            "connect_recovery_skipped",
         ]
         assert holder.poll() is None
     finally:
@@ -228,6 +230,61 @@ def test_repository_effect_lock_fences_recovery_across_different_databases(
                 _stop_process(holder)
 
     _wait_for(lambda: _lock_available(repo_lock), timeout=5)
+
+
+def test_pending_migration_is_fenced_by_same_db_effect_across_processes(tmp_path):
+    repo, _ = _repo(tmp_path)
+    db = tmp_path / "omd.db"
+    holder_script = _write_script(tmp_path / "hold_effect.py", _HOLD_EFFECT)
+    ready = tmp_path / "holder.ready"
+    release = tmp_path / "holder.release"
+
+    from omd_server import Coordinator
+
+    seeded = Coordinator(
+        str(db), repo=str(repo), worktrees_dir=str(tmp_path / "seed-wt"),
+        integration_branch="main", agent_ttl=None,
+        enforce_single_coordinator=False,
+    )
+    seeded.close()
+    seeded.store.db.close()
+
+    holder = subprocess.Popen(
+        [
+            sys.executable, str(holder_script), _ROOT, str(db), str(repo),
+            str(tmp_path / "holder-wt"), str(ready), str(release),
+        ],
+        cwd=_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        _wait_for(ready.exists, proc=holder)
+        with sqlite3.connect(db) as raw:
+            raw.execute("DELETE FROM meta WHERE key='schema_version'")
+
+        with pytest.raises(RuntimeError, match="exclusive split-effect authority"):
+            Coordinator(
+                str(db), repo=str(repo), worktrees_dir=str(tmp_path / "probe-wt"),
+                integration_branch="main", agent_ttl=None,
+                enforce_single_coordinator=False,
+            )
+        with sqlite3.connect(db) as raw:
+            assert raw.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone() is None
+    finally:
+        release.touch()
+        if holder.poll() is None:
+            try:
+                holder.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _stop_process(holder)
+
+    recovered = Coordinator(
+        str(db), repo=str(repo), worktrees_dir=str(tmp_path / "recovered-wt"),
+        integration_branch="main", agent_ttl=None,
+        enforce_single_coordinator=False,
+    )
+    assert recovered.store.schema_current() is True
 
 
 _BLOCKING_CHECK = r"""
