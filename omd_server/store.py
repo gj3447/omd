@@ -18,6 +18,8 @@ import time
 import uuid
 from contextlib import contextmanager
 
+from .admission import LEGACY_ADMISSION_POLICY_VERSION, pathspec_digest
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS orbits (
@@ -32,6 +34,21 @@ CREATE TABLE IF NOT EXISTS orbits (
   merge_deadline REAL,                 -- pin 유계(§E): 이 시각 넘으면 abort 대상
   merge_started_mono REAL,             -- merge_token crash-safe(§D11): dangling merge abort 판정
   intent_key TEXT,                     -- 증분5(§D9): claim 자연 멱등 — hash(agent,paths,mode,task)
+  -- M1 fair admission: created_at은 migration 입력일 뿐 ordering authority가 아니다.
+  queue_seq INTEGER,                    -- 전역 단조 입장 티켓(priority DESC, queue_seq ASC)
+  requested_ttl REAL,                   -- PENDING 뒤 promotion 때 원 요청 lease TTL 복원
+  policy_version TEXT,                  -- 이 요청을 정렬/판정한 admission policy
+  pathspec_digest TEXT,                 -- 정규화 pathspec의 canonical SHA-256
+  request_id TEXT,                      -- transport/admission identity(NULL=서버 내부 요청)
+  request_generation INTEGER NOT NULL DEFAULT 0,
+  bail_epoch INTEGER NOT NULL DEFAULT 0,
+  authority_snapshot_hash TEXT,         -- 판정이 읽은 authority facts digest
+  decision_id TEXT,                     -- 마지막 canonical admission decision digest
+  decision_type TEXT,                   -- decision_id가 해석하는 ADMISSION_/PROMOTION_ event
+  blocker_ids TEXT NOT NULL DEFAULT '[]',
+  enqueued_at REAL,
+  wait_deadline REAL,
+  terminal_reason TEXT,
   -- 증분9(§D12 read-set 코히런스): read-orbit 이 어느 통합 generation 위에서 분기했는지(read 시점
   -- integration_gen). 응결이 이 read-궤도와 겹치는 경로를 통합에 추가/변경하면(read_gen < 현 gen
   -- 이면서 겹침) consumer 는 옛 base 위에 빌드 중 → stale=1 로 표시 → connect 전 rebase/재독 강제.
@@ -116,7 +133,8 @@ CREATE INDEX IF NOT EXISTS idx_sem_waiters_sem ON sem_waiters(sem_id, state);
 -- 두 번째 효과를 일으키지 않게 한다(claim 누수·이중 merge·이중 release 차단).
 CREATE TABLE IF NOT EXISTS idempotency (
   request_id TEXT PRIMARY KEY, agent_id TEXT, verb TEXT, arg_hash TEXT,
-  status TEXT NOT NULL, response TEXT, created_at REAL, completed_at REAL
+  args_json TEXT, status TEXT NOT NULL, response TEXT,
+  created_at REAL, completed_at REAL
 );
 -- 증분8(§D5): 응결 랑데부 배리어. 세대(generation) 스탬프 + BROKEN 종단. 멤버십은 agent 수가
 -- 아니라 **task 집합**(reclaim 으로 task 가 requeue 되면 N 재계산). 참가자 사망(도착 전/후)·
@@ -156,6 +174,23 @@ _MIGRATIONS = [
     # 증분5(§D6/§D9)
     ("agents", "bail_epoch", "INTEGER NOT NULL DEFAULT 0"),
     ("orbits", "intent_key", "TEXT"),
+    # M1 fair admission.  queue_seq backfill/index creation is completed below while the
+    # migration transaction still holds BEGIN IMMEDIATE.
+    ("orbits", "queue_seq", "INTEGER"),
+    ("orbits", "requested_ttl", "REAL"),
+    ("orbits", "policy_version", "TEXT"),
+    ("orbits", "pathspec_digest", "TEXT"),
+    ("orbits", "request_id", "TEXT"),
+    ("orbits", "request_generation", "INTEGER NOT NULL DEFAULT 0"),
+    ("orbits", "bail_epoch", "INTEGER NOT NULL DEFAULT 0"),
+    ("orbits", "authority_snapshot_hash", "TEXT"),
+    ("orbits", "decision_id", "TEXT"),
+    ("orbits", "decision_type", "TEXT"),
+    ("orbits", "blocker_ids", "TEXT NOT NULL DEFAULT '[]'"),
+    ("orbits", "enqueued_at", "REAL"),
+    ("orbits", "wait_deadline", "REAL"),
+    ("orbits", "terminal_reason", "TEXT"),
+    ("idempotency", "args_json", "TEXT"),
     # 증분6(§D3 flags): EPHEMERAL/LATCH 분리 + wait register→poll.
     ("flags", "flag_type", "TEXT NOT NULL DEFAULT 'LATCH'"),
     ("flags", "epoch", "INTEGER NOT NULL DEFAULT 0"),
@@ -200,11 +235,111 @@ class Store:
         self._txn_depth = 0
 
     def _migrate(self):
-        """멱등 컬럼 추가(증분3) — 기존 DB도 안전하게 신규 컬럼을 얻는다(fresh-DB 친화)."""
-        for table, col, decl in _MIGRATIONS:
-            cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
-            if col not in cols:
-                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        """Additive, crash-safe schema migration including durable queue order.
+
+        M1 may start on a DB containing legacy PENDING rows.  Those rows receive
+        tickets in deterministic ``created_at, orbit_id`` order exactly once.
+        BEGIN IMMEDIATE prevents two coordinator processes from racing the
+        backfill or creating duplicate queue authority.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for table, col, decl in _MIGRATIONS:
+                cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+                if col not in cols:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            max_ticket = self.db.execute(
+                "SELECT MAX(queue_seq) AS n FROM orbits "
+                "WHERE kind='orbit' AND queue_seq IS NOT NULL"
+            ).fetchone()["n"]
+            if max_ticket is not None and self.current_seq() < int(max_ticket):
+                self.set_meta("seq", int(max_ticket))
+            legacy = self.db.execute(
+                "SELECT * FROM orbits WHERE kind='orbit' AND state='PENDING' "
+                "AND (queue_seq IS NULL OR requested_ttl IS NULL "
+                "OR policy_version IS NULL OR pathspec_digest IS NULL "
+                "OR request_id IS NULL OR enqueued_at IS NULL OR wait_deadline IS NULL) "
+                "ORDER BY created_at ASC, orbit_id ASC"
+            ).fetchall()
+            for row in legacy:
+                enqueued_at = (
+                    row["enqueued_at"]
+                    if row["enqueued_at"] is not None
+                    else row["created_at"] if row["created_at"] is not None else time.time()
+                )
+                ticket = row["queue_seq"]
+                if ticket is None:
+                    ticket = self.next_seq()
+                paths = json.loads(row["pathspec"])
+                self.db.execute(
+                    "UPDATE orbits SET queue_seq=?, requested_ttl=?, policy_version=?, "
+                    "pathspec_digest=?, request_id=?, enqueued_at=?, wait_deadline=? "
+                    "WHERE orbit_id=?",
+                    (
+                        ticket,
+                        row["requested_ttl"] if row["requested_ttl"] is not None else 600.0,
+                        row["policy_version"] or LEGACY_ADMISSION_POLICY_VERSION,
+                        row["pathspec_digest"] or pathspec_digest(paths),
+                        row["request_id"] or f"internal:{row['orbit_id']}",
+                        enqueued_at,
+                        row["wait_deadline"]
+                        if row["wait_deadline"] is not None
+                        else enqueued_at + 3600.0,
+                        row["orbit_id"],
+                    ),
+                )
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_orbits_queue_seq "
+                "ON orbits(queue_seq) "
+                "WHERE kind='orbit' AND queue_seq IS NOT NULL"
+            )
+            # Older M1 snapshots constrained only live rows and could therefore
+            # leave multiple terminal generation-zero histories.  Preserve the
+            # live authority row when present, then deterministically renumber
+            # duplicate history before upgrading to the global uniqueness rule.
+            duplicate_generations = self.db.execute(
+                "SELECT request_id,request_generation FROM orbits "
+                "WHERE kind='orbit' AND request_id IS NOT NULL "
+                "GROUP BY request_id,request_generation HAVING COUNT(*)>1 "
+                "ORDER BY request_id,request_generation"
+            ).fetchall()
+            for duplicate in duplicate_generations:
+                request_id = duplicate["request_id"]
+                generation = duplicate["request_generation"]
+                rows = self.db.execute(
+                    "SELECT orbit_id,state,created_at FROM orbits "
+                    "WHERE kind='orbit' AND request_id=? AND request_generation=? "
+                    "ORDER BY CASE WHEN state IN ('PENDING','HELD') THEN 0 ELSE 1 END, "
+                    "created_at ASC, orbit_id ASC",
+                    (request_id, generation),
+                ).fetchall()
+                maximum = self.db.execute(
+                    "SELECT MAX(request_generation) AS generation FROM orbits "
+                    "WHERE kind='orbit' AND request_id=?",
+                    (request_id,),
+                ).fetchone()["generation"]
+                next_generation = int(maximum) + 1
+                for row in rows[1:]:
+                    self.db.execute(
+                        "UPDATE orbits SET request_generation=?, "
+                        "authority_snapshot_hash=NULL, decision_id=NULL, "
+                        "decision_type='MIGRATION_RENUMBERED' WHERE orbit_id=?",
+                        (next_generation, row["orbit_id"]),
+                    )
+                    next_generation += 1
+            # A request generation is a lifecycle identity, not merely a live
+            # lease key. Recreate any partial predecessor fail-closed.
+            self.db.execute("DROP INDEX IF EXISTS uq_orbits_request_generation")
+            self.db.execute(
+                "CREATE UNIQUE INDEX uq_orbits_request_generation "
+                "ON orbits(request_id,request_generation) "
+                "WHERE kind='orbit' AND request_id IS NOT NULL"
+            )
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        else:
+            self.db.execute("COMMIT")
 
     # --- 트랜잭션 경계(재진입 가능) ---
     @contextmanager
@@ -244,6 +379,10 @@ class Store:
             "SET value=CAST(value AS INTEGER)+1")
         return int(self.db.execute(
             "SELECT value FROM meta WHERE key='seq'").fetchone()["value"])
+
+    def current_seq(self) -> int:
+        row = self.db.execute("SELECT value FROM meta WHERE key='seq'").fetchone()
+        return int(row["value"]) if row else -1
 
     # --- meta (일반 KV: 증분9 D12 integration_gen / D14 leader_lease) ---
     def get_meta(self, key, default=None):
@@ -322,16 +461,26 @@ class Store:
     def add_orbit(self, *, task_id, agent_id, pathspec, mode, state,
                   fence=None, expires_at=None, reason="", priority=0,
                   kind="orbit", resource_key=None, intent_key=None,
-                  read_gen=None) -> str:
-        oid = "orb-" + uuid.uuid4().hex[:12]
+                  read_gen=None, orbit_id=None, queue_seq=None,
+                  requested_ttl=None, policy_version=None,
+                  pathspec_digest=None, request_id=None, request_generation=0,
+                  bail_epoch=0, authority_snapshot_hash=None, decision_id=None,
+                  decision_type=None, blocker_ids=None, enqueued_at=None,
+                  wait_deadline=None, terminal_reason=None) -> str:
+        oid = orbit_id or "orb-" + uuid.uuid4().hex[:12]
         self.db.execute(
             "INSERT INTO orbits(orbit_id,task_id,agent_id,pathspec,mode,state,"
             "fence,expires_at,created_at,reason,priority,kind,resource_key,intent_key,"
-            "read_gen) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "read_gen,queue_seq,requested_ttl,policy_version,pathspec_digest,request_id,"
+            "request_generation,bail_epoch,authority_snapshot_hash,decision_id,blocker_ids,"
+            "decision_type,enqueued_at,wait_deadline,terminal_reason) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (oid, task_id, agent_id, json.dumps(pathspec), mode, state,
              fence, expires_at, time.time(), reason, priority, kind, resource_key,
-             intent_key, read_gen))
+             intent_key, read_gen, queue_seq, requested_ttl, policy_version,
+             pathspec_digest, request_id, request_generation, bail_epoch,
+             authority_snapshot_hash, decision_id, json.dumps(blocker_ids or []),
+             decision_type, enqueued_at, wait_deadline, terminal_reason))
         return oid
 
     def orbit_by_intent(self, intent_key) -> dict | None:
@@ -341,18 +490,64 @@ class Store:
             "SELECT * FROM orbits WHERE intent_key=? AND state IN ('HELD','PENDING') "
             "ORDER BY created_at ASC LIMIT 1", (intent_key,)))
 
+    def orbit_by_request(self, request_id, request_generation=None) -> dict | None:
+        if request_id is None:
+            return None
+        if request_generation is None:
+            return _row(self.db.execute(
+                "SELECT * FROM orbits WHERE request_id=? AND kind='orbit' "
+                "ORDER BY request_generation DESC, created_at ASC LIMIT 1",
+                (request_id,),
+            ))
+        return _row(self.db.execute(
+            "SELECT * FROM orbits WHERE request_id=? AND request_generation=? "
+            "AND kind='orbit' "
+            "ORDER BY created_at ASC LIMIT 1",
+            (request_id, request_generation),
+        ))
+
+    def latest_orbit_by_request(self, request_id) -> dict | None:
+        """Latest lifecycle row, including terminal generations."""
+        if request_id is None:
+            return None
+        return _row(self.db.execute(
+            "SELECT * FROM orbits WHERE request_id=? AND kind='orbit' "
+            "ORDER BY request_generation DESC, created_at DESC LIMIT 1",
+            (request_id,),
+        ))
+
+    def next_request_generation(self, request_id) -> int:
+        """Allocate the next durable generation for an explicit request id."""
+        row = self.db.execute(
+            "SELECT MAX(request_generation) AS generation FROM orbits "
+            "WHERE kind='orbit' AND request_id=?",
+            (request_id,),
+        ).fetchone()
+        current = row["generation"] if row else None
+        return 0 if current is None else int(current) + 1
+
     def get_orbit(self, oid) -> dict | None:
         return _row(self.db.execute("SELECT * FROM orbits WHERE orbit_id=?", (oid,)))
 
     def set_orbit(self, oid, *, state=..., expires_at=..., released_at=..., fence=...,
                   merging=..., merge_deadline=..., merge_started_mono=...,
-                  read_gen=..., stale=...):
+                  read_gen=..., stale=..., authority_snapshot_hash=...,
+                  decision_id=..., decision_type=..., blocker_ids=...,
+                  enqueued_at=..., wait_deadline=..., terminal_reason=...):
         sets, args = [], []
         for col, val in (("state", state), ("expires_at", expires_at),
                          ("released_at", released_at), ("fence", fence),
                          ("merging", merging), ("merge_deadline", merge_deadline),
                          ("merge_started_mono", merge_started_mono),
-                         ("read_gen", read_gen), ("stale", stale)):
+                         ("read_gen", read_gen), ("stale", stale),
+                         ("authority_snapshot_hash", authority_snapshot_hash),
+                         ("decision_id", decision_id),
+                         ("decision_type", decision_type),
+                         ("blocker_ids", json.dumps(blocker_ids)
+                          if blocker_ids is not ... else ...),
+                         ("enqueued_at", enqueued_at),
+                         ("wait_deadline", wait_deadline),
+                         ("terminal_reason", terminal_reason)):
             if val is not ...:
                 sets.append(f"{col}=?"); args.append(val)
         if not sets:
@@ -366,10 +561,10 @@ class Store:
             "SELECT * FROM orbits WHERE state='HELD' AND kind='orbit'"))
 
     def pending_orbits(self) -> list[dict]:
-        # 우선순위 DESC → 같으면 FIFO(created_at ASC). 기아 방지 기본. merge_token 제외.
+        # 우선순위 DESC → 같으면 durable FIFO(queue_seq ASC). created_at은 M1 authority가 아님.
         return _rows(self.db.execute(
             "SELECT * FROM orbits WHERE state='PENDING' AND kind='orbit' "
-            "ORDER BY priority DESC, created_at ASC"))
+            "ORDER BY priority DESC, queue_seq ASC"))
 
     def orbits_for_task(self, task_id) -> list[dict]:
         return _rows(self.db.execute(
@@ -380,6 +575,15 @@ class Store:
         return _rows(self.db.execute(
             "SELECT * FROM orbits WHERE state='HELD' AND kind='orbit' AND merging=0 "
             "AND expires_at IS NOT NULL AND expires_at<=?", (now,)))
+
+    def due_pending_orbits(self, now) -> list[dict]:
+        """PENDING requests whose recorded authority deadline is due."""
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE state='PENDING' AND kind='orbit' "
+            "AND wait_deadline IS NOT NULL AND wait_deadline<=? "
+            "ORDER BY priority DESC, queue_seq ASC",
+            (now,),
+        ))
 
     # --- tasks ---
     def add_task(self, *, task_id, name, writes, reads, deps, state, priority, shared=None):
@@ -511,12 +715,19 @@ class Store:
         return _row(self.db.execute(
             "SELECT * FROM idempotency WHERE request_id=?", (request_id,)))
 
-    def begin_idem(self, request_id, agent_id, verb, arg_hash):
+    def begin_idem(self, request_id, agent_id, verb, arg_hash, args=None):
         """request_id를 INFLIGHT로 등록. 이미 있으면 무시(OR IGNORE) — 호출부가 get_idem으로 분기."""
         self.db.execute(
-            "INSERT OR IGNORE INTO idempotency(request_id,agent_id,verb,arg_hash,status,created_at)"
-            " VALUES(?,?,?,?, 'INFLIGHT', ?)",
-            (request_id, agent_id, verb, arg_hash, time.time()))
+            "INSERT OR IGNORE INTO idempotency(request_id,agent_id,verb,arg_hash,args_json,"
+            "status,created_at) VALUES(?,?,?,?,?, 'INFLIGHT', ?)",
+            (
+                request_id,
+                agent_id,
+                verb,
+                arg_hash,
+                json.dumps(args, sort_keys=True, default=str) if args is not None else None,
+                time.time(),
+            ))
 
     def finish_idem(self, request_id, response):
         """성공 종단만 캐시(DONE). 비성공은 clear_idem로 지운다(재시도 가능해야 — §3.C)."""
@@ -524,9 +735,39 @@ class Store:
             "UPDATE idempotency SET status='DONE', response=?, completed_at=? WHERE request_id=?",
             (json.dumps(response), time.time(), request_id))
 
+    def finish_idem_exact(self, request_id, agent_id, verb, arg_hash, response) -> bool:
+        """CAS an INFLIGHT row to DONE only for its original request envelope."""
+        cur = self.db.execute(
+            "UPDATE idempotency SET status='DONE', response=?, completed_at=? "
+            "WHERE request_id=? AND agent_id IS ? AND verb=? AND arg_hash=? "
+            "AND status='INFLIGHT'",
+            (json.dumps(response), time.time(), request_id, agent_id, verb, arg_hash),
+        )
+        return cur.rowcount == 1
+
     def clear_idem(self, request_id):
         """비성공(DENIED/stale-fence/fenced_out) — INFLIGHT 흔적 제거 → 세상이 바뀌면 재시도 가능."""
         self.db.execute("DELETE FROM idempotency WHERE request_id=?", (request_id,))
+
+    def clear_idem_exact(self, request_id, agent_id, verb, arg_hash) -> bool:
+        """Delete only the caller's matching unfinished envelope."""
+        cur = self.db.execute(
+            "DELETE FROM idempotency WHERE request_id=? AND agent_id IS ? "
+            "AND verb=? AND arg_hash=? AND status='INFLIGHT'",
+            (request_id, agent_id, verb, arg_hash),
+        )
+        return cur.rowcount == 1
+
+    def clear_inflight_idem(self) -> int:
+        """Clear abandoned split-phase reservations after leader recovery."""
+        cur = self.db.execute("DELETE FROM idempotency WHERE status='INFLIGHT'")
+        return cur.rowcount
+
+    def inflight_idem(self) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM idempotency WHERE status='INFLIGHT' "
+            "ORDER BY created_at,request_id"
+        ))
 
     def gc_idem(self, cutoff: float) -> int:
         """§D9 멱등 캐시 GC: cutoff 이전에 완료된 DONE 행 삭제(무한누적 차단).
@@ -785,7 +1026,12 @@ class Store:
 
     def snapshot(self) -> dict:
         return {
-            "orbits": _rows(self.db.execute("SELECT orbit_id,task_id,mode,state,fence,expires_at FROM orbits")),
+            "orbits": _rows(self.db.execute(
+                "SELECT orbit_id,task_id,agent_id,mode,state,priority,queue_seq,fence,"
+                "expires_at,requested_ttl,policy_version,decision_id,decision_type,"
+                "blocker_ids,enqueued_at,wait_deadline "
+                "FROM orbits"
+            )),
             "tasks": _rows(self.db.execute("SELECT task_id,name,state FROM tasks")),
             "flags": _rows(self.db.execute("SELECT key,value FROM flags")),
         }

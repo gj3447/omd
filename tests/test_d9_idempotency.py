@@ -12,6 +12,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from omd_server import Coordinator
 
 
@@ -25,6 +27,174 @@ def test_claim_retry_same_request_id_no_leak(tmp_path):
     assert r2.get("replayed"), r2
     held = [o for o in omd.store.held_orbits()]
     assert len(held) == 1, f"누수 lease: {held}"
+
+
+@pytest.mark.parametrize(
+    "mutated",
+    [
+        {"agent_id": "agB"},
+        {"pathspec": ["b/**"]},
+        {"mode": "read"},
+        {"bail_epoch": 1},
+    ],
+)
+def test_completed_request_id_rejects_mutated_claim_envelope(tmp_path, mutated):
+    """DONE replay is exact-envelope only; identity/intent mutation is a conflict."""
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"))
+    first = omd.claim(
+        "agA", ["a/**"], "write", request_id="same-id", bail_epoch=0
+    )
+    args = {
+        "agent_id": "agA",
+        "pathspec": ["a/**"],
+        "mode": "write",
+        "request_id": "same-id",
+        "bail_epoch": 0,
+    }
+    args.update(mutated)
+    conflict = omd.claim(**args)
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "idempotency_conflict"
+    assert omd.store.get_orbit(first["orbit_id"])["state"] == "HELD"
+    assert len(omd.store.held_orbits()) == 1
+
+
+def test_request_id_cannot_cross_verbs(tmp_path):
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"))
+    held = omd.claim("agA", ["a/**"], request_id="cross-verb")
+    conflict = omd.release(
+        held["orbit_id"], "agA", held["fence"], request_id="cross-verb"
+    )
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "idempotency_conflict"
+    assert omd.store.get_orbit(held["orbit_id"])["state"] == "HELD"
+
+
+def test_pending_request_identity_replays_exactly_and_rejects_mutation(tmp_path):
+    """PENDING is retryable but still owns its live request identity."""
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"))
+    omd.claim("holder", ["a/**"])
+    first = omd.claim(
+        "waiter", ["a/**"], priority=3, request_id="pending-id", bail_epoch=0
+    )
+    replay = omd.claim(
+        "waiter", ["a/**"], priority=3, request_id="pending-id", bail_epoch=0
+    )
+    assert replay["dedup"] is True
+    assert replay["orbit_id"] == first["orbit_id"]
+    assert replay["queue_seq"] == first["queue_seq"]
+
+    conflict = omd.claim(
+        "waiter", ["a/**"], priority=4, request_id="pending-id", bail_epoch=0
+    )
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "idempotency_conflict"
+    assert len(omd.store.pending_orbits()) == 1
+
+
+def test_pending_request_rejects_reason_mutation(tmp_path):
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"))
+    omd.claim("holder", ["a/**"])
+    first = omd.claim(
+        "waiter", ["a/**"], reason="first", request_id="pending-reason"
+    )
+    conflict = omd.claim(
+        "waiter", ["a/**"], reason="changed", request_id="pending-reason"
+    )
+    assert first["state"] == "PENDING"
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "idempotency_conflict"
+    assert len(omd.store.pending_orbits()) == 1
+
+
+def test_pending_request_id_owns_global_live_namespace(tmp_path):
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"))
+    holder = omd.claim("holder", ["a/**"])
+    waiting = omd.claim(
+        "waiter", ["a/**"], request_id="pending-global-id"
+    )
+    conflict = omd.release(
+        holder["orbit_id"], "holder", holder["fence"],
+        request_id="pending-global-id",
+    )
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "idempotency_conflict"
+    assert omd.store.get_orbit(waiting["orbit_id"])["state"] == "PENDING"
+    assert omd.store.get_orbit(holder["orbit_id"])["state"] == "HELD"
+
+
+def test_explicit_request_id_cannot_alias_natural_intent(tmp_path):
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"))
+    omd.claim("holder", ["a/**"])
+    original = omd.claim("waiter", ["a/**"], request_id="original-id")
+    alias = omd.claim("waiter", ["a/**"], request_id="alias-id")
+    assert original["state"] == "PENDING"
+    assert alias["ok"] is False
+    assert alias["reason"] == "idempotency_conflict"
+    assert alias["original_request_id"] == "original-id"
+    assert omd.store.latest_orbit_by_request("alias-id") is None
+
+
+def test_promoted_then_released_request_cannot_repeat_generation_zero(tmp_path):
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"), agent_ttl=None)
+    holder = omd.claim("holder", ["a/**"])
+    waiting = omd.claim("waiter", ["a/**"], request_id="lifecycle-id")
+    omd.release(holder["orbit_id"], "holder", holder["fence"])
+    promoted = omd.store.get_orbit(waiting["orbit_id"])
+    assert promoted["state"] == "HELD"
+    omd.release(promoted["orbit_id"], "waiter", promoted["fence"])
+    seq_before = omd.store.current_seq()
+    fence_before = omd.store.current_fence()
+
+    replay = omd.claim("waiter", ["a/**"], request_id="lifecycle-id")
+    rows = omd.store.db.execute(
+        "SELECT orbit_id,request_generation,state FROM orbits WHERE request_id=?",
+        ("lifecycle-id",),
+    ).fetchall()
+    assert replay["dedup"] is True
+    assert replay["orbit_id"] == waiting["orbit_id"]
+    assert replay["state"] == "RELEASED"
+    assert [(row["request_generation"], row["state"]) for row in rows] == [
+        (0, "RELEASED")
+    ]
+    assert omd.store.current_seq() == seq_before
+    assert omd.store.current_fence() == fence_before
+
+    conflict = omd.claim("waiter", ["b/**"], request_id="lifecycle-id")
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "idempotency_conflict"
+
+
+def test_timed_out_request_replays_terminal_generation_zero(tmp_path):
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"), agent_ttl=None)
+    holder = omd.claim("holder", ["a/**"])
+    waiting = omd.claim("waiter", ["a/**"], request_id="timeout-terminal")
+    with omd.store.tx():
+        omd.store.set_orbit(waiting["orbit_id"], wait_deadline=time.time() - 1)
+    omd.sweep()
+    timed_out = omd.store.get_orbit(waiting["orbit_id"])
+    assert timed_out["state"] == "DENIED"
+    assert timed_out["decision_type"] == "WAIT_TIMEOUT"
+
+    omd.release(holder["orbit_id"], "holder", holder["fence"])
+    seq_before = omd.store.current_seq()
+    fence_before = omd.store.current_fence()
+    replay = omd.claim("waiter", ["a/**"], request_id="timeout-terminal")
+    rows = omd.store.db.execute(
+        "SELECT orbit_id,request_generation,state,decision_type FROM orbits "
+        "WHERE request_id=?",
+        ("timeout-terminal",),
+    ).fetchall()
+
+    assert replay["dedup"] is True
+    assert replay["orbit_id"] == waiting["orbit_id"]
+    assert replay["state"] == "DENIED"
+    assert replay["request_generation"] == 0
+    assert [tuple(row) for row in rows] == [
+        (waiting["orbit_id"], 0, "DENIED", "WAIT_TIMEOUT")
+    ]
+    assert omd.store.current_seq() == seq_before
+    assert omd.store.current_fence() == fence_before
 
 
 def test_claim_semantic_dedup_without_request_id(tmp_path):
@@ -45,6 +215,7 @@ def test_denied_not_cached_retryable(tmp_path):
     omd.claim("agA", ["b/**"], "write")                      # agA 가 b 대기
     denied = omd.claim("agB", ["a/**"], "write", request_id="req-x")  # agB 가 a 대기 → 사이클
     assert denied["state"] == "DENIED" and denied.get("deadlock"), denied
+    assert denied["request_generation"] == 0
     # DENIED 가 캐시 안 됐는지: idempotency 행이 없어야(재시도 가능).
     assert omd.store.get_idem("req-x") is None
     # 교착 해소(agA release) 후 같은 request_id 재시도 → 이번엔 진행(캐시된 DENIED 재생 아님).
@@ -52,6 +223,7 @@ def test_denied_not_cached_retryable(tmp_path):
     omd.release(b["orbit_id"], "agB", b["fence"])
     retry = omd.claim("agB", ["a/**"], "write", request_id="req-x")
     assert retry["state"] in ("HELD", "PENDING"), retry
+    assert retry["request_generation"] == 1
 
 
 def test_fenced_out_not_cached(tmp_path):
@@ -124,6 +296,112 @@ def test_connect_retry_no_double_merge(tmp_path):
     log = subprocess.run(["git", "log", "--oneline", "main"], cwd=str(repo),
                          capture_output=True, text=True).stdout
     assert log.count("CLOUD CONNECT A") == 1, log
+
+
+def test_post_merged_noop_binds_request_envelope(tmp_path):
+    repo = tmp_path / "repo"; _init_repo(repo)
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"), repo=str(repo),
+                      worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
+    _develop(omd, "A", "a", "x.py", "x = 1\n")
+    assert omd.connect("A")["state"] == "MERGED"
+
+    noop = omd.connect("A", request_id="post-merged")
+    assert noop["state"] == "MERGED" and noop["noop"]
+    assert omd.store.get_idem("post-merged")["status"] == "DONE"
+    conflict = omd.connect("A", push="different", request_id="post-merged")
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "idempotency_conflict"
+
+
+def test_connect_reserves_request_envelope_across_unlocked_phase_b(tmp_path):
+    repo = tmp_path / "repo"; _init_repo(repo)
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"), repo=str(repo),
+                      worktrees_dir=str(tmp_path / "wt"), integration_branch="main")
+    _develop(omd, "A", "a", "x.py", "x = 1\n")
+    entered = threading.Event()
+    proceed = threading.Event()
+    real_phase_b = omd._connect_phase_b
+    result = {}
+
+    def blocked_phase_b(intent, push=None):
+        entered.set()
+        assert proceed.wait(5)
+        return real_phase_b(intent, push=push)
+
+    omd._connect_phase_b = blocked_phase_b
+
+    def first_connect():
+        result.update(omd.connect("A", request_id="split-id"))
+
+    thread = threading.Thread(target=first_connect)
+    thread.start()
+    assert entered.wait(5)
+    exact = omd.connect("A", request_id="split-id")
+    assert exact["ok"] is False and exact["reason"] == "request_inflight"
+    conflict = omd.connect("A", push="different", request_id="split-id")
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "idempotency_conflict"
+    proceed.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert result["state"] == "MERGED"
+    replay = omd.connect("A", request_id="split-id")
+    assert replay["state"] == "MERGED" and replay["replayed"]
+
+
+def test_barrier_trip_reserves_request_envelope_across_split_phase(tmp_path):
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"))
+
+    def ready(task, sub):
+        omd.declare(task, writes=[f"{sub}/**"])
+        omd.next_task(f"ag{task}")
+        claim = omd.claim(f"ag{task}", [f"{sub}/**"], task_id=task)
+        omd.start(task, f"ag{task}")
+        omd.finish(task)
+        return claim["fence"]
+
+    ready("A", "a")
+    fence_b = ready("B", "b")
+    omd.barrier_declare("rv", ["A", "B"])
+    omd.barrier_arrive("rv", "agA", "A")
+    entered = threading.Event()
+    proceed = threading.Event()
+    real_connect_one = omd._barrier_connect_one
+    result = {}
+
+    def blocked_connect_one(task_id, expected_fence):
+        if not entered.is_set():
+            entered.set()
+            assert proceed.wait(5)
+        return real_connect_one(task_id, expected_fence)
+
+    omd._barrier_connect_one = blocked_connect_one
+
+    def trip():
+        result.update(
+            omd.barrier_arrive("rv", "agB", "B", request_id="barrier-split")
+        )
+
+    thread = threading.Thread(target=trip)
+    thread.start()
+    assert entered.wait(5)
+    exact = omd.barrier_arrive(
+        "rv", "agB", "B", request_id="barrier-split"
+    )
+    assert exact["ok"] is False and exact["reason"] == "request_inflight"
+    conflict = omd.barrier_arrive(
+        "rv", "agB", "B", fence=fence_b, request_id="barrier-split"
+    )
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "idempotency_conflict"
+    proceed.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert result["state"] == "TRIPPED"
+    replay = omd.barrier_arrive(
+        "rv", "agB", "B", request_id="barrier-split"
+    )
+    assert replay["state"] == "TRIPPED" and replay["replayed"]
 
 
 def test_connect_already_merged_semantic_idempotent(tmp_path):

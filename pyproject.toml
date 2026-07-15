@@ -28,3 +28,6 @@ verify = "warn"     # 관측은 보고만(빌드 verdict를 뒤집지 않음)
 
 [tool.setuptools]
 packages = ["omd_server"]
+
+[tool.setuptools.package-data]
+omd_server = ["scheduler_admission_fsm.json"]

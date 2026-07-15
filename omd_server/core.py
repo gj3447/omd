@@ -37,6 +37,17 @@ import uuid
 from contextlib import contextmanager
 
 from . import bypass_audit, fsm, task_state
+from .admission import (
+    ADMISSION_POLICY_VERSION,
+    AdmissionRequest,
+    authority_snapshot_hash,
+    decide_admission,
+    exact_conflict,
+    normalize_pathspec,
+    pathspec_digest,
+    sha256_json,
+)
+from .admission_contract import bind_decision_id, project_legacy, step as admission_step
 from .disjoint import path_in_globs, sets_overlap
 from .events import NOOP
 from .gitio import (
@@ -76,15 +87,20 @@ class CoordinatorConflict(RuntimeError):
 
 class _IdemSlot:
     """멱등 래퍼의 슬롯. hit=캐시 적중(본문 skip), value=동사 본문이 set한 응답."""
-    __slots__ = ("hit", "value")
+    __slots__ = ("hit", "value", "deferred")
 
     def __init__(self):
         self.hit = False
         self.value = None
+        self.deferred = False
 
     def set(self, value):
         self.value = value
         return value
+
+    def defer(self):
+        """Keep this exact request envelope INFLIGHT across a split phase."""
+        self.deferred = True
 
 
 class Coordinator(FlagMixin, SemMixin, BarrierMixin):
@@ -97,6 +113,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                  enforce_single_coordinator: bool = True,
                  auto_push: str | None = None,
                  idem_ttl: float | None = 3600.0,
+                 admission_wait_timeout: float = 3600.0,
                  strict_writeset: bool = False,
                  sweep_interval: float | None = None,
                  integration_check=None,
@@ -130,6 +147,12 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 or isinstance(integration_check_output_limit, bool)
                 or integration_check_output_limit <= 0):
             raise ValueError("integration_check_output_limit must be a positive integer")
+        try:
+            admission_wait_timeout = float(admission_wait_timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("admission_wait_timeout must be finite and positive") from exc
+        if not math.isfinite(admission_wait_timeout) or admission_wait_timeout <= 0:
+            raise ValueError("admission_wait_timeout must be finite and positive")
         # §D14: `:memory:` 디폴트 금지 — 재기동마다 모든 fence/leader_epoch 가 0 으로 리셋되어
         # 낡은 토큰/잔여 merge 와 충돌(고스트 writer). 영속 DB 필수. 단위테스트는 allow_memory_db=
         # True 로 명시 opt-in(프로세스 1개, 재기동 없음 — fence 리셋 위험 없음).
@@ -140,6 +163,14 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 "tokens. Pass a file path, or allow_memory_db=True for single-process tests.")
         self.store = Store(db_path)
         self.coordinator_id = coordinator_id or f"coord-{uuid.uuid4().hex[:12]}"
+        # M1 request identity needs a stable authority domain.  Compute a seed here,
+        # then persist/read it after leadership acquisition so moving/restoring the
+        # DB cannot silently change request identity.
+        identity_path = repo if repo is not None else db_path
+        repository_id_seed = "repo-" + hashlib.sha256(
+            os.path.realpath(identity_path).encode("utf-8")
+        ).hexdigest()
+        self.repository_id = repository_id_seed
         self.leader_ttl = leader_ttl
         self.enforce_single_coordinator = enforce_single_coordinator
         self.leader_epoch = None  # 리더 lease 획득 후 채워짐(현 리더 세대)
@@ -159,6 +190,12 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # _lock/events/store 가 필요하므로 그것들 뒤에 둔다.
         if self.enforce_single_coordinator:
             self._acquire_leadership()
+        with self.store.tx():
+            persisted_repository_id = self.store.get_meta("repository_id")
+            if persisted_repository_id is None:
+                self.store.set_meta("repository_id", repository_id_seed)
+                persisted_repository_id = repository_id_seed
+            self.repository_id = persisted_repository_id
         self.merge_timeout = merge_timeout if merge_timeout is not None else MERGE_TIMEOUT_S
         self.integration_check = integration_check
         self.integration_check_timeout = integration_check_timeout
@@ -172,6 +209,11 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # §D9 멱등 캐시 GC TTL(초). 기본 1h — 어떤 현실적 MCP 재시도 윈도우보다 길어 replay 안전.
         # None=GC 안 함(기존동작). _sweep_inline 이 idem_ttl 지난 DONE 행 정리(무한누적 차단).
         self.idem_ttl = idem_ttl
+        # M1 admission payloads carry a concrete wait deadline.  Inline/periodic
+        # sweep and restart reconciliation deliver WAIT_TIMEOUT before promotion;
+        # periodic delivery remains opt-in so an idle default Coordinator does not
+        # by itself establish the complete bounded-wait contract.
+        self.admission_wait_timeout = admission_wait_timeout
         # P5 strict-writeset: True 면 commit-time 에 write-set 위반 즉시 거부+soft-reset(빠른 fail-loud).
         # 기본 off(connect-time enforce 유지=하위호환). env OMD_STRICT_WRITESET 폴백(정확 truthy 파싱).
         self.strict_writeset = bool(strict_writeset) or (
@@ -330,41 +372,248 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
     def _conflicts(self, pathspec, mode) -> list[str]:
         """pathspec/mode가 충돌하는 활성 HELD 궤도 id들. read↔read 공존; shared↔shared 공존
         (P2 hot 공유파일 레인 — 응결은 3-way, 배타 write/read 와 겹치면 여전히 충돌)."""
-        out = []
-        for o in self.store.held_orbits():
-            if mode == "read" and o["mode"] == "read":
-                continue
-            if mode == "shared" and o["mode"] == "shared":
-                continue
-            if sets_overlap(pathspec, json.loads(o["pathspec"])):
-                out.append(o["orbit_id"])
-        return out
+        return [
+            o["orbit_id"]
+            for o in self.store.held_orbits()
+            if exact_conflict(pathspec, mode, o)
+        ]
 
-    def _promote_pending(self):
-        for o in self.store.pending_orbits():  # 우선순위 DESC → FIFO
-            if not self._conflicts(json.loads(o["pathspec"]), o["mode"]):
+    def _admission_decision(self, pathspec, mode, priority, queue_seq, orbit_id=None):
+        """Shared initial-claim/promotion decision over one authority snapshot."""
+        held = self.store.held_orbits()
+        pending = self.store.pending_orbits()
+        request = AdmissionRequest.build(
+            pathspec, mode, priority, queue_seq, orbit_id=orbit_id
+        )
+        decision = decide_admission(request, held, pending)
+        snapshot_hash = authority_snapshot_hash(
+            held, pending, coordinator_epoch=self.leader_epoch
+        )
+        return decision, snapshot_hash
+
+    def _admission_identity(self, row=None, **values):
+        source = dict(row or {})
+        source.update(values)
+        orbit_id = source["orbit_id"]
+        request_id = source.get("request_id") or f"internal:{orbit_id}"
+        digest = source.get("pathspec_digest")
+        if digest is None:
+            raw_paths = source["pathspec"]
+            digest = pathspec_digest(
+                json.loads(raw_paths) if isinstance(raw_paths, str) else raw_paths
+            )
+        return {
+            "repository_id": self.repository_id,
+            "request_id": request_id,
+            "orbit_id": orbit_id,
+            "request_generation": int(source.get("request_generation") or 0),
+            "owner_agent": source["agent_id"],
+            "bail_epoch": int(source.get("bail_epoch") or 0),
+            "mode": source["mode"],
+            "pathspec_digest": digest,
+            "policy_version": source.get("policy_version") or ADMISSION_POLICY_VERSION,
+        }
+
+    def _admission_payload(self, event_type, identity, snapshot_hash, **variant):
+        payload = {
+            **identity,
+            "actor": self.coordinator_id,
+            "event_id": f"evt-{uuid.uuid4().hex}",
+            "authority_snapshot_hash": snapshot_hash,
+            **variant,
+        }
+        return bind_decision_id(event_type, payload)
+
+    @staticmethod
+    def _assert_admission_projection(context, event_type, payload, snapshot_hash, expected):
+        reduced = admission_step(
+            context,
+            event_type,
+            payload,
+            trusted_authority_snapshot_hash=snapshot_hash,
+        )
+        if not reduced.accepted:
+            raise RuntimeError(
+                f"admission reducer rejected authority decision: {reduced.reason}"
+            )
+        projection = project_legacy(reduced.context["state"], reduced.context)
+        if projection.state != expected:
+            raise RuntimeError(
+                f"admission projection mismatch: semantic={reduced.context['state']} "
+                f"legacy={projection.state} expected={expected}"
+            )
+        return reduced
+
+    def _pending_owner_fresh(self, orbit, now):
+        """Fail closed when a queued request no longer has a live owner."""
+        agent = self.store.get_agent(orbit["agent_id"])
+        if agent is None or agent["state"] != "WORKING":
+            return False
+        if not self.agent_ttl:
+            return True
+        ttl = agent["liveness_ttl"] or self.agent_ttl
+        return agent["last_heartbeat"] >= now - ttl
+
+    def _timeout_pending(self, now):
+        """Project due semantic WAIT_TIMEOUT events to legacy DENIED rows."""
+        timed_out = []
+        for orbit in self.store.due_pending_orbits(now):
+            held = self.store.held_orbits()
+            pending = self.store.pending_orbits()
+            snapshot_hash = authority_snapshot_hash(
+                held, pending, coordinator_epoch=self.leader_epoch
+            )
+            identity = self._admission_identity(orbit)
+            payload = {
+                "repository_id": identity["repository_id"],
+                "request_id": identity["request_id"],
+                "orbit_id": identity["orbit_id"],
+                "request_generation": identity["request_generation"],
+                "actor": self.coordinator_id,
+                "authority_snapshot_hash": snapshot_hash,
+                "observed_at": now,
+                "event_id": f"evt-{uuid.uuid4().hex}",
+            }
+            context = {
+                **identity,
+                "state": "PENDING",
+                "queue_seq": orbit["queue_seq"],
+                "wait_deadline": orbit["wait_deadline"],
+            }
+            self._assert_admission_projection(
+                context, "WAIT_TIMEOUT", payload, snapshot_hash, "DENIED"
+            )
+            self.store.set_orbit(
+                orbit["orbit_id"],
+                state=fsm.advance("orbit", "PENDING", "deny"),
+                released_at=now,
+                authority_snapshot_hash=snapshot_hash,
+                decision_id=None,
+                decision_type="WAIT_TIMEOUT",
+                blocker_ids=[],
+                terminal_reason="wait_timeout",
+            )
+            timed_out.append(orbit["orbit_id"])
+            self._emit(
+                "orbit_timed_out",
+                orbit["agent_id"],
+                orbit_id=orbit["orbit_id"],
+                queue_seq=orbit["queue_seq"],
+                wait_deadline=orbit["wait_deadline"],
+                observed_at=now,
+            )
+        return timed_out
+
+    def _promote_pending(self, now=None):
+        # Same pure decision table as claim().  Iteration is priority DESC then
+        # durable queue_seq ASC; disjoint requests may all promote in one pass.
+        now = time.time() if now is None else now
+        for o in self.store.pending_orbits():
+            # Defense in depth: all public callers reconcile deadlines/owners
+            # first, but a direct internal call must still never grant either.
+            if o["wait_deadline"] is not None and o["wait_deadline"] <= now:
+                continue
+            if not self._pending_owner_fresh(o, now):
+                continue
+            decision, snapshot_hash = self._admission_decision(
+                json.loads(o["pathspec"]),
+                o["mode"],
+                o["priority"],
+                o["queue_seq"],
+                orbit_id=o["orbit_id"],
+            )
+            identity = self._admission_identity(o)
+            if decision.grantable:
                 fence = self.store.next_fence()
                 # §D12: PENDING read-궤도가 뒤늦게 grant 될 때도 현 통합 gen 을 박는다.
                 rg = self.store.integration_gen() if o["mode"] == "read" else ...
+                ttl = o["requested_ttl"] if o["requested_ttl"] is not None else 600.0
+                lease_deadline = now + ttl
+                payload = self._admission_payload(
+                    "PROMOTION_GRANTED",
+                    identity,
+                    snapshot_hash,
+                    queue_seq=o["queue_seq"],
+                    fence=fence,
+                    lease_deadline=lease_deadline,
+                )
+                context = {**identity, "state": "PENDING", "queue_seq": o["queue_seq"]}
+                self._assert_admission_projection(
+                    context, "PROMOTION_GRANTED", payload, snapshot_hash, "HELD"
+                )
                 self.store.set_orbit(
                     o["orbit_id"],
                     state=fsm.advance("orbit", "PENDING", "grant"),
-                    expires_at=time.time() + 600, fence=fence, read_gen=rg)
+                    expires_at=lease_deadline,
+                    fence=fence,
+                    read_gen=rg,
+                    authority_snapshot_hash=snapshot_hash,
+                    decision_id=payload["decision_id"],
+                    decision_type="PROMOTION_GRANTED",
+                    blocker_ids=[],
+                )
                 self._emit("orbit_granted", o["agent_id"], orbit_id=o["orbit_id"],
-                           fence=fence, mode=o["mode"], promoted=True)
+                           fence=fence, mode=o["mode"], promoted=True,
+                           queue_seq=o["queue_seq"], decision_id=payload["decision_id"])
+            else:
+                blocker_fingerprint = sha256_json(list(decision.blocker_ids))
+                payload = self._admission_payload(
+                    "PROMOTION_BLOCKED",
+                    identity,
+                    snapshot_hash,
+                    queue_seq=o["queue_seq"],
+                    blocker_fingerprint=blocker_fingerprint,
+                )
+                context = {**identity, "state": "PENDING", "queue_seq": o["queue_seq"]}
+                self._assert_admission_projection(
+                    context, "PROMOTION_BLOCKED", payload, snapshot_hash, "PENDING"
+                )
+                self.store.set_orbit(
+                    o["orbit_id"],
+                    authority_snapshot_hash=snapshot_hash,
+                    decision_id=payload["decision_id"],
+                    decision_type="PROMOTION_BLOCKED",
+                    blocker_ids=list(decision.blocker_ids),
+                )
+
+    def _reconcile_admission(self, now=None, *, reclaim=True):
+        """One ordering for release, connect, recovery, and periodic sweep.
+
+        Safety depends on this sequence: expire old HELD authority, reclaim stale
+        owners, terminate due PENDING requests, then consider promotion.
+        """
+        now = time.time() if now is None else now
+        for orbit in self.store.due_orbits(now):
+            self.store.set_orbit(
+                orbit["orbit_id"],
+                state=fsm.advance("orbit", "HELD", "expire"),
+                released_at=now,
+            )
+            self._emit("orbit_expired", orbit["agent_id"], orbit_id=orbit["orbit_id"])
+        if reclaim and self.agent_ttl:
+            self._reclaim_zombies_inline(promote=False)
+        self._timeout_pending(now)
+        self._promote_pending(now)
 
     def _wait_for(self) -> dict:
-        """wait-for 그래프: PENDING 요청 agent → 그 경로를 쥔 HELD agent."""
+        """Combined HELD ownership + higher-ranked PENDING reservation graph."""
         held = self.store.held_orbits()
+        pending = self.store.pending_orbits()
+        by_id = {o["orbit_id"]: o for o in held + pending}
         edges: dict = {}
-        for p in self.store.pending_orbits():
-            req, md = p["agent_id"], p["mode"]
-            ps = json.loads(p["pathspec"])
-            for o in held:
-                if md == "read" and o["mode"] == "read":
-                    continue
-                if o["agent_id"] != req and sets_overlap(ps, json.loads(o["pathspec"])):
-                    edges.setdefault(req, set()).add(o["agent_id"])
+        for p in pending:
+            request = AdmissionRequest.build(
+                json.loads(p["pathspec"]),
+                p["mode"],
+                p["priority"],
+                p["queue_seq"],
+                orbit_id=p["orbit_id"],
+            )
+            decision = decide_admission(request, held, pending)
+            for blocker_id in decision.blocker_ids:
+                blocker = by_id[blocker_id]
+                if blocker["agent_id"] != p["agent_id"]:
+                    edges.setdefault(p["agent_id"], set()).add(blocker["agent_id"])
         return edges
 
     def _cycle_with(self, node) -> bool:
@@ -435,13 +684,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
 
     def _sweep_inline(self):
         """임계구역 안에서 도는 sweep 본체(만료 회수 + 좀비 회수 + promote). tx 자기관리 안 함."""
-        if self.agent_ttl:
-            self._reclaim_zombies_inline()
         now = time.time()
-        for o in self.store.due_orbits(now):
-            self.store.set_orbit(o["orbit_id"],
-                                 state=fsm.advance("orbit", "HELD", "expire"))
-            self._emit("orbit_expired", o["agent_id"], orbit_id=o["orbit_id"])
+        self._reconcile_admission(now)
         # D3(§1.2): TTL 만료된 flag_ephemeral lease — 보유자가 renew 안 함(GC-pause/사망) →
         # 받쳐주던 EPHEMERAL 플래그를 BROKEN(자동 clear) + 대기자 PRODUCER_DEAD 기상. 영구 hang 0.
         for fl in self.store.due_flag_leases(now):
@@ -467,13 +711,12 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # 트립 plan(전원 도착)은 sweep 에서 실행하지 않는다(merge 는 락 밖이라 arrive 가 돌린다).
         for b in self.store.all_barriers(states=("ARMED",)):
             self._barrier_eval(b["barrier_id"])
-        self._promote_pending()
         # §D9 멱등 캐시 GC: idem_ttl 지난 DONE 행 정리(무한누적 차단). INFLIGHT(진행중)은
         # completed_at NULL 로 보존. now 는 위에서 이미 정의됨(시각 일관).
         if self.idem_ttl:
             self.store.gc_idem(now - self.idem_ttl)
 
-    def _reclaim_zombies_inline(self):
+    def _reclaim_zombies_inline(self, *, promote=True):
         """heartbeat 끊긴 물방울(involuntary) — 단일 회수 루틴으로 위임.
         F2: 생존창은 per-agent(liveness_ttl 선언, 미선언=agent_ttl) — 판정은 store 쿼리가 원자."""
         if not self.agent_ttl:
@@ -494,11 +737,13 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             )
             if active_connect_pin:
                 continue
-            self._reclaim_agent_inline(a["agent_id"], voluntary=False)
+            self._reclaim_agent_inline(
+                a["agent_id"], voluntary=False, promote=promote
+            )
             out.append(a["agent_id"])
         return out
 
-    def _reclaim_agent_inline(self, agent_id, *, voluntary):
+    def _reclaim_agent_inline(self, agent_id, *, voluntary, promote=True):
         """긴급탈출(voluntary `bail`) / 좀비회수(involuntary) **단일 루틴** (D2).
         이 agent가 쥔 모든 궤도(HELD/PENDING)를 해제하고, 진행중 작업(CLAIMED/IN_ORBIT/CONNECTING)을
         requeue하고, worktree+브랜치를 정리하고, agent를 RETIRE한다 → 어떤 보유물도 고아가 안 된다.
@@ -578,7 +823,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                    orbits=len(freed), tasks=len(requeued))
         for sem_id in reclaimed_sems:
             self._promote_sem_waiters(sem_id)  # 복구된 슬롯을 줄선 순서로 부여(§D7)
-        self._promote_pending()
+        if promote:
+            self._reconcile_admission(reclaim=False)
         return {"agent": agent_id, "voluntary": voluntary, "orbits": freed, "tasks": requeued}
 
     def _check_owner(self, o, agent_id, fence):
@@ -675,19 +921,126 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         if request_id is None:
             yield cache
             return
+        arg_hash = self._arg_hash(verb, args)
+        # PENDING is deliberately not a generic DONE cache entry because its
+        # response evolves.  The live orbit row still owns the request-id
+        # namespace, so another verb/agent cannot reuse it meanwhile.
+        live_request = self.store.orbit_by_request(request_id)
+        if live_request is not None and (
+            verb != "claim" or live_request["agent_id"] != agent_id
+        ):
+            cache.hit = True
+            cache.value = {
+                "ok": False,
+                "reason": "idempotency_conflict",
+                "request_id": request_id,
+                "original": {
+                    "agent_id": live_request["agent_id"],
+                    "verb": "claim",
+                    "orbit_id": live_request["orbit_id"],
+                },
+                "received": {"agent_id": agent_id, "verb": verb},
+            }
+            self._emit(
+                "idempotency_conflict",
+                agent_id,
+                request_id=request_id,
+                original_agent=live_request["agent_id"],
+                original_verb="claim",
+                received_verb=verb,
+            )
+            yield cache
+            return
         prior = self.store.get_idem(request_id)
+        if prior is not None and (
+            prior["agent_id"] != agent_id
+            or prior["verb"] != verb
+            or prior["arg_hash"] != arg_hash
+        ):
+            cache.hit = True
+            cache.value = {
+                "ok": False,
+                "reason": "idempotency_conflict",
+                "request_id": request_id,
+                "original": {
+                    "agent_id": prior["agent_id"],
+                    "verb": prior["verb"],
+                    "arg_hash": prior["arg_hash"],
+                },
+                "received": {
+                    "agent_id": agent_id,
+                    "verb": verb,
+                    "arg_hash": arg_hash,
+                },
+            }
+            self._emit(
+                "idempotency_conflict",
+                agent_id,
+                request_id=request_id,
+                original_agent=prior["agent_id"],
+                original_verb=prior["verb"],
+                received_verb=verb,
+            )
+            yield cache
+            return
         if prior is not None and prior["status"] == "DONE":
             cache.hit = True
             cache.value = json.loads(prior["response"])
             cache.value = dict(cache.value, replayed=True) if isinstance(cache.value, dict) else cache.value
             yield cache
             return
-        self.store.begin_idem(request_id, agent_id, verb, self._arg_hash(verb, args))
-        yield cache
+        if prior is not None and prior["status"] == "INFLIGHT":
+            cache.hit = True
+            cache.value = {
+                "ok": False,
+                "reason": "request_inflight",
+                "request_id": request_id,
+                "retry": True,
+            }
+            yield cache
+            return
+        self.store.begin_idem(request_id, agent_id, verb, arg_hash)
+        try:
+            yield cache
+        except BaseException:
+            self.store.clear_idem_exact(request_id, agent_id, verb, arg_hash)
+            raise
+        if cache.deferred:
+            return
         if cache.value is not None and self._is_success(cache.value):
-            self.store.finish_idem(request_id, cache.value)
+            if not self.store.finish_idem_exact(
+                request_id, agent_id, verb, arg_hash, cache.value
+            ):
+                raise RuntimeError(
+                    f"idempotency ownership lost while finishing {verb}:{request_id}"
+                )
         else:
-            self.store.clear_idem(request_id)
+            self.store.clear_idem_exact(request_id, agent_id, verb, arg_hash)
+
+    def _complete_split_idem(self, request_id, agent_id, verb, args, response):
+        """Finish/clear the exact envelope reserved before a split phase."""
+        if request_id is None:
+            return response
+        arg_hash = self._arg_hash(verb, args)
+        with self._cs():
+            if self._is_success(response):
+                if not self.store.finish_idem_exact(
+                    request_id, agent_id, verb, arg_hash, response
+                ):
+                    raise RuntimeError(
+                        f"idempotency ownership lost while finishing {verb}:{request_id}"
+                    )
+            else:
+                self.store.clear_idem_exact(request_id, agent_id, verb, arg_hash)
+        return response
+
+    def _clear_split_idem(self, request_id, agent_id, verb, args):
+        if request_id is None:
+            return
+        with self._cs():
+            self.store.clear_idem_exact(
+                request_id, agent_id, verb, self._arg_hash(verb, args)
+            )
 
     # ---- merge_token / 통합 worktree (§D11) ----
     def _trailer(self, task_id) -> str:
@@ -789,7 +1142,14 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             # 조정한다(위에서 CONNECTING 이 전부 MERGED/DONE 으로 수렴했으므로 여기의 멤버
             # 상태 = git 진실).
             self._barrier_recover()
-            self._promote_pending()
+            self._reconcile_admission()
+            abandoned = self.store.clear_inflight_idem()
+            if abandoned:
+                self._emit(
+                    "idempotency_inflight_recovered",
+                    self.coordinator_id,
+                    cleared=abandoned,
+                )
 
     def _barrier_recover(self):
         """§3.D: TRIPPING 중 크래시한 배리어를 *단위*로 조정(임계구역 안, _recover 말미).
@@ -1057,10 +1417,31 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
 
     def claim(self, agent_id, pathspec, mode="write", *, ttl=600.0, task_id=None,
               reason="", priority=0, request_id=None, bail_epoch=None):
+        if not isinstance(agent_id, str) or not agent_id:
+            return {"ok": False, "state": "REJECTED", "reason": "invalid_agent_id"}
+        if request_id is not None and (
+            not isinstance(request_id, str) or not request_id
+        ):
+            return {"ok": False, "state": "REJECTED", "reason": "invalid_request_id"}
         if isinstance(pathspec, str):
             pathspec = [pathspec]
+        try:
+            pathspec = list(normalize_pathspec(pathspec))
+            ttl = float(ttl)
+            if not math.isfinite(ttl) or ttl <= 0:
+                raise ValueError("ttl must be finite and positive")
+            # AdmissionRequest performs the canonical mode/priority checks.  A dummy
+            # sequence is sufficient because validation precedes authority mutation.
+            AdmissionRequest.build(pathspec, mode, priority, 0)
+        except (TypeError, ValueError) as exc:
+            return {
+                "ok": False,
+                "state": "REJECTED",
+                "reason": "invalid_admission_request",
+                "detail": str(exc),
+            }
         with self._cs():
-            args = [agent_id, sorted(pathspec), mode, task_id, ttl, priority]
+            args = [agent_id, pathspec, mode, task_id, ttl, priority, reason, bail_epoch]
             with self._idem(request_id, agent_id, "claim", args) as cache:
                 if cache.hit:
                     return cache.value
@@ -1070,41 +1451,196 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 if dead:
                     return cache.set(dead)
                 self.store.upsert_agent(agent_id)
+                agent = self.store.get_agent(agent_id)
+                effective_bail_epoch = int(agent["bail_epoch"] if agent else 0)
                 self._emit("orbit_requested", agent_id, mode=mode, paths=pathspec, task=task_id)
+                # PENDING is not stored in the generic DONE cache, but its durable
+                # request identity still forbids a same-id/different-intent mutation.
+                request_generation = 0
+                request_dup = self.store.latest_orbit_by_request(request_id)
+                if request_dup is not None:
+                    same_request = (
+                        request_dup["agent_id"] == agent_id
+                        and request_dup["mode"] == mode
+                        and list(normalize_pathspec(json.loads(request_dup["pathspec"]))) == pathspec
+                        and request_dup["task_id"] == task_id
+                        and int(request_dup["priority"] or 0) == priority
+                        and float(request_dup["requested_ttl"] or 600.0) == ttl
+                        and int(request_dup["bail_epoch"] or 0) == effective_bail_epoch
+                        and (request_dup["reason"] or "") == (reason or "")
+                    )
+                    if not same_request:
+                        self._emit("idempotency_conflict", agent_id,
+                                   request_id=request_id,
+                                   original_orbit=request_dup["orbit_id"],
+                                   received_verb="claim")
+                        return cache.set({"ok": False,
+                                          "reason": "idempotency_conflict",
+                                          "request_id": request_id,
+                                          "original_orbit": request_dup["orbit_id"]})
+                    retryable_policy_denial = (
+                        request_dup["state"] == "DENIED"
+                        and request_dup["decision_type"]
+                        in ("ADMISSION_DENIED", "PROMOTION_DENIED")
+                    )
+                    if retryable_policy_denial:
+                        # §3.C treats a policy denial as a retryable attempt.  The
+                        # retry advances the durable generation so the same request
+                        # id never creates two generation-zero effects.
+                        request_generation = self.store.next_request_generation(
+                            request_id
+                        )
+                    else:
+                        blockers = json.loads(request_dup["blocker_ids"] or "[]")
+                        return cache.set({"orbit_id": request_dup["orbit_id"],
+                                          "request_id": request_dup["request_id"],
+                                          "request_generation": request_dup[
+                                              "request_generation"],
+                                          "state": request_dup["state"],
+                                          "fence": request_dup["fence"],
+                                          "queue_seq": request_dup["queue_seq"],
+                                          "conflicts": blockers,
+                                          "decision_id": request_dup["decision_id"],
+                                          "dedup": True})
                 # §D9 의미적 멱등: dedup 우회돼도(다른 request_id·없음) 같은 의도면 기존 궤도 반환.
                 # §3.C 교차: 단 **현재 caller가 그 궤도의 소유자**여야 살아있는 HELD를 돌려준다 —
                 # 회수돼 타인에게 재부여된 lease를 우회로 넘기지 않음(fencing 무장 방지).
                 ikey = self._intent_key(agent_id, pathspec, mode, task_id)
                 dup = self.store.orbit_by_intent(ikey)
                 if dup is not None and dup["agent_id"] == agent_id:
+                    if request_id is not None and dup["request_id"] != request_id:
+                        self._emit(
+                            "idempotency_conflict", agent_id,
+                            request_id=request_id,
+                            original_orbit=dup["orbit_id"],
+                            original_request_id=dup["request_id"],
+                            received_verb="claim",
+                        )
+                        return cache.set({
+                            "ok": False,
+                            "reason": "idempotency_conflict",
+                            "request_id": request_id,
+                            "original_orbit": dup["orbit_id"],
+                            "original_request_id": dup["request_id"],
+                        })
                     self._emit("orbit_dedup", agent_id, orbit_id=dup["orbit_id"],
                                state=dup["state"])
-                    out = {"orbit_id": dup["orbit_id"], "state": dup["state"],
-                           "fence": dup["fence"], "conflicts": [], "dedup": True}
+                    out = {"orbit_id": dup["orbit_id"], "request_id": dup["request_id"],
+                           "request_generation": dup["request_generation"],
+                           "state": dup["state"], "fence": dup["fence"],
+                           "queue_seq": dup["queue_seq"],
+                           "conflicts": json.loads(dup["blocker_ids"] or "[]"),
+                           "decision_id": dup["decision_id"], "dedup": True}
                     return cache.set(out)
-                conf = self._conflicts(pathspec, mode)
-                if conf:
-                    oid = self.store.add_orbit(task_id=task_id, agent_id=agent_id,
-                                               pathspec=pathspec, mode=mode, state="PENDING",
-                                               reason=reason, priority=priority,
-                                               intent_key=ikey)
+                queue_seq = self.store.next_seq()
+                oid = "orb-" + uuid.uuid4().hex[:12]
+                semantic_request_id = request_id or f"internal:{oid}"
+                decision, snapshot_hash = self._admission_decision(
+                    pathspec, mode, priority, queue_seq, orbit_id=oid
+                )
+                identity = self._admission_identity(
+                    orbit_id=oid, request_id=semantic_request_id,
+                    request_generation=request_generation,
+                    agent_id=agent_id, bail_epoch=effective_bail_epoch, mode=mode,
+                    pathspec=pathspec, pathspec_digest=pathspec_digest(pathspec),
+                    policy_version=ADMISSION_POLICY_VERSION,
+                )
+                if not decision.grantable:
+                    enqueued_at = time.time()
+                    wait_deadline = enqueued_at + self.admission_wait_timeout
+                    payload = self._admission_payload(
+                        "ADMISSION_QUEUED", identity, snapshot_hash,
+                        queue_seq=queue_seq, enqueued_at=enqueued_at,
+                        wait_deadline=wait_deadline,
+                    )
+                    self._assert_admission_projection(
+                        {**identity, "state": "REQUESTED"}, "ADMISSION_QUEUED",
+                        payload, snapshot_hash, "PENDING")
+                    oid = self.store.add_orbit(
+                        orbit_id=oid, task_id=task_id, agent_id=agent_id,
+                        pathspec=pathspec, mode=mode, state="PENDING", reason=reason,
+                        priority=priority, intent_key=ikey, queue_seq=queue_seq,
+                        requested_ttl=ttl, policy_version=ADMISSION_POLICY_VERSION,
+                        pathspec_digest=identity["pathspec_digest"],
+                        request_id=semantic_request_id,
+                        request_generation=request_generation,
+                        bail_epoch=effective_bail_epoch,
+                        authority_snapshot_hash=snapshot_hash,
+                        decision_id=payload["decision_id"],
+                        decision_type="ADMISSION_QUEUED",
+                        blocker_ids=list(decision.blocker_ids),
+                        enqueued_at=enqueued_at,
+                        wait_deadline=wait_deadline)
                     if self._cycle_with(agent_id):  # 대기 시 데드락 사이클이면 거부
-                        self.store.set_orbit(oid, state=fsm.advance("orbit", "PENDING", "deny"))
-                        self._emit("orbit_denied", agent_id, orbit_id=oid, deadlock=True)
+                        held = self.store.held_orbits()
+                        pending = self.store.pending_orbits()
+                        denial_snapshot = authority_snapshot_hash(
+                            held, pending, coordinator_epoch=self.leader_epoch)
+                        denial = self._admission_payload(
+                            "PROMOTION_DENIED", identity, denial_snapshot,
+                            queue_seq=queue_seq, reason="reservation_cycle")
+                        self._assert_admission_projection(
+                            {**identity, "state": "PENDING", "queue_seq": queue_seq},
+                            "PROMOTION_DENIED", denial, denial_snapshot, "DENIED")
+                        self.store.set_orbit(
+                            oid, state=fsm.advance("orbit", "PENDING", "deny"),
+                            authority_snapshot_hash=denial_snapshot,
+                            decision_id=denial["decision_id"],
+                            decision_type="PROMOTION_DENIED",
+                            terminal_reason="reservation_cycle")
+                        self._emit("orbit_denied", agent_id, orbit_id=oid, deadlock=True,
+                                   queue_seq=queue_seq, decision_id=denial["decision_id"])
                         # DENIED는 캐시 금지(§3.C) — 세상이 바뀌면 재시도가 성공할 수 있어야.
-                        return cache.set({"orbit_id": oid, "state": "DENIED",
-                                          "deadlock": True, "conflicts": conf})
-                    self._emit("orbit_pending", agent_id, orbit_id=oid, conflicts=len(conf))
-                    return cache.set({"orbit_id": oid, "state": "PENDING", "conflicts": conf})
+                        return cache.set({"orbit_id": oid,
+                                          "request_id": semantic_request_id,
+                                          "request_generation": request_generation,
+                                          "state": "DENIED",
+                                          "deadlock": True,
+                                          "reason": "reservation_cycle",
+                                          "queue_seq": queue_seq,
+                                          "conflicts": list(decision.blocker_ids),
+                                          "held_conflicts": list(decision.held_blockers),
+                                          "pending_predecessors": list(
+                                              decision.pending_predecessors),
+                                          "decision_id": denial["decision_id"]})
+                    self._emit("orbit_pending", agent_id, orbit_id=oid,
+                               conflicts=len(decision.blocker_ids), queue_seq=queue_seq,
+                               held_conflicts=len(decision.held_blockers),
+                               pending_predecessors=len(decision.pending_predecessors),
+                               decision_id=payload["decision_id"])
+                    return cache.set({"orbit_id": oid,
+                                      "request_id": semantic_request_id,
+                                      "request_generation": request_generation,
+                                      "state": "PENDING", "queue_seq": queue_seq,
+                                      "conflicts": list(decision.blocker_ids),
+                                      "held_conflicts": list(decision.held_blockers),
+                                      "pending_predecessors": list(
+                                          decision.pending_predecessors),
+                                      "decision_id": payload["decision_id"]})
                 fence = self.store.next_fence()
+                lease_deadline = time.time() + ttl
+                payload = self._admission_payload(
+                    "ADMISSION_GRANTED", identity, snapshot_hash,
+                    fence=fence, lease_deadline=lease_deadline)
+                self._assert_admission_projection(
+                    {**identity, "state": "REQUESTED"}, "ADMISSION_GRANTED",
+                    payload, snapshot_hash, "HELD")
                 # §D12: read-궤도는 분기한 통합 generation 을 박는다 — 이후 겹치는 응결이
                 # 이보다 새 gen 을 만들면 stale 로 표시돼 consumer 가 옛 base 위에 빌드하는 것을 막는다.
                 read_gen = self.store.integration_gen() if mode == "read" else None
-                oid = self.store.add_orbit(task_id=task_id, agent_id=agent_id, pathspec=pathspec,
-                                           mode=mode, state="HELD", fence=fence,
-                                           expires_at=time.time() + ttl, reason=reason,
-                                           priority=priority, intent_key=ikey,
-                                           read_gen=read_gen)
+                oid = self.store.add_orbit(
+                    orbit_id=oid, task_id=task_id, agent_id=agent_id,
+                    pathspec=pathspec, mode=mode, state="HELD", fence=fence,
+                    expires_at=lease_deadline, reason=reason, priority=priority,
+                    intent_key=ikey, read_gen=read_gen, queue_seq=queue_seq,
+                    requested_ttl=ttl, policy_version=ADMISSION_POLICY_VERSION,
+                    pathspec_digest=identity["pathspec_digest"],
+                    request_id=semantic_request_id,
+                    request_generation=request_generation,
+                    bail_epoch=effective_bail_epoch,
+                    authority_snapshot_hash=snapshot_hash,
+                    decision_id=payload["decision_id"],
+                    decision_type="ADMISSION_GRANTED", blocker_ids=[])
                 # §D12: read claim 은 그 task 의 read-set 동기화 gen 을 박는다(궤도 생명과 분리 —
                 # 궤도를 release 한 뒤에도 consumer 의 connect 가 코히런스를 검사하도록). 여러 read
                 # 를 claim 하면 가장 옛 gen(보수적)로 고정한다.
@@ -1114,11 +1650,14 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                         prev = t["read_synced_gen"]
                         if prev is None or read_gen < prev:
                             self.store.set_task(task_id, read_synced_gen=read_gen)
-                self._emit("orbit_granted", agent_id, orbit_id=oid, fence=fence, mode=mode)
-                be = self.store.get_agent(agent_id)
-                return cache.set({"orbit_id": oid, "state": "HELD", "fence": fence,
-                                  "conflicts": [],
-                                  "bail_epoch": be["bail_epoch"] if be else 0})
+                self._emit("orbit_granted", agent_id, orbit_id=oid, fence=fence, mode=mode,
+                           queue_seq=queue_seq, decision_id=payload["decision_id"])
+                return cache.set({"orbit_id": oid, "request_id": semantic_request_id,
+                                  "request_generation": request_generation,
+                                  "state": "HELD", "fence": fence,
+                                  "queue_seq": queue_seq, "conflicts": [],
+                                  "decision_id": payload["decision_id"],
+                                  "bail_epoch": effective_bail_epoch})
 
     def renew(self, orbit_id, agent_id, fence, ttl=600.0, *, request_id=None,
               bail_epoch=None):
@@ -1171,7 +1710,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 self.store.set_orbit(orbit_id, state=fsm.advance("orbit", "HELD", "release"),
                                      released_at=time.time())
                 self._emit("orbit_released", agent_id, orbit_id=orbit_id)
-                self._promote_pending()
+                self._reconcile_admission()
                 return cache.set({"ok": True})
 
     def bail(self, agent_id, *, request_id=None):
@@ -1447,43 +1986,55 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         §D9: request_id 멱등(성공만 캐시). split-phase라 _idem 트랜잭션을 Phase B에 걸칠 수 없어
         캐시 확인/기록을 짧은 _cs() 두 곳으로 나눈다. 의미적 멱등(already-MERGED)은 fencing 위(§3.C):
         connect는 owner/fence 통과 후에만 머지하므로 dedup 재생이 재부여 lease를 풀지 않는다."""
-        # §D9 dedup 캐시 적중(성공 종단만 저장됨) → 재머지 없이 캐시 응답.
-        if request_id is not None:
-            with self._cs():
-                prior = self.store.get_idem(request_id)
-                if prior is not None and prior["status"] == "DONE":
-                    out = json.loads(prior["response"])
-                    return dict(out, replayed=True) if isinstance(out, dict) else out
-
-        # 멱등(P0-9/D9): 이미 응결된 task는 재머지 없이 즉시 MERGED 회신.
+        idem_args = [task_id, agent_id, fence, push, bail_epoch]
+        # Reserve the exact request envelope before leaving the transaction.  A
+        # concurrent exact retry sees request_inflight; a different envelope
+        # cannot hijack the id while Phase B is outside the lock.
         with self._cs():
-            t0 = self.store.get_task(task_id)
-            if t0 and t0["state"] == "MERGED":
-                return {"ok": True, "task_id": task_id, "state": "MERGED",
-                        "merge_sha": t0["merge_sha"], "noop": True}
+            with self._idem(
+                request_id, agent_id, "connect", idem_args
+            ) as cache:
+                if cache.hit:
+                    return cache.value
+                t0 = self.store.get_task(task_id)
+                if t0 and t0["state"] == "MERGED":
+                    return cache.set({
+                        "ok": True,
+                        "task_id": task_id,
+                        "state": "MERGED",
+                        "merge_sha": t0["merge_sha"],
+                        "noop": True,
+                    })
+                cache.defer()
 
-        deadline = time.time() + max(self.merge_timeout, 5.0) + 10.0
-        while True:
-            a = self._connect_phase_a(task_id, agent_id, fence, bail_epoch)
-            if not a["ok"]:
-                if a.get("retry") and time.time() < deadline:
-                    time.sleep(0.01)   # merge_token 경합 — 다른 connect 응결중. 곧 재시도.
-                    continue
-                return a               # 거부(fenced_out 등)는 캐시 안 함(§3.C)
-            if a.get("noop"):          # 이미 MERGED (멱등)
-                return a
-            # ----- Phase B: 락 밖(no _cs, no live tx) git merge -----
-            token_id, intent = a["token_id"], a["intent"]
-            merge_sha, err = self._connect_phase_b(intent, push=push)
-            # ----- Phase C: 락 안 — merge_sha 먼저 기록 후 해제(P0-6) -----
-            res = self._connect_phase_c(task_id, token_id, intent, merge_sha, err)
-            # §D9: 성공 종단만 캐시(merge conflict/timeout=retryable → 캐시 금지).
-            if request_id is not None and self._is_success(res):
-                with self._cs():
-                    self.store.begin_idem(request_id, agent_id, "connect",
-                                          self._arg_hash("connect", [task_id, fence]))
-                    self.store.finish_idem(request_id, res)
-            return res
+        try:
+            deadline = time.time() + max(self.merge_timeout, 5.0) + 10.0
+            while True:
+                a = self._connect_phase_a(task_id, agent_id, fence, bail_epoch)
+                if not a["ok"]:
+                    if a.get("retry") and time.time() < deadline:
+                        time.sleep(0.01)   # merge_token 경합 — 다른 connect 응결중. 곧 재시도.
+                        continue
+                    return self._complete_split_idem(
+                        request_id, agent_id, "connect", idem_args, a
+                    )
+                if a.get("noop"):
+                    return self._complete_split_idem(
+                        request_id, agent_id, "connect", idem_args, a
+                    )
+                # ----- Phase B: 락 밖(no _cs, no live tx) git merge -----
+                token_id, intent = a["token_id"], a["intent"]
+                merge_sha, err = self._connect_phase_b(intent, push=push)
+                # ----- Phase C: 락 안 — merge_sha 먼저 기록 후 해제(P0-6) -----
+                res = self._connect_phase_c(task_id, token_id, intent, merge_sha, err)
+                return self._complete_split_idem(
+                    request_id, agent_id, "connect", idem_args, res
+                )
+        except BaseException:
+            self._clear_split_idem(
+                request_id, agent_id, "connect", idem_args
+            )
+            raise
 
     def complete_task(self, task_id, msg=None, agent_id=None, fence=None, push=None,
                       *, request_id=None, bail_epoch=None):
@@ -1588,7 +2139,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         claims = {}
         with self._cs():
             self._sweep_inline()
-            for mode, paths, rid_suffix in specs:
+            for offset, (mode, paths, rid_suffix) in enumerate(specs, start=1):
                 dup = self.store.orbit_by_intent(
                     self._intent_key(agent_id, paths, mode, task_id)
                 )
@@ -1600,10 +2151,16 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                                 "mode": mode, "orbit_id": dup["orbit_id"],
                                 "state": dup["state"], "conflicts": []}
                     continue
-                conflicts = self._conflicts(paths, mode)
-                if conflicts:
+                # Hypothetical sequence is exact while this _cs transaction owns the
+                # writer lock.  It lets begin see PENDING predecessors before acquiring
+                # any member of its batch, preventing partial HELD acquisition.
+                admission, _ = self._admission_decision(
+                    paths, mode, priority, self.store.current_seq() + offset
+                )
+                if not admission.grantable:
                     pending = self.claim(
                         agent_id, paths, mode=mode, ttl=ttl, task_id=task_id,
+                        priority=priority,
                         request_id=_rid(rid_suffix), bail_epoch=bail_epoch,
                     )
                     self._emit("begin_blocked", task_id, reason="claim", mode=mode,
@@ -1611,11 +2168,13 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     return {"ok": False, "stage": "claim", "task_id": task_id,
                             "mode": mode, "orbit_id": pending.get("orbit_id"),
                             "state": pending.get("state"),
-                            "conflicts": pending.get("conflicts", conflicts)}
+                            "conflicts": pending.get(
+                                "conflicts", list(admission.blocker_ids))}
             # 전 클래스가 지금 grant 가능하거나 이미 HELD임을 확인한 뒤 같은 tx에서 획득.
             for mode, paths, rid_suffix in specs:
                 claimed = self.claim(
                     agent_id, paths, mode=mode, ttl=ttl, task_id=task_id,
+                    priority=priority,
                     request_id=_rid(rid_suffix), bail_epoch=bail_epoch,
                 )
                 if claimed.get("state") != "HELD":  # preflight 아래서는 방어적 불변식 가드
@@ -1839,7 +2398,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 self.store.set_task(task_id, state=fsm.advance("task", "CONNECTING", "rollback"),
                                     connect_intent_at=None, integration_base_sha=None)
                 self._release_merge_token_locked(token_id)
-                self._promote_pending()
+                self._reconcile_admission()
                 if isinstance(err, GitIntegrationCheckTimeout):
                     reason = "integration_check_timeout"
                 elif isinstance(err, GitIntegrationMutation):
@@ -1913,7 +2472,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             self.store.set_flag(task_id, "merged")
             self._emit("connect_merged", task_id, merge_sha=merge_sha,
                        gen=new_gen, stale_reads=len(stale_reads))
-            self._promote_pending()
+            self._reconcile_admission()
             return {"ok": True, "task_id": task_id, "state": "MERGED", "merge_sha": merge_sha,
                     "gen": new_gen, "stale_reads": stale_reads}
 

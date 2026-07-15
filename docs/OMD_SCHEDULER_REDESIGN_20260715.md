@@ -1,10 +1,15 @@
 # OMD safe conflict-aware scheduler redesign
 
-Status: **M0 evidence slice implemented; M0.5 development and runtime contracts
-structurally validated; runtime behavior unchanged.** The connect pipeline,
-durable admission and no-overtaking changes remain implementation fronts. Do
-not describe this branch as an optimized scheduler, a production rollout or a
-scientific progress result. The governing `L_IDE` lifecycle is documented in
+Status: **M1 fair-admission runtime slice implemented; full M1 remains open.**
+The runtime now enforces conflicting PENDING predecessor order with durable
+queue tickets, shared initial/promotion decisions, reservation-cycle safety,
+original-TTL promotion, exact request replay conflict checks and typed semantic
+decision projection. Finite deadlines and sweep/restart timeout delivery are
+implemented; default autonomous delivery, cancellation, overload/aging,
+candidate indexing, notification outbox and the prepared Connect pipeline
+remain implementation fronts. Do not describe this branch as the complete
+durable waiter, an optimized scheduler, a production rollout or a scientific
+progress result. The governing `L_IDE` lifecycle is documented in
 [`OMD_SCHEDULER_DEVELOPMENT_HARNESS_20260715.md`](./OMD_SCHEDULER_DEVELOPMENT_HARNESS_20260715.md).
 
 ## Decision
@@ -306,6 +311,45 @@ if an unrelated global queue head blocks disjoint work, if the index misses an
 exact conflict, if a bounded wait has no typed resolution, or if reservation
 precedence creates an undetected cycle.
 
+Implemented fairness slice:
+
+- every ordinary orbit receives a monotonic `queue_seq`; legacy PENDING rows
+  receive a deterministic one-time backfill of reconstructable
+  request/rank/deadline fields, ordered by `(created_at, orbit_id)`; current
+  decision metadata is recorded by reconciliation;
+- the pure admission kernel compares priority descending and queue sequence
+  ascending only among exact, mode-incompatible overlaps;
+- initial admission and promotion use that same kernel, so the older broad
+  waiter prevents the later narrow claim while unrelated work still grants;
+- promotion restores the persisted requested TTL rather than a hard-coded 600s;
+- wait-for cycle detection combines HELD-owner and reservation-precedence edges;
+- canonical `admission_decision/v1` payloads bind the nine-field request
+  identity, trusted authority snapshot and decision variant, then execute the
+  JSON FSM's context/effect bindings before legacy projection;
+- a live admission id or DONE-cached transport id with a different agent, verb,
+  path, mode, priority, reason or bail epoch returns typed
+  `idempotency_conflict` without repeating the effect;
+- due PENDING requests take the semantic `WAIT_TIMEOUT` path before promotion
+  during sweep and restart reconciliation;
+- policy-denial retry advances the durable request generation, while terminal
+  replay cannot create another generation-zero admission effect;
+- split-phase Connect and barrier effects reserve the exact idempotency
+  envelope until their unlocked phase completes or is safely cleared;
+- the unchanged frozen gate is green normally, RED under a test-only pure
+  predecessor bypass, and green again after restoration.
+
+The materialized M1 receipt is `arrived` evidence from one in-memory
+producer/readback backend. It explicitly records no separate oracle and awaits
+independent judgment; it is not promoted to `external_verdict`.
+
+Still open before full M1: default autonomous wait-deadline delivery, PENDING
+cancellation, capacity/overload, saturating aging, notification outbox,
+candidate-index soundness, explicit non-denial request-generation rollover,
+semantic binding for the remaining maintenance events, independent judgment
+and finalization. The current exact full scan is sound but is not an implemented
+candidate index. Connect now reserves its transport envelope across the split
+effect, but the prepared `ConnectAttempt`/protected-ref pipeline remains open.
+
 ### M2 — effect split
 
 Move worktree creation, Git add/commit/diff audit, cleanup, and push to explicit
@@ -440,7 +484,7 @@ python3 "$LOOP_VALIDATOR" \
   spec/connect_pipeline_loop.json
 ```
 
-### Frozen M0 and repository gate
+### Frozen M0 history, live M1 evidence and repository gate
 
 ```bash
 : "${SYMPOSIUM_ROOT:?set SYMPOSIUM_ROOT to the SYMPOSIUM checkout}"
@@ -457,8 +501,21 @@ raise SystemExit(actual != expected)
 PY
 "$OOPTDD_LOOP_BIN" \
   validate-spec spec/omd_scheduler_m0_ooptdd.yaml --json
+"$OOPTDD_LOOP_BIN" \
+  validate-spec spec/omd_scheduler_m1_ooptdd.yaml --json
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
-  -p no:cacheprovider tests/test_scheduler_m0_harness.py
+  -p no:cacheprovider \
+  tests/test_scheduler_m0_harness.py \
+  tests/test_scheduler_m1_admission.py \
+  tests/test_scheduler_admission_conformance.py \
+  tests/test_d9_idempotency.py
+.venv/bin/python -m benchmarks.produce_scheduler_m1_receipt \
+  --gate gates/scheduler_fairness.yaml \
+  --cid omd-scheduler-m1-newer \
+  --output evidence/omd_scheduler_m1/ooptdd_run.json \
+  --receipt-output evidence/omd_scheduler_m1/ooptdd_receipt.json
+.venv/bin/python "$SYMPOSIUM_ROOT/SKILLS/ooptdd-receipt/scripts/validate_receipt.py" \
+  evidence/omd_scheduler_m1/ooptdd_receipt.json --verify-linked --root .
 git diff --check
 ```
 
@@ -474,30 +531,31 @@ CI also runs the informational adoption harness and TLA+ job. Because CI may
 skip private OOPTDD-dependent tests when that dependency is unavailable, the
 explicit local OOPTDD validation remains required for an OOPTDD receipt claim.
 The TLC smoke requires Java and, when the jar is not cached, `curl` plus network
-access. `scripts/run_tlc.sh` currently downloads a mutable latest release, so
-that smoke is useful but is not pinned reproducible evidence; pinning the jar
-version and SHA-256 is an M1 promotion requirement.
+access. Both TLC launchers pin `tla2tools` v1.7.4 and fail closed unless the jar
+SHA-256 is
+`936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`.
 
 ## Verification limits and honest status
 
 - The engine, FSM and loop validators prove their individual schemas and static
   consistency. They do not prove that all four contracts project to one
   production implementation.
-- The abstract trace runner currently accepts fixture-provided guard results. It
-  proves structural transition, true/false guard-outcome and invalid-event
-  coverage, not real payload guard execution.
-- Payload-driven receipt/authority/finalization guard tests, a cross-contract
-  projection validator and model-to-production differential replay remain M0.5
-  promotion blockers.
-- The admission decision table and prepared connect pipeline are not bound to
-  current runtime code by this slice. M1 and later behavior claims require new
-  real-code evidence.
+- The abstract trace runner still accepts fixture-provided guard results. A
+  separate executable admission reducer now computes real nine-field identity,
+  trusted-authority, queue sequence and replay guards and compares production
+  decision projection; Connect payload guards remain abstract.
+- A repository-wide cross-contract validator and full Connect
+  model-to-production differential replay remain promotion blockers.
+- Admission decisions, including due `WAIT_TIMEOUT`, are bound to current
+  runtime code. Default autonomous deadline delivery, cancellation, overload,
+  aging, outbox and the remaining maintenance-event semantic bindings remain
+  open, and the prepared Connect pipeline is still contract-only.
 - M0's measured numbers and LakatoTree `partial` verdict describe reproducible
   evidence machinery only. They do not establish a fairness fix, throughput
   improvement, near-linear scaling, optimality or novel discovery.
 - Protected-ref non-bypassability requires an enforced remote policy and sole
   publisher identity. A local fail-soft push topology is insufficient.
 
-The honest current state is therefore: **contracts structurally validated;
-runtime implementation, cross-contract conformance and scientific promotion
-pending**.
+The honest current state is therefore: **M1 fairness runtime and admission
+decision conformance implemented; full durable waiting, Connect runtime,
+cross-contract proof and scientific promotion pending**.

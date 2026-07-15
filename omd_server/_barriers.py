@@ -154,9 +154,10 @@ class BarrierMixin:
         한 명이라도 사망/타임아웃이면 BROKEN(전원 기상). merge(Phase B)는 락 밖에서 돈다."""
         # Phase A(락): 도착 기록 + eval → 트립 plan. merge 는 락 밖(아래).
         plan = None
+        idem_args = [name, task_id, fence, bail_epoch]
         with self._cs():
             with self._idem(request_id, agent_id, "barrier_arrive",
-                            [name, task_id, fence]) as cache:
+                            idem_args) as cache:
                 if cache.hit:
                     return cache.value
                 self._sweep_inline()
@@ -201,42 +202,71 @@ class BarrierMixin:
                                       "arrived": sum(p["arrived"] for p in parts),
                                       "parties": len(parts)})
                 bid, gen = b["barrier_id"], b["generation"]
+                # The exact request envelope must remain reserved while Phase B/C
+                # runs outside this transaction.
+                cache.defer()
         # Phase B/C(락밖 merge + 원자 commit): 트립 plan 의 각 task 를 결정적 순서로 응결.
-        return self._barrier_trip(bid, gen, name, plan, request_id, agent_id)
+        return self._barrier_trip(
+            bid, gen, name, plan, request_id, agent_id, idem_args
+        )
 
-    def _barrier_trip(self, barrier_id, generation, name, plan, request_id, agent_id):
+    def _barrier_trip(
+        self, barrier_id, generation, name, plan, request_id, agent_id, idem_args
+    ):
         """트립 실행(§D5): plan 의 각 task 를 _barrier_connect_one 으로 응결(공개 connect 아님).
         하나라도 실패(fence stale/merge 충돌)면 배리어 BROKEN(policy break — 전원 깸) + 이미
         응결된 것은 그대로(전진), 나머지는 멈춤. 전부 성공하면 TRIPPED."""
         merged = []
-        for step in plan:
-            res = self._barrier_connect_one(step["task_id"], step["expected_fence"])
-            if not res.get("ok"):
-                with self._cs():
-                    b = self.store.get_barrier(barrier_id)
-                    if b and b["state"] in ("TRIPPING", "ARMED"):
-                        self._break_barrier(b, reason=f"trip_failed:{res.get('reason')}")
-                return {"ok": False, "state": "BROKEN", "name": name,
-                        "reason": f"trip failed on {step['task_id']}: {res.get('reason')}",
-                        "merged": merged}
-            merged.append(step["task_id"])
+        try:
+            for step in plan:
+                res = self._barrier_connect_one(step["task_id"], step["expected_fence"])
+                if not res.get("ok"):
+                    with self._cs():
+                        b = self.store.get_barrier(barrier_id)
+                        if b and b["state"] in ("TRIPPING", "ARMED"):
+                            self._break_barrier(b, reason=f"trip_failed:{res.get('reason')}")
+                    out = {"ok": False, "state": "BROKEN", "name": name,
+                           "reason": (f"trip failed on {step['task_id']}: "
+                                      f"{res.get('reason')}"),
+                           "merged": merged}
+                    return self._complete_split_idem(
+                        request_id, agent_id, "barrier_arrive", idem_args, out
+                    )
+                merged.append(step["task_id"])
+        except BaseException:
+            self._clear_split_idem(
+                request_id, agent_id, "barrier_arrive", idem_args
+            )
+            raise
         # 전 task 응결됨 → TRIPPED.
-        out = None
-        with self._cs():
-            b = self.store.get_barrier(barrier_id)
-            if b and b["state"] == "TRIPPING":
-                self.store.set_barrier(barrier_id,
-                                       state=fsm.advance("barrier", "TRIPPING", "trip"))
-                self._emit("barrier_tripped", name, barrier=name, generation=generation,
-                           merged=merged)
-            nb = self.store.get_barrier(barrier_id)
-            out = {"ok": True, "state": nb["state"], "name": name, "merged": merged,
-                   "generation": generation}
-            if request_id is not None and self._is_success(out):
-                self.store.begin_idem(request_id, agent_id, "barrier_arrive",
-                                      self._arg_hash("barrier_arrive", [name, None, None]))
-                self.store.finish_idem(request_id, out)
-        return out
+        try:
+            with self._cs():
+                b = self.store.get_barrier(barrier_id)
+                if b and b["state"] == "TRIPPING":
+                    self.store.set_barrier(
+                        barrier_id,
+                        state=fsm.advance("barrier", "TRIPPING", "trip"),
+                    )
+                    self._emit(
+                        "barrier_tripped", name, barrier=name,
+                        generation=generation, merged=merged,
+                    )
+                nb = self.store.get_barrier(barrier_id)
+                out = {
+                    "ok": True,
+                    "state": nb["state"],
+                    "name": name,
+                    "merged": merged,
+                    "generation": generation,
+                }
+        except BaseException:
+            self._clear_split_idem(
+                request_id, agent_id, "barrier_arrive", idem_args
+            )
+            raise
+        return self._complete_split_idem(
+            request_id, agent_id, "barrier_arrive", idem_args, out
+        )
 
     def _barrier_connect_one(self, task_id, expected_fence):
         """응결 trip 프리미티브(§D5) — 공개 connect() 를 재호출하지 않는다(그 Phase A 의

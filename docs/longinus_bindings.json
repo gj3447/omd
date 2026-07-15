@@ -74,8 +74,8 @@
       "file": "omd_server/core.py",
       "symbol": "_reclaim_agent_inline",
       "kind": "function",
-      "line_hint": 367,
-      "sha256": "c6d87d801247f674",
+      "line_hint": 746,
+      "sha256": "e0c6e2699ae95c64",
       "layer": "domain-policy",
       "frege_sinn": "긴급탈출(bail)/좀비회수 단일 회수 루틴 — 궤도해제+requeue+worktree정리+RETIRE, 멱등(§D2)"
     },

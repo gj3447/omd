@@ -1,11 +1,16 @@
 # OMD scheduler development harness
 
-Status: **M0.5 design and delivery contract only.** The machine-readable
-development, admission, and connect contracts exist and pass their structural
-validators. No M1 scheduler behavior, durable waiter, prepared connect runtime,
-or protected-ref control plane is implemented by this document slice. Do not
-describe it as an optimized scheduler, a production rollout, or a scientific
-progress result.
+Status: **M1 fair-admission runtime slice implemented; full M1 remains open.**
+Initial claim and promotion now share one pure compatibility/rank/blocker
+kernel, persist durable `queue_seq` and original TTL, prevent conflicting
+PENDING overtaking, reject reservation-edge cycles, and bind canonical typed
+decision payloads to the semantic admission FSM before projecting legacy Orbit
+state. Finite deadlines and sweep/restart `WAIT_TIMEOUT` delivery are now in
+the slice. Default autonomous deadline delivery, wait cancellation, queue
+capacity/aging, notification outbox, candidate indexing, the prepared Connect
+pipeline, and protected-ref control plane remain unimplemented. Do not
+describe this slice as the complete durable waiter, an optimized scheduler, a
+production rollout, or a scientific progress result.
 
 The runtime redesign and frozen M0 evidence are documented in
 [`OMD_SCHEDULER_REDESIGN_20260715.md`](./OMD_SCHEDULER_REDESIGN_20260715.md).
@@ -365,6 +370,60 @@ is:
 M1 must make that same gate green. Editing the gate to fit implementation output
 invalidates the downstream evidence.
 
+### 10.1 Implemented M1 fairness slice
+
+The current runtime closes evidence items 1--5 and 7 for the bounded real-code
+trace, and the queue-order part of item 8:
+
+- `omd_server/admission.py` is the pure mode compatibility, exact-overlap,
+  priority/FIFO rank and blocker decision table used by both `claim()` and
+  `_promote_pending()`;
+- SQLite persists monotonic `queue_seq`, requested TTL, policy version, path
+  digest, request id/generation, bail epoch, enqueue/deadline timestamps,
+  authority snapshot, canonical decision id/type and blockers. Legacy PENDING
+  rows receive the reconstructable request/rank/deadline fields through a
+  deterministic one-time backfill ordered by `(created_at, orbit_id)`; the next
+  reconciliation records current decision metadata. `created_at` is not the M1
+  ordering authority;
+- the combined wait-for graph includes HELD-owner and higher-ranked conflicting
+  PENDING-reservation edges, so a new reservation cycle is denied before it is
+  exposed;
+- `omd_server/admission_contract.py` loads the JSON FSM transition, context
+  update and effect bindings, computes nine-field identity, trusted authority,
+  queue-sequence and replay guards from typed payloads, and verifies the
+  one-way legacy projection;
+- reconciliation expires HELD authority, reclaims stale owners, delivers due
+  `WAIT_TIMEOUT` decisions, and only then considers promotion. The same order
+  runs on sweep and restart, so an overdue waiter cannot be promoted;
+- live admission identities own the global request-id namespace, and terminal
+  rows preserve their generation history; policy-denial retry advances the
+  durable request generation, while exact completed claim replay cannot create
+  a second generation-zero effect;
+- split-phase Connect and barrier trips reserve their exact request envelope
+  across unlocked effects, then complete or clear it with an envelope-matching
+  compare-and-set;
+- `benchmarks/produce_scheduler_m1_receipt.py` runs the unchanged frozen gate
+  as positive, a test-only pure-kernel predecessor bypass as RED, and the
+  restored runtime as green. The bypass is not a Coordinator/MCP/CLI option;
+- `spec/omd_admission.tla` models fair admission, compatible modes, durable
+  order, unique fencing, no incompatible overlap, no lower-ranked overtaking
+  and eventual resolution under release/promotion fairness assumptions.
+
+The M1 receipt is honestly tiered `arrived`: producer emission and readback use
+the same in-memory backend, `oracle.separate_source=false`, and the receipt
+remains `AWAITING_INDEPENDENT_JUDGE`. It is execution evidence, not an
+independent scientific judgment.
+
+This does **not** close evidence item 6. New PENDING rows persist a finite,
+typed `wait_deadline`, and sweep/restart reconciliation delivers the semantic
+timeout transition. The default Coordinator is still inline-only unless
+periodic sweep is explicitly enabled, and cancellation plus overload remain
+absent, so autonomous bounded resolution is not yet established. Item 9 has no
+candidate index to prove yet (the runtime uses the sound full exact scan).
+Policy-denial generation rollover is implemented; explicit non-denial rollover
+and maintenance events `RENEW`, `RELEASE`, cancellation and reclaim are not yet
+routed through the semantic reducer.
+
 ## 11. Evidence, judgment and landing chain
 
 For each runtime slice, retain this order and bind every arrow by hashes:
@@ -428,7 +487,7 @@ python3 "$LOOP_VALIDATOR" \
   spec/connect_pipeline_loop.json
 ```
 
-### Frozen M0 regression and repository gate
+### Frozen M0 history, live M1 evidence and repository gate
 
 ```bash
 : "${SYMPOSIUM_ROOT:?set SYMPOSIUM_ROOT to the SYMPOSIUM checkout}"
@@ -445,8 +504,21 @@ raise SystemExit(actual != expected)
 PY
 "$OOPTDD_LOOP_BIN" \
   validate-spec spec/omd_scheduler_m0_ooptdd.yaml --json
+"$OOPTDD_LOOP_BIN" \
+  validate-spec spec/omd_scheduler_m1_ooptdd.yaml --json
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
-  -p no:cacheprovider tests/test_scheduler_m0_harness.py
+  -p no:cacheprovider \
+  tests/test_scheduler_m0_harness.py \
+  tests/test_scheduler_m1_admission.py \
+  tests/test_scheduler_admission_conformance.py \
+  tests/test_d9_idempotency.py
+.venv/bin/python -m benchmarks.produce_scheduler_m1_receipt \
+  --gate gates/scheduler_fairness.yaml \
+  --cid omd-scheduler-m1-newer \
+  --output evidence/omd_scheduler_m1/ooptdd_run.json \
+  --receipt-output evidence/omd_scheduler_m1/ooptdd_receipt.json
+.venv/bin/python "$SYMPOSIUM_ROOT/SKILLS/ooptdd-receipt/scripts/validate_receipt.py" \
+  evidence/omd_scheduler_m1/ooptdd_receipt.json --verify-linked --root .
 git diff --check
 ```
 
@@ -462,43 +534,51 @@ runs the informational adoption harness and TLA+ model job. The private OOPTDD
 dependency may be absent and skipped in CI, so the explicit local OOPTDD command
 above remains a delivery gate when claiming its receipt path was exercised.
 The TLC smoke requires Java and, when the jar is not cached, `curl` plus network
-access. `scripts/run_tlc.sh` currently downloads a mutable latest release, so
-that smoke is useful but is not pinned reproducible evidence; pinning the jar
-version and SHA-256 is an M1 promotion requirement.
+access. Both TLC launchers now pin `tla2tools` v1.7.4 and verify SHA-256
+`936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`
+before executing any model.
 
 ## 13. Current delivery gate versus future runtime closure
 
-This M0.5 document/spec delivery is ready to commit only when:
+The historical M0.5 contract delivery is complete. The current M1 fairness
+slice is ready to commit only when:
 
-- this document and the redesign document link to all eight machine-readable
-  authorities;
-- both engines, both FSMs, both trace sets and both loop contracts pass their
-  individual validators;
+- admission engine/FSM/trace validators and the payload-driven production
+  projection suite pass;
 - the frozen M1 gate hash is unchanged;
-- the M0 harness regression remains green;
+- the same gate is green, RED under the test-only predecessor bypass and green
+  again after restoration;
+- fair ordering, liveness, disjoint progress, reservation-cycle, restart,
+  legacy migration and request-id conflict tests pass;
+- the historical M0 evidence hashes remain unchanged and its harness treats
+  that receipt as pinned history rather than rerunning the obsolete defect gate;
 - `git diff --check` is green and the diff is limited to the declared OMD
   write-set;
 - the branch is committed and published intentionally, then the OMD edit orbit
   is released and the lease-only coordination task is canceled/read back.
 
-That delivery does **not** make an M1 implementation cycle `CLOSED`. A future
-runtime slice additionally needs the new real-code behavior, frozen
-positive/negative/restored receipts, implementation conformance, an independent
-scripted judgment, authoritative landing readback and finalization receipts.
+Landing those files makes the **M1 fairness implementation slice** durable. It
+does not make full M1 or the development cycle `CLOSED`: default autonomous
+deadline delivery, cancellation/overload/aging, candidate-index soundness,
+maintenance-event reducer binding, an independent scripted progress judgment
+and finalization receipts remain future work.
 
 ## 14. Known limitations and promotion blockers
 
-1. `run_fsm_traces.py` currently consumes declared `guard_results`; it proves
-   structural transition and true/false guard-outcome coverage, not that real
-   payload comparison code computed those values.
-2. A payload-driven guard runner for complete receipt identity, authority
-   replay, same-tree/wrong-commit and finalization receipt checks is not yet
-   implemented.
+1. `run_fsm_traces.py` still consumes declared `guard_results`; it proves
+   abstract structural coverage. Admission decisions now have a separate real
+   payload reducer/conformance suite, but Connect receipt and finalization guards
+   do not.
+2. Admission payload guards cover decision events and production projection.
+   The remaining lifecycle maintenance events, Connect same-tree/wrong-commit,
+   authorization and finalization receipts are not yet executable end to end.
 3. No repository cross-contract validator currently proves engine, admission
    FSM, connect FSM, both loop projections and production reducer conformance.
    Individual schema validators are necessary but insufficient.
-4. No production admission reducer is bound to
-   `spec/scheduler_admission_fsm.json`; M1 remains unimplemented.
+4. Production admission/grant/queue/promotion/denial and due-timeout decisions
+   are bound to the JSON semantic reducer. Default autonomous timeout delivery,
+   cancellation, overload, aging, notification outbox and maintenance-event
+   binding remain the open M1 front.
 5. The prepared candidate, expected-old ref CAS, independent ref reader and
    finalization protocol are contracts, not the current runtime path.
 6. The connect loop is a conservative `loop-contract/v1` runner aggregate over
@@ -516,5 +596,6 @@ scripted judgment, authoritative landing readback and finalization receipts.
 8. Protected-ref non-bypassability requires a real remote policy and sole
    publisher identity. A local fail-soft push topology cannot establish it.
 
-Until these blockers are closed, the honest status is **contracts structurally
-validated; runtime and scientific promotion pending**.
+Until these blockers are closed, the honest status is **M1 fairness runtime and
+decision-payload conformance implemented; full durable waiting, Connect runtime,
+cross-contract proof and scientific promotion pending**.

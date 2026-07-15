@@ -1,0 +1,76 @@
+{
+  "correlation": {
+    "cid": "omd-scheduler-m1-newer"
+  },
+  "cycle_id": "omd-scheduler-m1-fair-admission-20260715",
+  "judgment": {
+    "status": "AWAITING_INDEPENDENT_JUDGE",
+    "supplied_by_producer": false
+  },
+  "negative_oracle": {
+    "injection": "Ignore conflicting PENDING predecessors in decide_admission.",
+    "observed_verdict": "red",
+    "receipt_path": "evidence/omd_scheduler_m1/ooptdd_run.json",
+    "receipt_sha256": "e394cf6a83486f4780fe576b0161ea59b600e158f4726f09da18e43d59f367df",
+    "restored": true,
+    "spec_sha256": "d73a11e09e31728b50eaadb52109462fc2140dc6d8c3bea36004be8965737ed2",
+    "technique": "fault_injection"
+  },
+  "oracle": {
+    "corroborated": false,
+    "emit_identity": "MemoryBackend",
+    "read_identity": "MemoryBackend",
+    "separate_source": false
+  },
+  "positive": {
+    "charge_ratio": 1.0,
+    "evidence_tier": "arrived",
+    "forbidden_events_passed": true,
+    "observed_verdict": "green",
+    "receipt_path": "evidence/omd_scheduler_m1/ooptdd_run.json",
+    "receipt_sha256": "e394cf6a83486f4780fe576b0161ea59b600e158f4726f09da18e43d59f367df"
+  },
+  "producer": {
+    "command": "/Users/lagyeongjun/CD/omd/.venv/bin/python /Users/lagyeongjun/CD/omd/benchmarks/produce_scheduler_m1_receipt.py --gate gates/scheduler_fairness.yaml --cid omd-scheduler-m1-newer --output evidence/omd_scheduler_m1/ooptdd_run.json --receipt-output evidence/omd_scheduler_m1/ooptdd_receipt.json",
+    "cwd": "/Users/lagyeongjun/CD/omd",
+    "entrypoint": "benchmarks.produce_scheduler_m1_receipt:produce",
+    "exit_code": 0,
+    "git_head": "7638fb59e99f47fffb4069bcef631874f9220836",
+    "real_code_path": true,
+    "source_path": "benchmarks/produce_scheduler_m1_receipt.py",
+    "source_symbol": "produce"
+  },
+  "receipt_id": "omd-scheduler-m1-fair-admission",
+  "requirement_group": "OMD-SCHEDULER-M1-FAIR-ADMISSION",
+  "requirements": [
+    {
+      "event": "orbit_granted",
+      "id": "M1-OVERTAKING-DEFECT",
+      "role": "guard_defect"
+    },
+    {
+      "event": "orbit_pending",
+      "id": "M1-PENDING-PREDECESSOR-GUARD",
+      "role": "guard_mechanism"
+    }
+  ],
+  "schema_version": "symposium-ooptdd-receipt/v1",
+  "source_binding": {
+    "path": "benchmarks/produce_scheduler_m1_receipt.py",
+    "sha256": "501a0386001caec199035eb9b5b6f1fec8c315fbe3a131c6fd6cd0813d0cb8b1",
+    "symbol": "produce"
+  },
+  "spec": {
+    "locked_before_positive_run": true,
+    "path": "spec/omd_scheduler_m1_ooptdd.yaml",
+    "sha256": "d73a11e09e31728b50eaadb52109462fc2140dc6d8c3bea36004be8965737ed2"
+  },
+  "subject_binding": {
+    "admission_path": "omd_server/admission.py",
+    "admission_sha256": "05ef13014b60e3ef318ebecd14bf5bd85ab30d8df8918150dc025bc67593bdd2",
+    "core_path": "omd_server/core.py",
+    "core_sha256": "a7a883947b0ac2b892203e06cb314e2e988436278673f20d00ac5263d24a2cf1",
+    "git_head_before_evidence_commit": "7638fb59e99f47fffb4069bcef631874f9220836"
+  },
+  "template_only": false
+}
