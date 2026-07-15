@@ -1,0 +1,29 @@
+{
+  "schema_version": "omd-scheduler-m0-ooptdd-plan/v1",
+  "locked_at": "2026-07-15T13:41:59+09:00",
+  "locked_before_positive_run": true,
+  "requirement_group": "OMD-SCHEDULER-M0-BASELINE-REPLICATION",
+  "claim": "The real Coordinator probe exposes the preregistered pre-M1 overtaking state, the event arrives in the verifier backend, an injected silent drop turns the same gate red, and removing the injection restores green.",
+  "gate": {
+    "path": "evidence/omd_scheduler_m0/m0_measurement_gate.yaml",
+    "sha256": "3f76fd6da11e4c806c052fd6843540d19fdef372a55b9401067f288b762e5c28"
+  },
+  "producer": {
+    "path": "benchmarks/produce_scheduler_m0_receipt.py",
+    "sha256": "691a1ea196f2470040bceff86d62efb2673fe083a1e0c6624af4d434be6ba4ac"
+  },
+  "real_entrypoint": {
+    "path": "benchmarks/omd_scheduler_m0.py",
+    "symbol": "run_ooptdd",
+    "sha256": "3c39d0c6cf57ce9e05b916e2a691aaefebd9f5d080b06d8ec7568345f59bdc15"
+  },
+  "positive_expectation": "green",
+  "negative_injection": "MemoryBackend(drop=True) silently discards every required event while the real Coordinator still executes.",
+  "negative_expectation": "red",
+  "restored_expectation": "green",
+  "non_claims": [
+    "no-overtaking is fixed",
+    "scheduler performance improved",
+    "event trace alone proves the concurrency invariant"
+  ]
+}

@@ -1,0 +1,123 @@
+{
+  "schema_version": "fsm-spec/v1",
+  "name": "omd-connect-attempt",
+  "execution": {
+    "step_interface": "step(connect_attempt_configuration, typed_event) -> next_configuration, effect_commands",
+    "event_queue": "External events are FIFO per attempt; effects report outcomes as new events and are never synchronously re-entered.",
+    "run_to_completion": "One event is selected and reduced atomically per attempt version.",
+    "action_order": "Select transition, compute next state, commit state and outbox intent, then dispatch typed effects."
+  },
+  "context_schema": {
+    "attempt_id": {"type": "string"},
+    "owner_agent": {"type": "actor-id"},
+    "fence": {"type": "non-negative integer"},
+    "bail_epoch": {"type": "non-negative integer"},
+    "base_sha": {"type": "git-sha"},
+    "task_tip_sha": {"type": "git-sha"},
+    "candidate_tree_sha": {"type": "git-sha"},
+    "write_set_digest": {"type": "sha256"},
+    "check_policy_digest": {"type": "sha256"},
+    "attempt_generation": {"type": "non-negative integer"}
+  },
+  "event_schemas": {
+    "DEQUEUE": {"type": "object", "required": ["attempt_id", "actor", "event_id"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}}},
+    "CANDIDATE_READY": {"type": "object", "required": ["attempt_id", "actor", "event_id", "candidate_tree_sha"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}, "candidate_tree_sha": {"type": "git-sha"}}},
+    "CANDIDATE_FAILED": {"type": "object", "required": ["attempt_id", "actor", "event_id", "reason"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}, "reason": {"type": "string"}}},
+    "VALIDATION_GREEN": {"type": "object", "required": ["attempt_id", "actor", "event_id", "receipt_tree_sha", "check_policy_digest"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}, "receipt_tree_sha": {"type": "git-sha"}, "check_policy_digest": {"type": "sha256"}}},
+    "VALIDATION_RED": {"type": "object", "required": ["attempt_id", "actor", "event_id", "receipt_id"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}, "receipt_id": {"type": "string"}}},
+    "VALIDATION_FAILED": {"type": "object", "required": ["attempt_id", "actor", "event_id", "reason"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}, "reason": {"type": "string"}}},
+    "REQUEST_PUBLISH": {"type": "object", "required": ["attempt_id", "actor", "event_id", "owner_agent", "fence", "bail_epoch"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}, "owner_agent": {"type": "actor-id"}, "fence": {"type": "non-negative integer"}, "bail_epoch": {"type": "non-negative integer"}}},
+    "REF_CAS_SUCCEEDED": {"type": "object", "required": ["attempt_id", "actor", "event_id", "published_tree_sha"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}, "published_tree_sha": {"type": "git-sha"}}},
+    "REF_CAS_STALE": {"type": "object", "required": ["attempt_id", "actor", "event_id", "observed_ref"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}, "observed_ref": {"type": "git-sha"}}},
+    "REF_CAS_UNKNOWN": {"type": "object", "required": ["attempt_id", "actor", "event_id"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}}},
+    "RECOVER_REF_NEW": {"type": "object", "required": ["attempt_id", "actor", "event_id"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}}},
+    "RECOVER_REF_OLD": {"type": "object", "required": ["attempt_id", "actor", "event_id"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}}},
+    "RECOVER_REF_OTHER": {"type": "object", "required": ["attempt_id", "actor", "event_id", "observed_ref"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}, "observed_ref": {"type": "git-sha"}}},
+    "FINALIZE_COMMITTED": {"type": "object", "required": ["attempt_id", "actor", "event_id"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}}},
+    "FINALIZE_FAILED": {"type": "object", "required": ["attempt_id", "actor", "event_id", "reason"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}, "reason": {"type": "string"}}},
+    "CANCEL": {"type": "object", "required": ["attempt_id", "actor", "event_id", "reason"], "properties": {"attempt_id": {"type": "string"}, "actor": {"type": "actor-id"}, "event_id": {"type": "string"}, "reason": {"type": "string"}}}
+  },
+  "guards": {
+    "receipt_matches_candidate": {"reads": ["candidate_tree_sha", "check_policy_digest"], "event_reads": ["receipt_tree_sha", "check_policy_digest"], "pure": true, "synchronous": true},
+    "authority_current": {"reads": ["owner_agent", "fence", "bail_epoch"], "event_reads": ["owner_agent", "fence", "bail_epoch"], "pure": true, "synchronous": true},
+    "published_tree_matches_receipt": {"reads": ["candidate_tree_sha"], "event_reads": ["published_tree_sha"], "pure": true, "synchronous": true}
+  },
+  "effects": {
+    "PrepareCandidate": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "RunValidation": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "RecordFailure": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "RecordValidationReceipt": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "PersistPublishIntent": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "RecordPublished": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "RecordStale": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "ReconcileRef": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "RecordRetry": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "EnqueuePostPublishEffects": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "RecordCancelled": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "AuditInvalidTransition": {"kind": "audit", "payload_schema": {"type": "object", "required": ["state", "event", "actor", "reason", "event_id"], "properties": {"state": {"type": "string"}, "event": {"type": "string"}, "actor": {"type": "actor-id"}, "reason": {"type": "string"}, "event_id": {"type": "string"}}}}
+  },
+  "machines": [
+    {
+      "id": "connect_attempt",
+      "initial": "QUEUED",
+      "states": [
+        {"id": "QUEUED", "kind": "atomic"},
+        {"id": "PREPARING", "kind": "atomic"},
+        {"id": "VALIDATING", "kind": "atomic"},
+        {"id": "VALIDATED", "kind": "atomic"},
+        {"id": "PUBLISH_INTENT", "kind": "atomic"},
+        {"id": "RECONCILING", "kind": "atomic"},
+        {"id": "PUBLISHED", "kind": "atomic"},
+        {"id": "FINALIZED", "kind": "final"},
+        {"id": "STALE", "kind": "final"},
+        {"id": "RED", "kind": "final"},
+        {"id": "FAILED", "kind": "final"},
+        {"id": "CANCELLED", "kind": "final"},
+        {"id": "NEEDS_REPAIR", "kind": "final"}
+      ],
+      "events": ["DEQUEUE", "CANDIDATE_READY", "CANDIDATE_FAILED", "VALIDATION_GREEN", "VALIDATION_RED", "VALIDATION_FAILED", "REQUEST_PUBLISH", "REF_CAS_SUCCEEDED", "REF_CAS_STALE", "REF_CAS_UNKNOWN", "RECOVER_REF_NEW", "RECOVER_REF_OLD", "RECOVER_REF_OTHER", "FINALIZE_COMMITTED", "FINALIZE_FAILED", "CANCEL"],
+      "invalid_event_policy": {
+        "mode": "reject-and-audit",
+        "guard_false": "reject-and-audit",
+        "state_change": "none",
+        "effect": "AuditInvalidTransition",
+        "effect_binding": {"state": "configuration.state", "event": "event.type", "actor": "event.actor", "reason": "rejection.reason", "event_id": "event.event_id"}
+      },
+      "transitions": [
+        {"id": "dequeue", "from": "QUEUED", "event": "DEQUEUE", "to": "PREPARING", "effects": ["PrepareCandidate"], "effect_bindings": {"PrepareCandidate": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "candidate-ready", "from": "PREPARING", "event": "CANDIDATE_READY", "to": "VALIDATING", "effects": ["RunValidation"], "effect_bindings": {"RunValidation": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "candidate-failed", "from": "PREPARING", "event": "CANDIDATE_FAILED", "to": "FAILED", "effects": ["RecordFailure"], "effect_bindings": {"RecordFailure": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "validation-green", "from": "VALIDATING", "event": "VALIDATION_GREEN", "to": "VALIDATED", "guard": "receipt_matches_candidate", "effects": ["RecordValidationReceipt"], "effect_bindings": {"RecordValidationReceipt": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "validation-red", "from": "VALIDATING", "event": "VALIDATION_RED", "to": "RED", "effects": ["RecordFailure"], "effect_bindings": {"RecordFailure": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "validation-failed", "from": "VALIDATING", "event": "VALIDATION_FAILED", "to": "FAILED", "effects": ["RecordFailure"], "effect_bindings": {"RecordFailure": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "request-publish", "from": "VALIDATED", "event": "REQUEST_PUBLISH", "to": "PUBLISH_INTENT", "guard": "authority_current", "effects": ["PersistPublishIntent"], "effect_bindings": {"PersistPublishIntent": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "ref-cas-succeeded", "from": "PUBLISH_INTENT", "event": "REF_CAS_SUCCEEDED", "to": "PUBLISHED", "guard": "published_tree_matches_receipt", "effects": ["RecordPublished"], "effect_bindings": {"RecordPublished": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "ref-cas-stale", "from": "PUBLISH_INTENT", "event": "REF_CAS_STALE", "to": "STALE", "effects": ["RecordStale"], "effect_bindings": {"RecordStale": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "ref-cas-unknown", "from": "PUBLISH_INTENT", "event": "REF_CAS_UNKNOWN", "to": "RECONCILING", "effects": ["ReconcileRef"], "effect_bindings": {"ReconcileRef": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "recover-ref-new", "from": "RECONCILING", "event": "RECOVER_REF_NEW", "to": "PUBLISHED", "effects": ["RecordPublished"], "effect_bindings": {"RecordPublished": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "recover-ref-old", "from": "RECONCILING", "event": "RECOVER_REF_OLD", "to": "VALIDATED", "effects": ["RecordRetry"], "effect_bindings": {"RecordRetry": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "recover-ref-other", "from": "RECONCILING", "event": "RECOVER_REF_OTHER", "to": "NEEDS_REPAIR", "effects": ["RecordFailure"], "effect_bindings": {"RecordFailure": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "finalize-committed", "from": "PUBLISHED", "event": "FINALIZE_COMMITTED", "to": "FINALIZED", "effects": ["EnqueuePostPublishEffects"], "effect_bindings": {"EnqueuePostPublishEffects": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "finalize-failed", "from": "PUBLISHED", "event": "FINALIZE_FAILED", "to": "NEEDS_REPAIR", "effects": ["RecordFailure"], "effect_bindings": {"RecordFailure": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "cancel-queued", "from": "QUEUED", "event": "CANCEL", "to": "CANCELLED", "effects": ["RecordCancelled"], "effect_bindings": {"RecordCancelled": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "cancel-preparing", "from": "PREPARING", "event": "CANCEL", "to": "CANCELLED", "effects": ["RecordCancelled"], "effect_bindings": {"RecordCancelled": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "cancel-validating", "from": "VALIDATING", "event": "CANCEL", "to": "CANCELLED", "effects": ["RecordCancelled"], "effect_bindings": {"RecordCancelled": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "cancel-validated", "from": "VALIDATED", "event": "CANCEL", "to": "CANCELLED", "effects": ["RecordCancelled"], "effect_bindings": {"RecordCancelled": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}}
+      ]
+    }
+  ],
+  "safety_properties": [
+    {"id": "exact-green-tree", "statement": "Only the exact candidate tree bound to the accepted green receipt may reach PUBLISHED.", "verification": "Guard truth-table, stale-base integration test, and crash injection around ref CAS."},
+    {"id": "intent-before-effect", "statement": "PUBLISH_INTENT is durable before the ref CAS effect can execute.", "verification": "Transactional outbox contract test and kill-before/after-effect recovery traces."},
+    {"id": "no-blind-unknown-retry", "statement": "An unknown ref-update outcome reaches RECONCILING and is not blindly retried.", "verification": "Unknown-outcome trace plus mocked ambiguous Git response integration test."}
+  ],
+  "liveness_properties": [
+    {"id": "bounded-attempt-resolution", "statement": "Every admitted attempt eventually reaches a final state or NEEDS_REPAIR.", "assumptions": ["Effect workers eventually return a typed success, failure, or unknown-outcome event.", "Queue fairness prevents indefinite overtaking.", "Retry and reconciliation budgets are finite."], "verification": "Bounded trace/model check plus queue-starvation and retry-exhaustion tests."}
+  ],
+  "trace_fixtures": ["spec/connect_pipeline_traces.json"],
+  "conformance": {
+    "implementation_step": "Bind guards to pure comparisons and effects to typed ports; production conformance begins only in M1/M3 slices.",
+    "model_trace_runner": "SYMPOSIUM SKILLS/fsm-design/scripts/run_fsm_traces.py validates abstract transition coverage.",
+    "contract_tests": "Run every transition, every guard false, invalid event, duplicate outcome, cancellation, and crash-recovery trace against model and later production code."
+  }
+}
