@@ -52,6 +52,8 @@ def _invoke(spy, capsys, *argv):
     payload = json.loads(capsys.readouterr().out)
     assert instance.db_path == "test.db"
     assert instance.config == {
+        "sweep_interval": None,
+        "autostart_background_workers": False,
         "admission_queue_capacity": 1024,
         "admission_aging_quantum": 60.0,
         "admission_max_age_boost": 10,
@@ -184,6 +186,8 @@ def test_cli_admission_policy_flags_override_environment(spy, capsys, monkeypatc
     )
     instance = spy.instances[-1]
     assert instance.config == {
+        "sweep_interval": None,
+        "autostart_background_workers": False,
         "admission_queue_capacity": 3,
         "admission_aging_quantum": 7.0,
         "admission_max_age_boost": 2,

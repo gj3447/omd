@@ -142,6 +142,10 @@ def main(argv=None):
     )
     omd = Coordinator(
         a.db,
+        # One-shot commands own no background lifecycle. Every verb already
+        # performs inline reconciliation, and cleanup happens before resign.
+        sweep_interval=None,
+        autostart_background_workers=False,
         admission_queue_capacity=capacity,
         admission_aging_quantum=aging_quantum,
         admission_max_age_boost=max_age_boost,
@@ -222,10 +226,10 @@ def main(argv=None):
         }[a.cmd]()
         print(json.dumps(out, ensure_ascii=False, indent=2))
     finally:
-        try:
-            omd.resign()
-        finally:
-            omd.close()
+        # Join every accepted writer/effect before handing leadership off.
+        # If close fails, resign must not expose the DB to a second writer.
+        omd.close()
+        omd.resign()
 
 
 if __name__ == "__main__":

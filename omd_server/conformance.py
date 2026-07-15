@@ -102,7 +102,7 @@ CHECKS = [
           and "GitMergeConflict" in _src(r, "omd_server/gitio.py")
           and "def enable_rerere" in _src(r, "omd_server/gitio.py")),
     # ---- 알려진 잔여 GAP(must=False, 정직히 리포트) ----
-    Check("periodic_sweep", "주기적 백그라운드 sweep(§D3/D4: opt-in sweep_interval, 유휴 spike 해소 + clean join)", True,
+    Check("periodic_sweep", "주기적 백그라운드 sweep(§D3/D4: embedded default-on, 명시 opt-out, heartbeat + terminal clean join)", True,
           lambda r: "def _periodic_sweep_loop" in _src(r, "omd_server/core.py")
           and "def close" in _src(r, "omd_server/core.py")
           and "sweep_interval" in _src(r, "omd_server/core.py")),

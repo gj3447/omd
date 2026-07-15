@@ -151,7 +151,7 @@
     "concurrency": "Disjoint or mode-compatible requests may become HELD in the same promotion pass and execute concurrently outside the authority transaction.",
     "backpressure": "The current one-repository-per-DB authority pins one durable non-negative queue limit (default 1024; zero is no-wait) and returns a typed QUEUE_FULL receipt with retry_after_at metadata. Cross-repository global and conflict-domain limits remain deferred until their no-bypass accounting is proved.",
     "cancellation": "A PENDING owner may cancel with current identity and bail epoch. Cancellation is idempotent and immediately triggers eligible promotion.",
-    "timeouts": "Wait and lease deadlines are persisted timestamps. External deadline events carry observed time; no lazy status read is the sole liveness mechanism. The finite aging boost improves precedence but does not prove starvation freedom; wait_deadline is the bounded-resolution authority.",
+    "timeouts": "Wait and lease deadlines are persisted timestamps. Direct embedded Coordinator construction starts a 1-second authority tick when sweep_interval is omitted; explicit None or zero is the deterministic opt-out. Under singleton enforcement a separate lifecycle heartbeat worker refreshes the leader lease at leader_ttl/3 independently of slow sweep execution. MCP defers background sweep and outbox work until lifespan entry and CLI remains one-shot/inline. Every deadline event carries observed time; no lazy status read is the sole liveness mechanism. Finite aging boost does not prove starvation freedom; wait_deadline is the bounded-resolution authority.",
     "notification_delivery": "State-changing admission edges enqueue admission_notification/v1 in the same authority transaction. A post-commit hook only arms an asynchronous dispatcher; notifier I/O holds neither authority nor repository-effect locks. Delivery is leased, claim-token fenced, bounded by a finite attempt timeout and a maximum live-plus-retained-outcome registry, per request-generation FIFO, and deduplicatable at-least-once by stable event_id. Bounded late-outcome eviction may replay the same identity. available_at and claim_deadline autonomously re-arm delivery even when deadline sweep is disabled; replacement timer start is retried three times without discarding an existing later timer. A poisoned stream does not block another request stream while notifier capacity remains. Manual flush and timer delivery share a lifecycle gate, and close rejects new drains then joins accepted drains and strict effects before handoff. Legacy fail-soft telemetry is deferred until commit and authority-lock release, preventing sink reentrancy from inverting dispatcher and authority locks. A coordination_notification/v1 agent-reclaim summary is causally blocked on every released-orbit predecessor, or uses a synthetic stream when no orbit exists. PROMOTION_BLOCKED and RENEW remain non-durable high-rate observations in this bounded slice."
   },
   "durability": {
@@ -207,6 +207,7 @@
     "Notification failure, child-thread BaseException, or notifier-start failure leaves an observable retryable outbox entry and does not roll back an accepted lease fact.",
     "A closed coordinator rejects new manual drains and cannot ACK or retry durable notification state after handoff.",
     "A transient dispatcher timer-start failure is retried without losing an already armed later wake; exhausting the finite bound is explicitly observable.",
+    "Default embedded authority and separate heartbeat workers hold only weak Coordinator references, wake immediately on owner collection, and stop on lost leadership. The heartbeat remains live while close joins accepted sweep/notifier effects, then close stops it behind a terminal lifecycle gate before leadership handoff. Worker-start failure closes and resigns. Server construction and one-shot CLI commands explicitly suppress pre-lifecycle background writers and notifier effects; synchronous schema initialization and recovery may still occur.",
     "Legacy sink reentrancy cannot run while the authority transaction or RLock is held.",
     "An agent-reclaim summary cannot be delivered before any released-orbit event it summarizes."
   ],
@@ -240,7 +241,7 @@
     "Run a decision-table truth suite for every mode pair, HELD blocker, PENDING predecessor, priority, FIFO, aging, capacity, and cycle combination.",
     "Property-test indexed candidates against a full exact scan with the assertion full_conflicts is a subset of indexed_candidates.",
     "Run real Coordinator positive readback and injected-negative OOPTDD receipts for no-overtaking.",
-    "Crash-test queue insertion, grant, release-plus-promotion, cancellation, deadline, and notification cut points.",
+    "Crash-test queue insertion, grant, release-plus-promotion, cancellation, deadline, and notification cut points; verify omitted embedded default, explicit off, timeout-before-promotion, heartbeat independence from a blocked sweep, heartbeat retention through accepted-effect joins, worker-start rollback, terminal close/start linearization, context-manager resign, immediate weak-reference worker wakeup, actual server outbox deferral, CLI opt-out, and authority/outbox timer separation.",
     "Model-check bounded safety and liveness with conflicting partial orders and restart."
   ],
   "implementation_slices": [
@@ -249,7 +250,7 @@
     "M1c (implemented): add PENDING reservation edges plus deterministic dynamic-cycle resolution, a content-addressed saturating-aging v2 policy, one-clock decision evidence, schema migration, and restart/property tests.",
     "M1d (implemented): persist state-changing semantic admission notifications and coordination dependencies transactionally; deliver them post-commit through lifecycle-gated, timer-start-fenced, claim-token-fenced, per-stream FIFO at-least-once replay without changing accepted lease facts.",
     "M2a-index (implemented): derive a conservative maximal-literal-prefix candidate trie from every complete authority snapshot, retain exact glob verification and full-scan fallback, and property/differential-test it against the full oracle.",
-    "M2a-deadline: make embedded-runtime deadline ticks lifecycle-safe by default while retaining explicit deterministic opt-out; MCP already owns its lifespan-scoped sweep.",
+    "M2a-deadline (implemented): make embedded-runtime authority ticks lifecycle-safe by default with singleton heartbeat, retain explicit deterministic opt-out, keep server construction background-worker-free until its lifespan, keep CLI one-shot, and prove that notification timers do not create deadline transitions.",
     "M2b: move all Git effects out of the authority transaction before reconsidering RLock or SQLite replacement."
   ],
   "falsifiers": [

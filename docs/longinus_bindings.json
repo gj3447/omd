@@ -352,14 +352,14 @@
       "frege_sinn": "재기동 시 pre-merge HEAD/no MERGE_HEAD/clean tracked tree를 증명하는 fail-stop rollback seam"
     },
     {
-      "sourceId": "server._leader_heartbeat_loop",
-      "file": "omd_server/server.py",
-      "symbol": "_leader_heartbeat_loop",
-      "kind": "function",
-      "line_hint": 66,
-      "sha256": "975a5848ca1cf55b",
+      "sourceId": "core.Coordinator._periodic_heartbeat_loop",
+      "file": "omd_server/core.py",
+      "symbol": "_periodic_heartbeat_loop",
+      "kind": "method",
+      "line_hint": 846,
+      "sha256": "316ff6f29fb27f7a",
       "layer": "infrastructure",
-      "frege_sinn": "leader lease enforced 서버만 ttl/3 heartbeat; 비-enforced stdio는 no-op, takeover fence-out이면 종결"
+      "frege_sinn": "별도 lifecycle worker가 느린 sweep/effect join과 독립적으로 enforced leader lease를 ttl/3 갱신; owner 수거·takeover fence-out·안전 handoff에서 종결"
     },
     {
       "sourceId": "events.Emitter.emit",

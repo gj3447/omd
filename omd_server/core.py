@@ -34,6 +34,7 @@ import os
 import threading
 import time
 import uuid
+import weakref
 from contextlib import contextmanager
 
 try:
@@ -136,6 +137,8 @@ DURABLE_ADMISSION_TELEMETRY_EVENTS = frozenset(
 ADMISSION_OUTBOX_LEASE_TTL = 30.0
 ADMISSION_OUTBOX_MAX_RETRY_DELAY = 60.0
 ADMISSION_OUTBOX_TIMER_START_RETRIES = 3
+DEFAULT_EMBEDDED_SWEEP_INTERVAL = 1.0
+_SWEEP_INTERVAL_OMITTED = object()
 
 
 _EFFECT_LOCKS_GUARD = threading.Lock()
@@ -163,6 +166,14 @@ def _normalize_sweep_interval(value):
     if not math.isfinite(interval) or interval < 0:
         raise ValueError("sweep_interval must be a finite non-negative number")
     return interval or None
+
+
+def _wake_worker_on_owner_gc(stop_event):
+    """Build a weakref callback that wakes a sleeping lifecycle worker."""
+    def wake(_coordinator_ref):
+        stop_event.set()
+
+    return wake
 
 
 class CoordinatorConflict(RuntimeError):
@@ -211,7 +222,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                  admission_aging_quantum: float = DEFAULT_ADMISSION_AGING_QUANTUM,
                  admission_max_age_boost: int = DEFAULT_ADMISSION_MAX_AGE_BOOST,
                  strict_writeset: bool = False,
-                 sweep_interval: float | None = None,
+                 sweep_interval: float | None | object = _SWEEP_INTERVAL_OMITTED,
+                 autostart_background_workers: bool = True,
                  notification_timeout: float = 5.0,
                  notification_max_inflight: int = 8,
                  integration_check=None,
@@ -269,11 +281,17 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             raise ValueError(
                 "admission_queue_capacity must be a non-negative integer"
             )
+        if not isinstance(autostart_background_workers, bool):
+            raise ValueError("autostart_background_workers must be a boolean")
         admission_policy = QueuePolicy(
             aging_quantum=admission_aging_quantum,
             max_age_boost=admission_max_age_boost,
         )
-        sweep_interval = _normalize_sweep_interval(sweep_interval)
+        sweep_interval = _normalize_sweep_interval(
+            DEFAULT_EMBEDDED_SWEEP_INTERVAL
+            if sweep_interval is _SWEEP_INTERVAL_OMITTED
+            else sweep_interval
+        )
         # §D14: `:memory:` 디폴트 금지 — 재기동마다 모든 fence/leader_epoch 가 0 으로 리셋되어
         # 낡은 토큰/잔여 merge 와 충돌(고스트 writer). 영속 DB 필수. 단위테스트는 allow_memory_db=
         # True 로 명시 opt-in(프로세스 1개, 재기동 없음 — fence 리셋 위험 없음).
@@ -343,12 +361,16 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         self.notification_timeout = notification_timeout
         self.notification_max_inflight = notification_max_inflight
         self._lock = threading.RLock()  # 프로세스내 단일 writer(actor 대용) — D1
-        # §D3/D4 주기적 백그라운드 sweep(opt-in). None/0=off(embedded 기본=inline-only). 켜면
-        # 만료 lease/permit/좀비 회수가 동사 호출과 무관하게 진행 → 유휴 후 첫 호출 spike 해소.
+        # §D3/D4 주기적 백그라운드 sweep. 인자 생략=embedded 기본 1초,
+        # 명시 None/0=off. 만료 wait/lease/permit/좀비 회수가 동사 호출과 무관하게 진행한다.
         # 스레드 안전: 변이는 전부 _cs(RLock 직렬화) + store(check_same_thread=False, WAL).
         self._sweep_interval = sweep_interval
         self._sweep_stop = threading.Event()
         self._sweep_thread = None
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread = None
+        self._sweep_lifecycle_lock = threading.RLock()
+        self._sweep_closed = False
         # Outbox delivery is scheduled independently from authority/effect
         # locks.  A post-commit hook only arms this timer; notifier I/O always
         # runs on the timer worker and transient failures wake at their durable
@@ -359,6 +381,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         self._outbox_timer_due = None
         self._outbox_active_threads = set()
         self._outbox_closed = False
+        # Server construction may recover durable state before FastMCP enters
+        # lifespan, but it must not schedule notifier effects or authority
+        # writers until that lifecycle owns their shutdown.
+        self._background_workers_enabled = False
         self._notification_attempt_lock = threading.Lock()
         self._notification_attempts = {}
         self._notification_closed = False
@@ -585,7 +611,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         self.idem_ttl = idem_ttl
         # M1 admission payloads carry a concrete wait deadline. Inline/periodic
         # sweep and restart reconciliation deliver WAIT_TIMEOUT before promotion.
-        # Embedded delivery is opt-in; the MCP server owns a default lifespan sweep.
+        # Embedded omission is autonomous by default; MCP/CLI pass an explicit
+        # opt-out because their own lifespan/one-shot boundary owns scheduling.
         self.admission_wait_timeout = admission_wait_timeout
         self.admission_queue_capacity = admission_queue_capacity
         self.admission_policy = admission_policy
@@ -613,12 +640,115 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # 재기동 복구(§D8, 멱등) — git↔DB 조정 + dangling merge_token abort.
         self._recover()
         # A crash after authority commit but before notification ACK leaves a
-        # durable row.  Startup only arms the dispatcher: notifier I/O must not
-        # delay construction or hold startup/effect authority.
+        # durable row. Embedded runtimes arm delivery and authority maintenance
+        # only after recovery. Server/CLI surfaces may defer both until their
+        # lifecycle boundary. If worker startup fails, do not strand the leader
+        # lease acquired above: stop every accepted worker before resigning.
+        if autostart_background_workers:
+            try:
+                self.start_background_workers()
+            except BaseException:
+                self.close()
+                if self.leader_epoch is not None:
+                    self.resign()
+                self.store.db.close()
+                raise
+
+    def start_background_workers(
+        self,
+        *,
+        sweep_interval=_SWEEP_INTERVAL_OMITTED,
+        heartbeat: bool | None = None,
+    ):
+        """Arm lifecycle-owned authority maintenance and outbox delivery.
+
+        The operation is idempotent before :meth:`close`. ``close`` is a
+        terminal lifecycle fence, so a stopped Coordinator cannot silently
+        acquire a new writer after its caller has begun leadership handoff.
+        """
+        target = (
+            self._sweep_interval
+            if sweep_interval is _SWEEP_INTERVAL_OMITTED
+            else _normalize_sweep_interval(sweep_interval)
+        )
+        if heartbeat is not None and not isinstance(heartbeat, bool):
+            raise ValueError("heartbeat must be a boolean or None")
+        # An enabled authority sweep always owns singleton keepalive. ``True``
+        # additionally requests keepalive when the sweep itself is opted out.
+        heartbeat_enabled = target is not None or heartbeat is True
+        sweep_result = self.start_sweep(target) if target is not None else {
+            "ok": True,
+            "enabled": False,
+            "noop": True,
+        }
+        heartbeat_result = (
+            self.start_leader_heartbeat()
+            if heartbeat_enabled and target is None
+            else {
+                "ok": True,
+                "enabled": bool(
+                    self._heartbeat_thread
+                    and self._heartbeat_thread.is_alive()
+                ),
+                "noop": not heartbeat_enabled,
+            }
+        )
+        with self._outbox_timer_lock:
+            if self._outbox_closed:
+                raise RuntimeError("background workers are closed")
+            already = self._background_workers_enabled
+            self._background_workers_enabled = True
+        # Startup only schedules; notifier I/O never runs under startup/effect
+        # authority and every durable row remains replayable after a crash.
         self._wake_admission_outbox()
-        # 리더십·복구가 끝난 *뒤*에만 백그라운드 sweep 을 발사(변이 전 writer-둘 방지).
-        if self._sweep_interval is not None:
-            self.start_sweep()
+        return {
+            "ok": True,
+            "already": already,
+            "sweep": sweep_result,
+            "heartbeat": heartbeat_result,
+            "outbox_enabled": True,
+        }
+
+    def _start_leader_heartbeat_locked(self):
+        if not self.enforce_single_coordinator or self.leader_ttl <= 0:
+            return {"ok": True, "enabled": False, "noop": True}, False
+        thread = self._heartbeat_thread
+        if thread is not None and thread.is_alive():
+            return {"ok": True, "enabled": True, "already": True}, False
+        self._heartbeat_stop.clear()
+        candidate = threading.Thread(
+            target=Coordinator._periodic_heartbeat_loop,
+            args=(
+                weakref.ref(
+                    self,
+                    _wake_worker_on_owner_gc(self._heartbeat_stop),
+                ),
+                self._heartbeat_stop,
+                self.leader_ttl / 3.0,
+            ),
+            name=f"omd-heartbeat-{self.coordinator_id}",
+            daemon=True,
+        )
+        self._heartbeat_thread = candidate
+        try:
+            candidate.start()
+        except BaseException:
+            self._heartbeat_thread = None
+            self._heartbeat_stop.set()
+            raise
+        return {
+            "ok": True,
+            "enabled": True,
+            "interval": self.leader_ttl / 3.0,
+        }, True
+
+    def start_leader_heartbeat(self):
+        """Start the lifecycle-owned singleton keepalive thread."""
+        with self._sweep_lifecycle_lock:
+            if self._sweep_closed:
+                raise RuntimeError("leader heartbeat is closed")
+            result, _ = self._start_leader_heartbeat_locked()
+            return result
 
     def start_sweep(self, interval=None):
         """Start periodic authority maintenance after startup and recovery.
@@ -631,36 +761,111 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         )
         if target is None:
             return {"ok": True, "enabled": False, "noop": True}
-        thread = self._sweep_thread
-        if thread is not None and thread.is_alive():
-            if self._sweep_interval != target:
-                raise RuntimeError(
-                    "periodic sweep is already running with a different interval"
-                )
-            return {"ok": True, "enabled": True, "already": True, "interval": target}
-        self._sweep_interval = target
-        self._sweep_stop.clear()
-        self._sweep_thread = threading.Thread(
-            target=self._periodic_sweep_loop,
-            args=(target,),
-            name=f"omd-sweep-{self.coordinator_id}",
-            daemon=True,
-        )
-        self._sweep_thread.start()
-        return {"ok": True, "enabled": True, "interval": target}
+        with self._sweep_lifecycle_lock:
+            if self._sweep_closed:
+                raise RuntimeError("periodic sweep is closed")
+            thread = self._sweep_thread
+            if thread is not None and thread.is_alive():
+                if self._sweep_interval != target:
+                    raise RuntimeError(
+                        "periodic sweep is already running with a different interval"
+                    )
+                return {
+                    "ok": True,
+                    "enabled": True,
+                    "already": True,
+                    "interval": target,
+                }
+            self._sweep_interval = target
+            self._sweep_stop.clear()
+            _, heartbeat_started = self._start_leader_heartbeat_locked()
+            candidate = threading.Thread(
+                target=Coordinator._periodic_sweep_loop,
+                args=(
+                    weakref.ref(
+                        self,
+                        _wake_worker_on_owner_gc(self._sweep_stop),
+                    ),
+                    self._sweep_stop,
+                    target,
+                ),
+                name=f"omd-sweep-{self.coordinator_id}",
+                daemon=True,
+            )
+            self._sweep_thread = candidate
+            try:
+                candidate.start()
+            except BaseException:
+                # Publish no dead handle. A later explicit retry may clear the
+                # stop event, while constructor startup will close and resign.
+                self._sweep_thread = None
+                self._sweep_stop.set()
+                if heartbeat_started:
+                    self._heartbeat_stop.set()
+                    heartbeat_thread = self._heartbeat_thread
+                    if heartbeat_thread is not None and heartbeat_thread.is_alive():
+                        heartbeat_thread.join(timeout=5.0)
+                        if heartbeat_thread.is_alive():
+                            raise RuntimeError(
+                                "leader heartbeat did not stop after sweep startup failure"
+                            )
+                    self._heartbeat_thread = None
+                raise
+            return {"ok": True, "enabled": True, "interval": target}
 
-    def _periodic_sweep_loop(self, interval):
+    @staticmethod
+    def _periodic_sweep_loop(coordinator_ref, stop_event, interval):
         """만료 lease/permit/좀비를 주기적으로 회수(§D3/D4). Event.wait 로 자므로 stop 즉시 반응
         (인터벌 안 기다림). sweep 실패가 스레드를 죽이면 안 됨 → catch 후 다음 주기 재시도.
-        리더십 상실(takeover 당한 좀비 리더)은 정지 — 좀비가 계속 변이하면 writer 둘."""
-        while not self._sweep_stop.wait(interval):
+        리더십 상실(takeover 당한 좀비 리더)은 정지 — 좀비가 계속 변이하면 writer 둘.
+        Thread target은 weakref만 보유해 잊힌 embedded Coordinator를 영구 보존하지 않는다."""
+        while not stop_event.wait(interval):
+            coordinator = coordinator_ref()
+            if coordinator is None:
+                return
             try:
-                self.sweep()
+                coordinator.sweep()
             except CoordinatorConflict:
-                self._emit("sweep_stopped", self.coordinator_id, reason="not_leader")
+                coordinator._emit(
+                    "sweep_stopped",
+                    coordinator.coordinator_id,
+                    reason="not_leader",
+                )
                 return
             except Exception as e:  # noqa: BLE001 — 스레드 생존 우선(silent skip 아님, emit)
-                self._emit("sweep_error", self.coordinator_id, error=repr(e))
+                coordinator._emit(
+                    "sweep_error",
+                    coordinator.coordinator_id,
+                    error=repr(e),
+                )
+            finally:
+                # Do not retain the Coordinator across the next timed wait.
+                del coordinator
+
+    @staticmethod
+    def _periodic_heartbeat_loop(coordinator_ref, stop_event, interval):
+        """Refresh singleton authority independently from slow sweep/effects."""
+        while not stop_event.wait(interval):
+            coordinator = coordinator_ref()
+            if coordinator is None:
+                return
+            try:
+                coordinator.coordinator_heartbeat()
+            except CoordinatorConflict:
+                coordinator._emit(
+                    "heartbeat_stopped",
+                    coordinator.coordinator_id,
+                    reason="not_leader",
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 — retry while lease is live.
+                coordinator._emit(
+                    "heartbeat_error",
+                    coordinator.coordinator_id,
+                    error=repr(exc),
+                )
+            finally:
+                del coordinator
 
     def close(self):
         """Stop and join background sweep/outbox workers (idempotent)."""
@@ -670,6 +875,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             # this same lock, so none can mutate durable delivery state after
             # close() returns.
             self._outbox_closed = True
+            self._background_workers_enabled = False
             outbox_timer = self._outbox_timer
             outbox_active = list(self._outbox_active_threads)
             self._outbox_timer = None
@@ -681,15 +887,19 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             # waits for them.  Stop them from starting a new strict effect;
             # close later joins every effect that was already registered.
             self._notification_closed = True
-        self._sweep_stop.set()
-        th = self._sweep_thread
-        if th is not None and th.is_alive():
-            th.join(timeout=5.0)
-            if th.is_alive():
-                raise RuntimeError(
-                    "periodic sweep did not stop; refusing unsafe coordinator handoff"
-                )
-        self._sweep_thread = None
+        with self._sweep_lifecycle_lock:
+            # Terminal gate + shared lock linearize close against concurrent
+            # starts. No writer can appear after this snapshot and escape join.
+            self._sweep_closed = True
+            self._sweep_stop.set()
+            th = self._sweep_thread
+            if th is not None and th.is_alive():
+                th.join(timeout=5.0)
+                if th.is_alive():
+                    raise RuntimeError(
+                        "periodic sweep did not stop; refusing unsafe coordinator handoff"
+                    )
+            self._sweep_thread = None
         if (
             outbox_timer is not None
             and outbox_timer is not threading.current_thread()
@@ -721,12 +931,27 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 )
         with self._notification_attempt_lock:
             self._notification_attempts.clear()
+        # Keep the leader lease alive until every accepted writer/notifier
+        # effect above is joined. Only then may shutdown expose an expired lease
+        # or allow the caller to resign it.
+        with self._sweep_lifecycle_lock:
+            self._heartbeat_stop.set()
+            heartbeat_thread = self._heartbeat_thread
+            if heartbeat_thread is not None and heartbeat_thread.is_alive():
+                heartbeat_thread.join(timeout=5.0)
+                if heartbeat_thread.is_alive():
+                    raise RuntimeError(
+                        "leader heartbeat did not stop; refusing unsafe coordinator handoff"
+                    )
+            self._heartbeat_thread = None
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         self.close()
+        if self.enforce_single_coordinator:
+            self.resign()
         return False
 
     # ---- 임계구역 / 이벤트 ----
@@ -856,7 +1081,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         due_at = float(due_at)
         start_error = None
         with self._outbox_timer_lock:
-            if self._outbox_closed:
+            if self._outbox_closed or not self._background_workers_enabled:
                 return
             previous_timer = self._outbox_timer
             previous_due = self._outbox_timer_due

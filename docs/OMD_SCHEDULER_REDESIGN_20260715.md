@@ -9,8 +9,11 @@ implemented. Standalone wait cancellation authenticates the PENDING owner,
 request generation and bail epoch, then atomically projects semantic CANCELLED
 to legacy DENIED and reconciles promotion. Task cancellation terminalizes
 associated PENDING/HELD admission rows and repairs legacy orphans on restart.
-The MCP server delivers deadlines with a default 1-second lifespan-owned sweep;
-embedded coordinators remain opt-in. Public renew/release, due lease expiry and
+Direct embedded Coordinators deliver deadlines with a default 1-second authority
+tick and explicit `None`/`0` opt-out. Under singleton enforcement a separate
+lifecycle heartbeat worker refreshes the leader lease at `leader_ttl/3`,
+independently of slow sweep execution. The MCP server defers background sweep and outbox delivery
+until lifespan entry, while the CLI remains one-shot. Public renew/release, due lease expiry and
 both PENDING/HELD owner-reclaim paths now pass through the typed lifecycle
 reducer before legacy mutation. Repository wait capacity is durable and bounded
 (default 1024; `0` is no-wait); a full queue returns a replayable semantic
@@ -34,10 +37,10 @@ the authority transaction and RLock are released, preventing sink reentrancy
 from creating a dispatcher/authority lock inversion.
 Cross-stream predecessor rows keep a multi-orbit reclaim's
 `coordination_notification/v1` summary behind every released-orbit fact, while
-empty-agent reclaim uses a synthetic coordination stream. Candidate indexing
-and the prepared
-Connect pipeline remain
-implementation fronts. Do not describe this branch as the complete
+empty-agent reclaim uses a synthetic coordination stream. The conservative
+transaction-local candidate prefilter is implemented; a persistent/sublinear
+index and the prepared Connect pipeline remain implementation fronts. Do not
+describe this branch as the complete
 durable waiter, an optimized scheduler, a production rollout or a scientific
 progress result. The governing `L_IDE` lifecycle is documented in
 [`OMD_SCHEDULER_DEVELOPMENT_HARNESS_20260715.md`](./OMD_SCHEDULER_DEVELOPMENT_HARNESS_20260715.md).
@@ -409,8 +412,7 @@ The materialized M1 receipt is `arrived` evidence from one in-memory
 producer/readback backend. It explicitly records no separate oracle and awaits
 independent judgment; it is not promoted to `external_verdict`.
 
-Still open before full M1: embedded-runtime default wait-deadline delivery,
-explicit non-denial request-generation rollover, independent judgment and
+Still open before full M1: explicit non-denial request-generation rollover, independent judgment and
 finalization. Candidate-index soundness is implemented as a transaction-local
 maximal-literal-prefix prefilter with exact verification, full-scan fallback and
 indexed/full property tests. It reduces exact glob comparisons but is neither
@@ -646,7 +648,11 @@ SHA-256 is
   content-addressed aging and dynamic rank-cycle resolution are implemented;
   the state-edge notification outbox has crash/replay and claim-token fencing;
   a conservative candidate prefilter is exact-verified and property-tested;
-  embedded-runtime default deadline delivery remains open. Task-bound
+  embedded deadline ticks are default-on with explicit opt-out, weak-reference
+  cleanup, terminal close/start linearization, constructor rollback and
+  close-before-resign lifecycle tests. Under singleton enforcement a separate
+  heartbeat worker remains live through sweep/notifier joins and refreshes the
+  leader lease independently of slow sweep execution. Task-bound
   `CANCEL`/`RELEASE` projection is also implemented. The prepared Connect
   pipeline is still contract-only.
 - M0's measured numbers and LakatoTree `partial` verdict describe reproducible

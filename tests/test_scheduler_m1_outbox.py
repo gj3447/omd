@@ -40,6 +40,9 @@ class Collector:
 
 
 def _omd(tmp_path, *, collector=None, **kwargs):
+    # Outbox tests isolate notification scheduling from authority deadlines.
+    # The dedicated regression below proves that the two timers do not alias.
+    kwargs.setdefault("sweep_interval", None)
     omd = Coordinator(
         str(tmp_path / "omd.db"),
         agent_ttl=None,
@@ -50,6 +53,30 @@ def _omd(tmp_path, *, collector=None, **kwargs):
     if collector is not None:
         collector.coordinator = omd
     return omd
+
+
+def test_outbox_timer_does_not_create_wait_timeout_when_authority_tick_is_off(
+    tmp_path,
+):
+    collector = Collector()
+    omd = _omd(
+        tmp_path,
+        collector=collector,
+        admission_wait_timeout=0.03,
+    )
+    try:
+        omd.claim("holder", ["src/**"], ttl=10.0)
+        waiting = omd.claim("waiter", ["src/**"], request_id="outbox-not-clock")
+        _wait_until(lambda: len(collector.notifications) >= 2)
+        time.sleep(0.08)
+        assert omd.store.get_orbit(waiting["orbit_id"])["state"] == "PENDING"
+
+        omd.sweep()
+        row = omd.store.get_orbit(waiting["orbit_id"])
+        assert row["state"] == "DENIED"
+        assert row["decision_type"] == "WAIT_TIMEOUT"
+    finally:
+        omd.close()
 
 
 def _wait_until(predicate, *, timeout=3.0):

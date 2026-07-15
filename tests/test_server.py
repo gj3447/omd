@@ -3,49 +3,10 @@
 import json
 import sys
 import sqlite3
+import time
 from datetime import timedelta
-from types import SimpleNamespace
 
 import pytest
-
-
-def test_leader_heartbeat_loop_is_noop_without_singleton_enforcement():
-    anyio = pytest.importorskip("anyio")
-    pytest.importorskip("fastmcp")
-    from omd_server.server import _leader_heartbeat_loop
-
-    class _NonEnforcedCoordinator:
-        enforce_single_coordinator = False
-
-        def coordinator_heartbeat(self):
-            raise AssertionError("non-enforced coordinator has no leader lease")
-
-    anyio.run(_leader_heartbeat_loop, _NonEnforcedCoordinator())
-
-
-def test_leader_heartbeat_loop_stops_when_leadership_is_lost(monkeypatch):
-    anyio = pytest.importorskip("anyio")
-    pytest.importorskip("fastmcp")
-    from omd_server.core import CoordinatorConflict
-    from omd_server import server as server_module
-
-    calls = []
-
-    async def no_wait(_interval):
-        return None
-
-    def fenced_heartbeat():
-        calls.append("heartbeat")
-        raise CoordinatorConflict("lost leadership")
-
-    monkeypatch.setattr(server_module.anyio, "sleep", no_wait)
-    omd = SimpleNamespace(
-        enforce_single_coordinator=True,
-        leader_ttl=30.0,
-        coordinator_heartbeat=fenced_heartbeat,
-    )
-    anyio.run(server_module._leader_heartbeat_loop, omd)
-    assert calls == ["heartbeat"]
 
 
 def test_coordinator_lifespan_resigns_only_when_singleton_enforced():
@@ -69,8 +30,10 @@ def test_coordinator_lifespan_resigns_only_when_singleton_enforced():
             self.resign_calls += 1
             return {"ok": True}
 
-        def start_sweep(self, interval):
-            self.calls.append(("start_sweep", interval))
+        def start_background_workers(self, *, sweep_interval, heartbeat):
+            self.calls.append(
+                ("start_background_workers", sweep_interval, heartbeat)
+            )
             return {"ok": True}
 
         def close(self):
@@ -83,18 +46,24 @@ def test_coordinator_lifespan_resigns_only_when_singleton_enforced():
     non_enforced = _Coordinator(False)
     anyio.run(enter_and_exit, non_enforced)
     assert non_enforced.resign_calls == 0
-    assert non_enforced.calls == ["close"]
+    assert non_enforced.calls == [
+        ("start_background_workers", None, False),
+        "close",
+    ]
 
     enforced = _Coordinator(True)
     anyio.run(enter_and_exit, enforced)
     assert enforced.resign_calls == 1
+    assert enforced.calls[0] == ("start_background_workers", None, True)
     assert enforced.calls[-2:] == ["close", "resign"]
 
     swept = _Coordinator(True)
 
     async def enter_swept():
         async with _coordinator_lifespan(swept, sweep_interval=0.25)(None):
-            assert swept.calls == [("start_sweep", 0.25)]
+            assert swept.calls == [
+                ("start_background_workers", 0.25, True)
+            ]
 
     anyio.run(enter_swept)
     assert swept.calls[-2:] == ["close", "resign"]
@@ -116,6 +85,88 @@ def test_server_sweep_interval_contract(raw, expected):
     from omd_server.server import _parse_server_sweep_interval
 
     assert _parse_server_sweep_interval(raw) == expected
+
+
+def test_build_server_defers_background_workers_until_lifespan(tmp_path, monkeypatch):
+    pytest.importorskip("fastmcp")
+    from omd_server import server as server_module
+
+    created = []
+
+    class SpyCoordinator:
+        def __init__(self, *args, **kwargs):
+            created.append((args, kwargs))
+
+    class FakeMCP:
+        def __init__(self, *args, **kwargs):
+            self.lifespan = kwargs["lifespan"]
+
+        def tool(self):
+            return lambda function: function
+
+    monkeypatch.setattr(server_module, "Coordinator", SpyCoordinator)
+    monkeypatch.setattr(server_module, "FastMCP", FakeMCP)
+    server_module.build_server(str(tmp_path / "deferred.db"))
+    assert len(created) == 1
+    assert created[0][1]["sweep_interval"] is None
+    assert created[0][1]["autostart_background_workers"] is False
+
+
+def test_build_server_defers_pending_outbox_effect_until_lifespan(
+    tmp_path, monkeypatch
+):
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server import server as server_module
+    from omd_server.core import Coordinator
+
+    db = tmp_path / "deferred-outbox.db"
+    event_log = tmp_path / "events.jsonl"
+    seed = Coordinator(
+        str(db),
+        agent_ttl=None,
+        enforce_single_coordinator=False,
+        sweep_interval=None,
+        autostart_background_workers=False,
+    )
+    seed.claim("agent", ["src/**"], request_id="deferred-notification")
+    seed.close()
+
+    class FakeMCP:
+        def __init__(self, *args, **kwargs):
+            self.lifespan = kwargs["lifespan"]
+
+        def tool(self):
+            return lambda function: function
+
+    def outbox_state():
+        with sqlite3.connect(db) as conn:
+            return conn.execute(
+                "SELECT state FROM admission_outbox WHERE request_id=?",
+                ("deferred-notification",),
+            ).fetchone()[0]
+
+    monkeypatch.setenv("OMD_EVENT_LOG", str(event_log))
+    monkeypatch.setattr(server_module, "FastMCP", FakeMCP)
+    mcp = server_module.build_server(str(db))
+    time.sleep(0.10)
+    assert outbox_state() == "PENDING"
+    if event_log.exists():
+        assert "admission_notification/v1" not in event_log.read_text()
+
+    async def enter_lifespan():
+        async with mcp.lifespan(None):
+            with anyio.fail_after(2.0):
+                while outbox_state() != "DELIVERED":
+                    await anyio.sleep(0.01)
+
+    anyio.run(enter_lifespan)
+    assert outbox_state() == "DELIVERED"
+    events = [json.loads(line) for line in event_log.read_text().splitlines()]
+    assert any(
+        event.get("notification_schema") == "admission_notification/v1"
+        for event in events
+    )
 
 
 @pytest.mark.parametrize("raw", ["-1", "nan", "inf", "-inf", "not-a-number"])
@@ -217,6 +268,7 @@ def test_server_lifespan_sweep_delivers_idle_wait_deadline(tmp_path):
         agent_ttl=None,
         admission_wait_timeout=0.04,
         enforce_single_coordinator=False,
+        sweep_interval=None,
     )
     omd.claim("holder", ["a/**"])
     waiting = omd.claim("waiter", ["a/**"], request_id="idle-wait")
@@ -232,6 +284,45 @@ def test_server_lifespan_sweep_delivers_idle_wait_deadline(tmp_path):
     assert row["state"] == "DENIED"
     assert row["decision_type"] == "WAIT_TIMEOUT"
     assert omd._sweep_thread is None
+
+
+def test_server_lifespan_keeps_enforced_lease_when_sweep_is_opted_out(tmp_path):
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server.core import Coordinator, CoordinatorConflict
+    from omd_server.server import _coordinator_lifespan
+
+    db = str(tmp_path / "heartbeat-only-lifespan.db")
+    omd = Coordinator(
+        db,
+        agent_ttl=None,
+        leader_ttl=0.06,
+        sweep_interval=None,
+        autostart_background_workers=False,
+    )
+
+    async def hold_lifespan():
+        async with _coordinator_lifespan(omd, sweep_interval=None)(None):
+            await anyio.sleep(0.10)
+            with pytest.raises(
+                CoordinatorConflict, match="another live coordinator"
+            ):
+                Coordinator(
+                    db,
+                    agent_ttl=None,
+                    coordinator_id="lifespan-takeover-probe",
+                    leader_ttl=0.06,
+                    sweep_interval=None,
+                )
+
+    anyio.run(hold_lifespan)
+    with Coordinator(
+        db,
+        agent_ttl=None,
+        coordinator_id="lifespan-next-owner",
+        sweep_interval=None,
+    ) as reopened:
+        assert reopened.leader_epoch == 2
 
 
 def test_begin_tool_exposes_and_forwards_liveness_ttl(tmp_path, monkeypatch):

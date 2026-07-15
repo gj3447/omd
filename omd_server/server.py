@@ -17,8 +17,6 @@ fastmcp 미설치 시 import만 가드 (core/cli/tests는 fastmcp 없이 동작)
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import math
 import os
 
@@ -27,7 +25,7 @@ from .admission_config import (
     parse_admission_max_age_boost as _parse_admission_max_age_boost,
     parse_admission_queue_capacity as _parse_admission_queue_capacity,
 )
-from .core import Coordinator, CoordinatorConflict
+from .core import Coordinator
 from .events import Emitter
 from .sinks import JsonlSink
 
@@ -62,7 +60,6 @@ Call about() any time to re-read this orientation. Full design: README.md / CONC
 """
 
 try:
-    import anyio
     from fastmcp import FastMCP
     from fastmcp.server.lifespan import lifespan
 except ImportError:  # 서버 extra 미설치
@@ -87,38 +84,20 @@ def _parse_server_sweep_interval(raw: str | None) -> float | None:
     return interval or None
 
 
-async def _leader_heartbeat_loop(omd: Coordinator) -> None:
-    # stdio MCP servers deliberately share one SQLite DB without a process-wide
-    # leader lease. Such coordinators have no lease to refresh, so heartbeat is
-    # not merely unnecessary: coordinator_heartbeat() would fence itself out.
-    if not omd.enforce_single_coordinator:
-        return
-    interval = max(1.0, omd.leader_ttl / 3.0)
-    while True:
-        await anyio.sleep(interval)
-        try:
-            omd.coordinator_heartbeat()
-        except CoordinatorConflict:
-            # A takeover permanently fences this coordinator. Do not keep a
-            # noisy background task retrying a lease it can no longer own.
-            return
-
-
 def _coordinator_lifespan(omd: Coordinator, *, sweep_interval: float | None = None):
     @lifespan
     async def coordinator_lifespan(server):
-        heartbeat_task = None
         try:
-            if sweep_interval is not None:
-                omd.start_sweep(sweep_interval)
-            if omd.enforce_single_coordinator:
-                heartbeat_task = asyncio.create_task(_leader_heartbeat_loop(omd))
+            # Constructor-time recovery is synchronous, but no background
+            # writer/notifier effect starts until lifespan owns its shutdown.
+            omd.start_background_workers(
+                sweep_interval=sweep_interval,
+                # Even with OMD_SWEEP_INTERVAL=0 an enforced server must retain
+                # its lease through synchronous close/effect joins.
+                heartbeat=omd.enforce_single_coordinator,
+            )
             yield {"omd": omd}
         finally:
-            if heartbeat_task is not None:
-                heartbeat_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await heartbeat_task
             # Stop and join the periodic writer before handing leadership off.
             # close() fails loudly rather than resigning with a live old writer.
             omd.close()
@@ -153,6 +132,10 @@ def build_server(db_path: str = "omd.db"):
     omd = Coordinator(
         db_path,
         enforce_single_coordinator=False,
+        # build_server() may synchronously initialize/recover durable state, but
+        # must not start a background writer/effect before FastMCP lifespan.
+        sweep_interval=None,
+        autostart_background_workers=False,
         events=_events,
         admission_queue_capacity=_capacity,
         admission_aging_quantum=_aging_quantum,

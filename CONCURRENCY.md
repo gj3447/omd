@@ -535,8 +535,9 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
   1. **EPHEMERAL set 은 agent 를 자동 upsert** — 안 그러면 `bail`/좀비회수가 `agents` 행을 못 찾아 noop → 플래그 영구 잔존(바로 해소하려던 버그). 즉 flag_set(EPHEMERAL)은 owner 를 살아있는 agent 로 등록하는 부작용이 있다(의도된 계약).
   2. **`flag_set` 의 bail_epoch CAS 는 부분** — 회수된 좀비(RETIRED/ZOMBIE/BAILING) 차단은 `_check_alive` 로 항상 ON 이지만, EPHEMERAL 의 §D6 "epoch CAS" 는 **owner CAS + lease fence 만료**로 대체 강제(별도 flag epoch 를 변이마다 caller 가 들고 오게 하진 않음 — orbit lease 가 이미 fence/owner 가드를 받으므로 이중화 불필요). LATCH 는 소유 개념 자체가 없어(§D3) owner/epoch CAS 비대상.
   3. **CLEARED ≠ BROKEN**: 자발 clear 는 '사실이 더는 참 아님'(producer 정상 종료)이라 대기자를 PRODUCER_DEAD 로 깨우지 않는다 — want 가 다른 값이면 계속 WAITING(타임아웃까지). 오직 보유자 **사망**(reclaim/TTL)만 BROKEN/PRODUCER_DEAD. 영구 hang 은 사망 경로가 BROKEN 으로 닫으므로 없음.
-  4. **당시 periodic sweep 없음** — 현재는 `sweep_interval`/`OMD_SWEEP_INTERVAL` opt-in
-     background tick으로 해소됐다. 기본값은 여전히 inline-only(하위호환).
+  4. **당시 periodic sweep 없음** — 현재 embedded는 인자 생략 시 1초 autonomous tick,
+     MCP는 lifespan 진입 후 `OMD_SWEEP_INTERVAL` tick을 시작한다. 명시 `None`/`0`만
+     inline-only opt-out이다.
 - **남은 부채**: P0 전부 닫힘(증분1~4). 미구현 = **D4 세마포어** · **D5 배리어** · D12 read-set 코히런스 · D14 HA 입장 — 전부 설계만(P1/P2). (D3 = 증분6, D6 잔여+D9 = 증분5, P0-1~11 = 증분1~4.)
 
 ### ✅ 증분 7 — D4 크래시 안전 세마포어: permit=lease, 가용 = max − count(ACTIVE) — DONE
@@ -567,7 +568,8 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
 - **deviation/한계(정직 표기)**:
   1. **promote 는 eager(release/sweep/declare 마다 즉시 head 부여)** — 그래서 '빈 슬롯 + 대기자' 상태가 정상 경로엔 거의 안 생기고, `_has_earlier_waiter` 가드는 *defense-in-depth*(직접 acquire 의 큐 점프 차단)다. 그 이빨은 territory 테스트(store 직접 상태 주입)로 실증. eager-promote 자체가 1차 기아 방지.
   2. **대기 deadline = ttl**(별도 wait-timeout 인자 없음) — `acquire` 의 `ttl` 이 'permit 보유 TTL'이자 '대기 타임아웃'을 겸한다. 명세(§D4 의사코드)는 `ttl`만 받으므로 따랐다. 더 세분이 필요하면 P2(별도 `wait_timeout`).
-  3. **당시 periodic sweep 없음** — 증분6과 동일하게 현재 opt-in background tick으로 해소.
+  3. **당시 periodic sweep 없음** — 증분6과 동일하게 현재 default embedded/MCP lifespan
+     background tick으로 해소(`None`/`0`은 명시 opt-out).
   4. **permit 은 fence 를 받지만 strict-fence 재검증 동사는 release 뿐** — acquire/reuse 는 owner 기준(같은 agent). renew 전용 동사는 안 만들고 heartbeat 로 TTL 연장(§D2 의 'heartbeat 한 번이 모든 hb_bound lease 갱신' 패턴). permit 개별 renew 가 필요하면 P2.
 - **남은 부채**: P0 전부 닫힘(증분1~4). 미구현 = **D5 배리어**(세대-스탬프+BROKEN) · D12 read-set 코히런스 · D14 HA 입장 — 전부 설계만(P1/P2). (D4 = 증분7, D3 = 증분6, D6 잔여+D9 = 증분5 에서 닫힘.)
 
@@ -635,9 +637,9 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
      배리어 BROKEN 신호로 호출자에게 반쪽 적용을 알린다). 정직: "전부-아니면-전무" 원자 트립은 아니다 —
      merge 의 비가역성 때문(D8 도 개별 task 단위로 git 진실과 조정). 응결 순서 결정성 + merge_token 으로
      index 오염은 막지만, k번째에서 깨지면 1..k-1 은 응결됨.
-  2. **당시 periodic sweep 없음**(현재 opt-in background tick으로 해소) — 그 시점에는 누군가
-     inline-sweep 동사(barrier_arrive/barrier_status/sweep/next_task 등)를 호출할 때 일어난다. 대기 참가자가
-     status/arrive 하면 반드시 반영되므로 영구 hang 없음. 백그라운드 tick 은 P2.
+  2. **당시 periodic sweep 없음** — 현재 default embedded/MCP lifespan background tick으로
+     해소했다. 명시 opt-out surface에서는 누군가 inline-sweep 동사
+     (barrier_arrive/barrier_status/sweep/next_task 등)를 호출할 때 반영된다.
   3. **CONSUMED 전이는 정의만**(FSM 에 trip→consume 있음) — 결과 수거 동사는 미구현(현재 TRIPPED 가
      사실상 종단; barrier_status 로 관측). 필요해지면 P2.
   4. **§3.D 재기동 복구의 배리어-bound CONNECTING 단위 처리는 미구현** — `_recover()` 는 여전히 task 를
@@ -709,8 +711,9 @@ monotonic clock 내부비교 / fence-qualified worktree 경로 / idempotency 테
    강제한다. "알림만"(soft) 옵션은 미구현.
 3. **D14 는 단일 인스턴스 강제(거부)** 만 — 리더-lease **페일오버**(통합 머지 조정까지)는 §7 대로
    범위 밖. takeover 는 "죽은 리더 자리를 새 리더가 인계" 까지(진행중 작업의 무중단 인계 아님).
-4. **당시 leader heartbeat 자동 주기 미구현** — 현재 `server.py` lifespan이 leader enforcement
-   모드에서 ttl/3 keepalive를 실행하고, takeover로 fence-out되면 루프를 종결한다. 여러 stdio MCP
+4. **당시 leader heartbeat 자동 주기 미구현** — 현재 default embedded의 별도 heartbeat
+   worker는 느린 sweep 실행과 독립적으로 ttl/3 keepalive를 실행하고, takeover로 fence-out되면 종결한다.
+   `server.py` lifespan도 enforcement 모드에서 같은 keepalive 경계를 보존한다. 여러 stdio MCP
    client를 허용하려고 enforcement를 끈 surface는 애초 leader lease가 없으므로 heartbeat도 no-op.
 5. `_ghost_reads` 의 글로브 overlap 은 `sets_overlap`(보수적 — 거짓-양성 가능, soundness 우선).
    거짓-양성이면 불필요한 rebase 1회를 강제할 뿐 분열은 절대 안 남(안전측 실패).
@@ -839,8 +842,8 @@ P3 충돌 복구 UX = 증분13, runtime guardrails = 증분14~15 에서 닫힘.)
 - **D14 HA 입장 확정**: 단일 인스턴스 강제(거부) vs 리더-lease 페일오버 — 후자는 통합 머지 조정까지 필요(범위 큼). 우선 *단일 인스턴스 강제 + `:memory:` 금지*.
 - **D10 강제 방식**: sparse-checkout(완전 격리, 비용↑) vs pre-connect diff 감사(저렴, 사후) 중 v1 선택. (감사 우선 권장.)
 - **D12 read-set 코히런스**의 정확한 무효화 정책(전 consumer 강제 rebase vs 알림만).
-- **periodic sweep 기본값 정책** — 구현은 `sweep_interval`/`OMD_SWEEP_INTERVAL` opt-in. 기본을
-  inline-only에서 always-on으로 바꿀지는 workload/throughput 측정 뒤 결정.
+- **periodic sweep 운영 cadence** — embedded 기본 1초와 MCP lifespan 기본 1초는 채택됐다.
+  workload/throughput 측정으로 cadence를 조정하되 명시 `None`/`0` opt-out과 deadline bound를 보존한다.
 - **durable 엔진**(DBOS) 채택은 여전히 선택(현 설계는 DB-backed FSM + git-진실 복구로 충분; 장기 크래시-내성이 정말 필요해지면).
 - glob char-class 정밀 교집합(현 `disjoint.py`는 보수적 True — soundness 유지, 병렬도만 손해).
 

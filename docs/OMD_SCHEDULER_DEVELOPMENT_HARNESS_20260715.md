@@ -11,8 +11,10 @@ plus PENDING and HELD owner reclaim) now pass through the typed reducer before l
 mutation. A standalone authenticated wait-cancel operation is available, and
 cancelling a task atomically maps its associated PENDING row to semantic
 `CANCEL` and its HELD row to semantic `RELEASE`, with restart repair for legacy
-orphan rows. The MCP server owns a default autonomous sweep; embedded
-coordinators remain opt-in. The repository queue is now bounded (default 1024,
+orphan rows. Direct embedded Coordinators now own a default autonomous authority
+tick with an explicit deterministic opt-out and singleton heartbeat; the MCP
+server defers background sweep/outbox work until lifespan entry and the CLI
+stays one-shot. The repository queue is now bounded (default 1024,
 operator-pinned per DB), and full queues return a typed, replayable
 `QUEUE_FULL` receipt without allocating an Orbit, fence or queue ticket.
 The queue now uses a content-addressed v2 saturating-aging policy: the operational
@@ -26,8 +28,9 @@ semantic admission edges now persist `admission_notification/v1` in the same
 authority transaction and deliver post-commit with stable event IDs,
 claim-token fencing, per-request-generation FIFO and at-least-once replay.
 `PROMOTION_BLOCKED` and `RENEW` remain non-durable high-rate observations in
-this bounded M1d slice. Candidate indexing, the prepared Connect pipeline, and
-protected-ref control plane remain unimplemented. Do not
+this bounded M1d slice. A conservative transaction-local candidate prefilter is
+implemented; persistent/sublinear indexing, the prepared Connect pipeline, and
+the protected-ref control plane remain unimplemented. Do not
 describe this slice as the complete durable waiter, an optimized scheduler, a
 production rollout, or a scientific progress result.
 
@@ -480,12 +483,22 @@ The runtime path for evidence item 6 is now implemented. New PENDING rows persis
 typed `wait_deadline`, and sweep/restart reconciliation delivers the semantic
 timeout transition. A standalone `cancel_wait` operation now authenticates the
 PENDING owner, request generation and bail epoch, projects semantic `CANCELLED`
-to legacy `DENIED`, and reconciles eligible promotion once. Embedded
-`Coordinator` instances remain inline-only unless periodic sweep is explicitly
-enabled. The MCP server starts a 1-second sweep by default inside its lifespan
-(`OMD_SWEEP_INTERVAL=0` is the explicit opt-out), stops and joins it before
-leader handoff, and therefore delivers idle wait deadlines without a foreground
-verb. A durable per-repository capacity (default 1024; `0` means no-wait) is
+to legacy `DENIED`, and reconciles eligible promotion once. Direct embedded
+`Coordinator` construction starts a 1-second authority tick when
+`sweep_interval` is omitted; explicit `None` or `0` remains inline-only. The
+sweep and separate heartbeat threads hold only weak Coordinator references and
+stop on collection or lost leadership. Under singleton enforcement the heartbeat
+worker refreshes the leader lease at `leader_ttl/3`, independently of slow sweep
+execution. `close()` is a terminal, linearized start gate; it joins sweep and
+notifier effects while heartbeat remains live, then stops heartbeat before
+`resign()`. Context-manager exit performs that safe order. Constructor
+worker-start failure also closes then resigns rather
+than stranding a live lease. The MCP server may synchronously initialize and
+recover state at construction, but suppresses background sweep and outbox
+effects until lifespan (`OMD_SWEEP_INTERVAL=0` opts out of sweep), and joins
+them before handoff; the CLI explicitly stays inline-only. Therefore idle wait deadlines no longer
+require a foreground verb on the default embedded or MCP surfaces. A durable
+per-repository capacity (default 1024; `0` means no-wait) is
 pinned in DB metadata. Once full, only blocked claims take semantic
 `ADMISSION_REJECTED`; disjoint/compatible grants still proceed. The rejection
 binds depth, capacity and `retry_after_at` in its decision ID, creates no live
@@ -639,6 +652,9 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
   tests/test_scheduler_m2_candidate_index.py \
   tests/test_scheduler_m2_candidate_index_replay.py \
   tests/test_scheduler_m1_outbox.py \
+  tests/test_periodic_sweep.py \
+  tests/test_server.py \
+  tests/test_cli_parity.py \
   tests/test_scheduler_admission_conformance.py \
   tests/test_sinks.py \
   tests/test_d2_reclaim.py \
@@ -709,9 +725,8 @@ slice is ready to commit only when:
   capability bound to the PENDING row's owner, generation and bail epoch.
 
 Landing those files makes the **M1 fairness implementation slice** durable. It
-does not make full M1 or the development cycle `CLOSED`: embedded-runtime
-default deadline delivery, an independent scripted progress judgment and
-finalization receipts remain future work.
+does not make full M1 or the development cycle `CLOSED`: an independent scripted
+progress judgment and finalization receipts remain future work.
 
 ## 14. Known limitations and promotion blockers
 
@@ -731,8 +746,11 @@ finalization receipts remain future work.
    by default; content-addressed saturating aging and dynamic rank-cycle
    resolution plus the durable state-edge notification outbox are implemented.
    The conservative, exact-verified candidate prefilter is implemented without
-   claiming a persistent or sublinear database index. Embedded-runtime default
-   deadline delivery remains the open M1 runtime front. Task-bound
+   claiming a persistent or sublinear database index. Default embedded deadline
+   ticks, explicit opt-out, server lifespan deferral, CLI one-shot behavior and
+   authority/outbox timer separation are runtime-tested. Heartbeat-before-sweep,
+   constructor rollback, terminal close/start linearization and immediate
+   context-manager handoff are also runtime-tested. Task-bound
    `CANCEL`/`RELEASE` projection is also implemented.
 5. The prepared candidate, expected-old ref CAS, independent ref reader and
    finalization protocol are contracts, not the current runtime path.
