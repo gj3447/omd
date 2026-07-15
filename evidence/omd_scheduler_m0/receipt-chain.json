@@ -1,0 +1,46 @@
+{
+  "head_receipt_sha256": "c97ba992f7251a134cd1d814e56530a3b681e64f7a9e10ba5d24433708940ad3",
+  "receipts": [
+    {
+      "baseline_lineage": "b10b756219eda7d94f9e0784aa71f5203e279b3c",
+      "baseline_value": 0.0,
+      "closes_question": null,
+      "credence": null,
+      "direction": "higher",
+      "judge_script_sha": "04e122e92ec4bf2ae17ed99d76885e8466ebdf4e94ce1bea1e7e0543a3fe6db6",
+      "metric_name": "m0_replay_obligations_met",
+      "noise_band": 0.0,
+      "novel_direction": null,
+      "novel_metric": null,
+      "novel_prediction": null,
+      "novel_threshold": null,
+      "prev_receipt_sha": null,
+      "receipt_kind": "prediction",
+      "receipt_sha": "6acde90fe7c073d943bb463a05f9f1a83ee582c227840b71e1302f47336001c5",
+      "registered_at": "2026-07-15T13:35:09+09:00",
+      "scale_type": "ratio",
+      "tag": "m0-reproducible-evidence",
+      "tree": "omd-safe-conflict-aware-scheduler",
+      "verdict": null,
+      "verdict_source": null
+    },
+    {
+      "engine_rule_sha": "7ae9c20de615d1275e0d239a2aafa02ad4bb07c52fa187bc2198e2c4b29c407e",
+      "judge_script_sha": "04e122e92ec4bf2ae17ed99d76885e8466ebdf4e94ce1bea1e7e0543a3fe6db6",
+      "judged_at": "2026-07-15T04:55:24.142585+00:00",
+      "lakatos_status": "judged",
+      "measurement_grade": "server_regenerated",
+      "metric_name": "m0_replay_obligations_met",
+      "metric_value": 2.0,
+      "novel_confirmed": false,
+      "prev_receipt_sha": "6acde90fe7c073d943bb463a05f9f1a83ee582c227840b71e1302f47336001c5",
+      "receipt_sha": "c97ba992f7251a134cd1d814e56530a3b681e64f7a9e10ba5d24433708940ad3",
+      "tag": "m0-reproducible-evidence",
+      "target_id": "A fresh locked replay will reproduce the disclosed orbit no-overtaking defect and freeze a descriptive single-Coordinator claim-scaling baseline without claiming a performance improvement.",
+      "tree": "omd-safe-conflict-aware-scheduler",
+      "verdict": "partial",
+      "verdict_source": "scripted"
+    }
+  ],
+  "schema": "omd-scheduler-m0-receipt-chain/v1"
+}

@@ -1,0 +1,35 @@
+{
+  "branch": "m0-reproducible-evidence",
+  "errors": [
+    "replay failed: RuntimeError: benchmark replay failed with 1: Traceback (most recent call last):\n  File \"/Users/lagyeongjun/CD/omd/benchmarks/omd_scheduler_m0.py\", line 40, in <module>\n    from omd_server import Coordinator, Emitter  # noqa: E402\n    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/lagyeongjun/CD/omd/omd_server/__init__.py\", line 7, in <module>\n    from .core import Coordinator, CoordinatorConflict\n  File \"/Users/lagyeongjun/CD/omd/omd_server/core.py\", line 39, in <module>\n    from . import bypass_audit, fsm, task_state\n  File \"/Users/lagyeongjun/CD/omd/omd_server/fsm.py\", line 9, in <module>\n    from transitions import Machine\nModuleNotFoundError: No module named 'transitions'\n"
+  ],
+  "executed_at": "2026-07-15T04:50:56.890418+00:00",
+  "inputs": {
+    "evidence_path": "/Users/lagyeongjun/CD/omd/evidence/omd_scheduler_m0/evidence.json",
+    "evidence_sha256": "9fef2cef053b52587b2508e12e1624d50891fccba9e3815268d1f842287278c2",
+    "judge_script_sha256": "04e122e92ec4bf2ae17ed99d76885e8466ebdf4e94ce1bea1e7e0543a3fe6db6",
+    "preregistration_path": "/Users/lagyeongjun/CD/omd/evidence/omd_scheduler_m0/preregistration.json",
+    "preregistration_sha256": "f43aa5ab89b1c1dd08da313fa457eeef48f921c28a497f3fdedf60abee75406e"
+  },
+  "programme": "omd-safe-conflict-aware-scheduler",
+  "recomputed": {
+    "claim_cells": {
+      "1": 10,
+      "2": 10,
+      "4": 10,
+      "8": 10
+    },
+    "claim_matrix_complete": true,
+    "fairness_observations": 10,
+    "fairness_replication_complete": true,
+    "m0_replay_obligations_met": 2,
+    "required": 2.0
+  },
+  "replay": null,
+  "roles": {
+    "implementer": "codex-omd-scheduler-m0-20260715-root",
+    "judge": "progress_judge.omd_scheduler_m0"
+  },
+  "schema": "omd-scheduler-m0-judge-response/v1",
+  "status": "invalid"
+}

@@ -1,0 +1,13 @@
+{
+  "engine_and_external_fold_equal": true,
+  "engine_response_sha256": "38294339d935275a340843c12d1925c41defed4b7f7b941b1d1289b88fe9f40f",
+  "failed_attempt_path": "evidence/omd_scheduler_m0/judge-attempt-1-invalid.json",
+  "failed_attempt_sha256": "066d6b6da6117d977b4d6f856409e2938972fd7eb3bf9e77e175b5c25902b2b5",
+  "from_receipt": true,
+  "head_receipt_sha256": "c97ba992f7251a134cd1d814e56530a3b681e64f7a9e10ba5d24433708940ad3",
+  "ok": true,
+  "prediction_receipt_sha256": "6acde90fe7c073d943bb463a05f9f1a83ee582c227840b71e1302f47336001c5",
+  "receipt_count": 2,
+  "schema": "omd-scheduler-m0-receipt-verification/v1",
+  "scripted_source_confirmed": true
+}

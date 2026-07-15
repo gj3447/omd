@@ -100,6 +100,53 @@ The separately locked `gates/scheduler_fairness.yaml` is intentionally RED on
 M0.  M1 must make that same hash green; editing the gate to fit output is
 forbidden.
 
+### M0 measured result (2026-07-15)
+
+The frozen run at source commit
+`b10b756219eda7d94f9e0784aa71f5203e279b3c` completed 10 fairness episodes and
+40 claim-scaling episodes (24,000 raw claim latency samples).  The known
+admission defect reproduced in all 10 fairness episodes: the older, higher
+priority `src/**` waiter remained PENDING while the newer `src/b.py` request
+was HELD.  Therefore the no-overtaking pass rate is `0/10 = 0.0`.
+
+The descriptive single-Coordinator baseline is:
+
+| clients | median throughput (claims/s) | speedup vs 1 | parallel efficiency | median episode p99 (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 260.650 | 1.000 | 1.000 | 9.803 |
+| 2 | 259.788 | 0.997 | 0.498 | 16.826 |
+| 4 | 253.556 | 0.973 | 0.243 | 33.365 |
+| 8 | 259.258 | 0.995 | 0.124 | 58.748 |
+
+These numbers are a baseline for later paired comparison, not an estimate of
+global capacity.  They show no throughput scaling in this one-process,
+one-Coordinator claim workload while tail latency rises with client count.
+They do not isolate SQLite from the process-wide critical section and
+increasing HELD-conflict scan, and they do not include the optional real-Git
+connect scenario.
+
+The OOPTDD receipt exercised the real Coordinator path.  The positive and
+restored-positive observations reached the in-memory readback backend with
+charge ratio `1.0`; dropping the required event at that backend made the same
+locked gate RED with charge ratio `0.0`.
+
+The first independent judge attempt correctly failed closed because the
+LakatoTree Python environment lacked OMD's `transitions` dependency.  The
+failed response is retained as `judge-attempt-1-invalid.json`.  Re-running the
+unchanged judge, evidence, hashes, and criteria under OMD's virtual environment
+with LakatoTree on `PYTHONPATH` completed a fresh 10 + 40 episode replay and
+recomputed both obligations.  LakatoTree's scripted result is `partial`: the
+reproducible measurement mechanism improved from its registered baseline, but
+there is no preregistered novel target and no scheduler behavior improvement.
+
+Durable evidence:
+
+- `evidence/omd_scheduler_m0/evidence.json`
+- `evidence/omd_scheduler_m0/ooptdd_receipt.json`
+- `evidence/omd_scheduler_m0/judge-response.json`
+- `evidence/omd_scheduler_m0/judgment-packet.json`
+- `evidence/omd_scheduler_m0/receipt-chain.json`
+
 ## Subsequent vertical slices
 
 ### M1 — fair admission and durable waiting

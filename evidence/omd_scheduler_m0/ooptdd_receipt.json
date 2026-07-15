@@ -1,0 +1,71 @@
+{
+  "schema_version": "symposium-ooptdd-receipt/v1",
+  "template_only": false,
+  "receipt_id": "omd-scheduler-m0-baseline-replication",
+  "cycle_id": "pi-omd-scheduler-m0-20260715",
+  "requirement_group": "OMD-SCHEDULER-M0-MEASUREMENT-PIPELINE",
+  "spec": {
+    "path": "evidence/omd_scheduler_m0/m0_measurement_gate.yaml",
+    "sha256": "3f76fd6da11e4c806c052fd6843540d19fdef372a55b9401067f288b762e5c28",
+    "locked_before_positive_run": true
+  },
+  "producer": {
+    "command": "PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m benchmarks.produce_scheduler_m0_receipt --gate evidence/omd_scheduler_m0/m0_measurement_gate.yaml --cid omd-scheduler-m0-ooptdd-fresh --output evidence/omd_scheduler_m0/ooptdd_run.json",
+    "cwd": "/Users/lagyeongjun/CD/omd",
+    "git_head": "b10b756219eda7d94f9e0784aa71f5203e279b3c",
+    "entrypoint": "benchmarks.omd_scheduler_m0:run_ooptdd",
+    "source_path": "benchmarks/omd_scheduler_m0.py",
+    "source_symbol": "run_ooptdd",
+    "real_code_path": true,
+    "exit_code": 0
+  },
+  "correlation": {
+    "cid": "omd-scheduler-m0-ooptdd-fresh"
+  },
+  "requirements": [
+    {
+      "id": "M0-DEFECT-REPRODUCED",
+      "role": "guard_defect",
+      "event": "newer_granted_while_older_pending"
+    },
+    {
+      "id": "M0-EVIDENCE-READBACK",
+      "role": "guard_mechanism",
+      "event": "scheduler_fairness_probe_completed"
+    }
+  ],
+  "positive": {
+    "observed_verdict": "green",
+    "receipt_path": "evidence/omd_scheduler_m0/ooptdd_run.json",
+    "receipt_sha256": "c4333f1db818581451f77c46b8915321ffc21cd9c8f8a1c1ecb902332039a2a4",
+    "evidence_tier": "arrived",
+    "charge_ratio": 1.0,
+    "forbidden_events_passed": true,
+    "loop": {
+      "complete": true,
+      "methodology_ok": true,
+      "done": 1,
+      "total": 1
+    }
+  },
+  "negative_oracle": {
+    "spec_sha256": "3f76fd6da11e4c806c052fd6843540d19fdef372a55b9401067f288b762e5c28",
+    "technique": "drop_backend",
+    "injection": "Drop the required scheduler_fairness_probe_completed event at the MemoryBackend boundary while leaving the real Coordinator probe unchanged.",
+    "observed_verdict": "red",
+    "receipt_path": "evidence/omd_scheduler_m0/ooptdd_run.json",
+    "receipt_sha256": "c4333f1db818581451f77c46b8915321ffc21cd9c8f8a1c1ecb902332039a2a4",
+    "restored": true
+  },
+  "oracle": {
+    "separate_source": false,
+    "corroborated": false,
+    "emit_identity": "MemoryBackend",
+    "read_identity": "MemoryBackend"
+  },
+  "source_binding": {
+    "path": "benchmarks/omd_scheduler_m0.py",
+    "symbol": "run_ooptdd",
+    "sha256": "3c39d0c6cf57ce9e05b916e2a691aaefebd9f5d080b06d8ec7568345f59bdc15"
+  }
+}

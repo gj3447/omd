@@ -1,0 +1,78 @@
+{
+  "schema": "omd-scheduler-m0-verification/v1",
+  "verified_at": "2026-07-15T13:59:05+09:00",
+  "source_measurement_git_head": "b10b756219eda7d94f9e0784aa71f5203e279b3c",
+  "checks": [
+    {
+      "command": "python3 /Users/lagyeongjun/CD/SYMPOSIUM/SKILLS/engine-design/scripts/validate_engine_spec.py spec/connect_pipeline_engine.json",
+      "exit_code": 0,
+      "result": "OK; 0 warnings"
+    },
+    {
+      "command": "python3 /Users/lagyeongjun/CD/SYMPOSIUM/SKILLS/fsm-design/scripts/validate_fsm.py spec/connect_pipeline_fsm.json",
+      "exit_code": 0,
+      "result": "OK; 0 warnings"
+    },
+    {
+      "command": "python3 /Users/lagyeongjun/CD/SYMPOSIUM/SKILLS/fsm-design/scripts/run_fsm_traces.py spec/connect_pipeline_fsm.json spec/connect_pipeline_traces.json",
+      "exit_code": 0,
+      "result": "OK; 17 abstract traces"
+    },
+    {
+      "command": "python3 /Users/lagyeongjun/CD/SYMPOSIUM/SKILLS/loop-engineering/scripts/validate_loop_contract.py spec/connect_pipeline_loop.json",
+      "exit_code": 0,
+      "result": "OK; 0 warnings"
+    },
+    {
+      "command": "/Users/lagyeongjun/CD/SYMPOSIUM/PI/ooptdd-loop/.venv/bin/ooptdd-loop validate-spec spec/omd_scheduler_m0_ooptdd.yaml --json",
+      "exit_code": 0,
+      "result": "OK; OOPTDD R01-R14 passed"
+    },
+    {
+      "command": "python3 /Users/lagyeongjun/CD/SYMPOSIUM/SKILLS/ooptdd-receipt/scripts/validate_receipt.py evidence/omd_scheduler_m0/ooptdd_receipt.json --verify-linked --root /Users/lagyeongjun/CD/omd",
+      "exit_code": 0,
+      "result": "valid symposium-ooptdd-receipt/v1; linked hashes verified"
+    },
+    {
+      "command": "python3 /Users/lagyeongjun/CD/SYMPOSIUM/SKILLS/lakatotree-judge/scripts/validate_judgment.py evidence/omd_scheduler_m0/judgment-packet.json --stage complete --verify-linked --root /Users/lagyeongjun/CD/omd",
+      "exit_code": 0,
+      "result": "valid symposium-lakatotree-judgment/v1 complete packet; linked hashes verified"
+    },
+    {
+      "command": "PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider tests/test_scheduler_m0_harness.py",
+      "exit_code": 0,
+      "result": "8 passed in 2.12s; OOPTDD arrival 8/8 sessions and 24 outcomes"
+    },
+    {
+      "command": "PYTHONPATH=/Users/lagyeongjun/CD/SYMPOSIUM/PI/lakatotree .venv/bin/python -m benchmarks.package_scheduler_m0_judgment --prereg evidence/omd_scheduler_m0/preregistration.json --evidence evidence/omd_scheduler_m0/evidence.json --judge-response /tmp/omd_scheduler_m0_judge-response-attempt2.json --failed-attempt /tmp/omd_scheduler_m0_judge-response.json --source-commit b10b756219eda7d94f9e0784aa71f5203e279b3c --output-dir evidence/omd_scheduler_m0",
+      "exit_code": 0,
+      "result": "judgment packet and engine/external-verifier receipt chain generated"
+    },
+    {
+      "command": "same package command with judge-attempt-1-invalid.json as the response",
+      "expected_exit_code": 1,
+      "observed_exit_code": 1,
+      "result": "rejected before writes: status not judged, replay obligation absent, scripted engine result absent"
+    },
+    {
+      "command": "PYTHONDONTWRITEBYTECODE=1 make verify",
+      "exit_code": 0,
+      "result": "358 passed in 72.20s; conformance 16/17; regressed 0; one documented intentional non-adoption; verify GREEN"
+    }
+  ],
+  "measurement": {
+    "evidence_path": "evidence/omd_scheduler_m0/evidence.json",
+    "evidence_sha256": "9fef2cef053b52587b2508e12e1624d50891fccba9e3815268d1f842287278c2",
+    "fairness_repeats": 10,
+    "fairness_passes": 0,
+    "claim_episodes": 40,
+    "raw_claim_latency_samples": 24000
+  },
+  "judgment": {
+    "invalid_attempt_sha256": "066d6b6da6117d977b4d6f856409e2938972fd7eb3bf9e77e175b5c25902b2b5",
+    "successful_response_sha256": "38294339d935275a340843c12d1925c41defed4b7f7b941b1d1289b88fe9f40f",
+    "prediction_receipt_sha256": "6acde90fe7c073d943bb463a05f9f1a83ee582c227840b71e1302f47336001c5",
+    "judgment_receipt_sha256": "c97ba992f7251a134cd1d814e56530a3b681e64f7a9e10ba5d24433708940ad3",
+    "packet_sha256": "834900ded20169fe831478987a2b3a28814409aaa69d5b7e929f41c9a03afb13"
+  }
+}

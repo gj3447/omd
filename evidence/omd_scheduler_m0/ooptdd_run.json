@@ -1,0 +1,310 @@
+{
+  "cid": "omd-scheduler-m0-ooptdd-fresh",
+  "completed_at": "2026-07-15T04:46:48.226073+00:00",
+  "gate": {
+    "path": "evidence/omd_scheduler_m0/m0_measurement_gate.yaml",
+    "sha256": "3f76fd6da11e4c806c052fd6843540d19fdef372a55b9401067f288b762e5c28"
+  },
+  "negative": {
+    "drop_required_events": true,
+    "evidence_tier": "emitted",
+    "gate_result": {
+      "authenticated": null,
+      "checks": [
+        {
+          "charged": false,
+          "event": "scheduler_fairness_probe_completed",
+          "got": 0,
+          "grounding": "derived-self",
+          "kind": "count",
+          "op": "==",
+          "optional": false,
+          "passed": false,
+          "pending": false,
+          "settled_at": null,
+          "strength": "value-pinned",
+          "tautological": false,
+          "verdict": "pend",
+          "want": 1,
+          "weight": 1.0,
+          "where": {
+            "newer_claim_state": "HELD",
+            "no_overtaking_passed": false,
+            "older_waiter_state": "PENDING",
+            "store_readback_complete": true
+          }
+        }
+      ],
+      "cid": "omd-scheduler-m0-ooptdd-fresh",
+      "complete": true,
+      "ok": false,
+      "optional_failed": [],
+      "oracle": {
+        "corroborated": 0,
+        "derived_self": 1,
+        "emit_backend": "MemoryBackend",
+        "emit_identity": "MemoryBackend",
+        "enforced": false,
+        "forbid_errors": false,
+        "gating": 1,
+        "relocated": 0,
+        "signature_enforced": false,
+        "single_authority": true
+      },
+      "pending_failed": [],
+      "pending_satisfied": [],
+      "probe_reachable": true,
+      "reachable": true,
+      "scope": {
+        "asserts_anything": true,
+        "by_strength": {
+          "value-pinned": 1
+        },
+        "charge_ratio": 0.0,
+        "charged": 0,
+        "gating": 1,
+        "named_event_types": 0,
+        "observed_event_types": 0,
+        "optional": 0,
+        "pending": 0,
+        "stream_coverage": null,
+        "total": 1,
+        "unasserted_observed": [],
+        "uncharged": [
+          "scheduler_fairness_probe_completed"
+        ]
+      },
+      "unauthenticated": false,
+      "uncorroborated": false,
+      "vacuous": false
+    },
+    "observation": {
+      "after_holder_release": {
+        "newer": "HELD",
+        "older": "PENDING"
+      },
+      "cid": "omd-scheduler-m0-ooptdd-fresh",
+      "final": {
+        "newer": "RELEASED",
+        "older": "RELEASED"
+      },
+      "holder_state": "HELD",
+      "newer_claim_state": "HELD",
+      "newer_created_at": 1784090808.2214432,
+      "newer_granted_while_older_pending": true,
+      "newer_priority": 0,
+      "no_overtaking_passed": false,
+      "older_arrived_first": true,
+      "older_created_at": 1784090808.22128,
+      "older_priority": 10,
+      "older_waiter_state": "PENDING",
+      "schema": "omd.m0.fairness-observation.v1",
+      "store_readback_complete": true
+    }
+  },
+  "positive": {
+    "drop_required_events": false,
+    "evidence_tier": "arrived",
+    "gate_result": {
+      "authenticated": null,
+      "checks": [
+        {
+          "charged": true,
+          "event": "scheduler_fairness_probe_completed",
+          "got": 1,
+          "grounding": "derived-self",
+          "kind": "count",
+          "op": "==",
+          "optional": false,
+          "passed": true,
+          "pending": false,
+          "settled_at": null,
+          "strength": "value-pinned",
+          "tautological": false,
+          "verdict": "pend",
+          "want": 1,
+          "weight": 1.0,
+          "where": {
+            "newer_claim_state": "HELD",
+            "no_overtaking_passed": false,
+            "older_waiter_state": "PENDING",
+            "store_readback_complete": true
+          }
+        }
+      ],
+      "cid": "omd-scheduler-m0-ooptdd-fresh",
+      "complete": true,
+      "ok": true,
+      "optional_failed": [],
+      "oracle": {
+        "corroborated": 0,
+        "derived_self": 1,
+        "emit_backend": "MemoryBackend",
+        "emit_identity": "MemoryBackend",
+        "enforced": false,
+        "forbid_errors": false,
+        "gating": 1,
+        "relocated": 0,
+        "signature_enforced": false,
+        "single_authority": true
+      },
+      "pending_failed": [],
+      "pending_satisfied": [],
+      "probe_reachable": true,
+      "reachable": true,
+      "scope": {
+        "asserts_anything": true,
+        "by_strength": {
+          "value-pinned": 1
+        },
+        "charge_ratio": 1.0,
+        "charged": 1,
+        "gating": 1,
+        "named_event_types": 1,
+        "observed_event_types": 4,
+        "optional": 0,
+        "pending": 0,
+        "stream_coverage": 0.25,
+        "total": 1,
+        "unasserted_observed": [
+          "orbit_granted",
+          "orbit_released",
+          "orbit_requested"
+        ],
+        "uncharged": []
+      },
+      "unauthenticated": false,
+      "uncorroborated": false,
+      "vacuous": false
+    },
+    "observation": {
+      "after_holder_release": {
+        "newer": "HELD",
+        "older": "PENDING"
+      },
+      "cid": "omd-scheduler-m0-ooptdd-fresh",
+      "final": {
+        "newer": "RELEASED",
+        "older": "RELEASED"
+      },
+      "holder_state": "HELD",
+      "newer_claim_state": "HELD",
+      "newer_created_at": 1784090808.217085,
+      "newer_granted_while_older_pending": true,
+      "newer_priority": 0,
+      "no_overtaking_passed": false,
+      "older_arrived_first": true,
+      "older_created_at": 1784090808.2168908,
+      "older_priority": 10,
+      "older_waiter_state": "PENDING",
+      "schema": "omd.m0.fairness-observation.v1",
+      "store_readback_complete": true
+    }
+  },
+  "producer": {
+    "entrypoint": "benchmarks.omd_scheduler_m0:run_ooptdd",
+    "path": "benchmarks/produce_scheduler_m0_receipt.py",
+    "sha256": "691a1ea196f2470040bceff86d62efb2673fe083a1e0c6624af4d434be6ba4ac"
+  },
+  "restored_positive": {
+    "drop_required_events": false,
+    "evidence_tier": "arrived",
+    "gate_result": {
+      "authenticated": null,
+      "checks": [
+        {
+          "charged": true,
+          "event": "scheduler_fairness_probe_completed",
+          "got": 1,
+          "grounding": "derived-self",
+          "kind": "count",
+          "op": "==",
+          "optional": false,
+          "passed": true,
+          "pending": false,
+          "settled_at": null,
+          "strength": "value-pinned",
+          "tautological": false,
+          "verdict": "pend",
+          "want": 1,
+          "weight": 1.0,
+          "where": {
+            "newer_claim_state": "HELD",
+            "no_overtaking_passed": false,
+            "older_waiter_state": "PENDING",
+            "store_readback_complete": true
+          }
+        }
+      ],
+      "cid": "omd-scheduler-m0-ooptdd-fresh",
+      "complete": true,
+      "ok": true,
+      "optional_failed": [],
+      "oracle": {
+        "corroborated": 0,
+        "derived_self": 1,
+        "emit_backend": "MemoryBackend",
+        "emit_identity": "MemoryBackend",
+        "enforced": false,
+        "forbid_errors": false,
+        "gating": 1,
+        "relocated": 0,
+        "signature_enforced": false,
+        "single_authority": true
+      },
+      "pending_failed": [],
+      "pending_satisfied": [],
+      "probe_reachable": true,
+      "reachable": true,
+      "scope": {
+        "asserts_anything": true,
+        "by_strength": {
+          "value-pinned": 1
+        },
+        "charge_ratio": 1.0,
+        "charged": 1,
+        "gating": 1,
+        "named_event_types": 1,
+        "observed_event_types": 4,
+        "optional": 0,
+        "pending": 0,
+        "stream_coverage": 0.25,
+        "total": 1,
+        "unasserted_observed": [
+          "orbit_granted",
+          "orbit_released",
+          "orbit_requested"
+        ],
+        "uncharged": []
+      },
+      "unauthenticated": false,
+      "uncorroborated": false,
+      "vacuous": false
+    },
+    "observation": {
+      "after_holder_release": {
+        "newer": "HELD",
+        "older": "PENDING"
+      },
+      "cid": "omd-scheduler-m0-ooptdd-fresh",
+      "final": {
+        "newer": "RELEASED",
+        "older": "RELEASED"
+      },
+      "holder_state": "HELD",
+      "newer_claim_state": "HELD",
+      "newer_created_at": 1784090808.22502,
+      "newer_granted_while_older_pending": true,
+      "newer_priority": 0,
+      "no_overtaking_passed": false,
+      "older_arrived_first": true,
+      "older_created_at": 1784090808.224798,
+      "older_priority": 10,
+      "older_waiter_state": "PENDING",
+      "schema": "omd.m0.fairness-observation.v1",
+      "store_readback_complete": true
+    }
+  },
+  "schema": "omd-scheduler-m0-ooptdd-run/v1",
+  "started_after_gate_lock": true
+}
