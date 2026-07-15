@@ -51,12 +51,14 @@
       "path-glob lease",
       "PENDING reservation",
       "bounded repository wait capacity",
-      "monotonic fence sequence"
+      "monotonic fence sequence",
+      "durable admission notification outbox"
     ],
     "work_units": [
       "OrbitRequest",
       "LeaseGrant",
-      "ReservationEdge"
+      "ReservationEdge",
+      "AdmissionNotification"
     ]
   },
   "state_model": "A pure admission decision table owns grant-versus-queue-versus-deny; spec/scheduler_admission_fsm.json owns each OrbitRequest lifecycle orthogonally to the existing Task FSM. The runtime_projection below is the only compatibility mapping to the legacy Orbit FSM.",
@@ -148,14 +150,15 @@
     "concurrency": "Disjoint or mode-compatible requests may become HELD in the same promotion pass and execute concurrently outside the authority transaction.",
     "backpressure": "The current one-repository-per-DB authority pins one durable non-negative queue limit (default 1024; zero is no-wait) and returns a typed QUEUE_FULL receipt with retry_after_at metadata. Cross-repository global and conflict-domain limits remain deferred until their no-bypass accounting is proved.",
     "cancellation": "A PENDING owner may cancel with current identity and bail epoch. Cancellation is idempotent and immediately triggers eligible promotion.",
-    "timeouts": "Wait and lease deadlines are persisted timestamps. External deadline events carry observed time; no lazy status read is the sole liveness mechanism. The finite aging boost improves precedence but does not prove starvation freedom; wait_deadline is the bounded-resolution authority."
+    "timeouts": "Wait and lease deadlines are persisted timestamps. External deadline events carry observed time; no lazy status read is the sole liveness mechanism. The finite aging boost improves precedence but does not prove starvation freedom; wait_deadline is the bounded-resolution authority.",
+    "notification_delivery": "State-changing admission edges enqueue admission_notification/v1 in the same authority transaction. A post-commit hook only arms an asynchronous dispatcher; notifier I/O holds neither authority nor repository-effect locks. Delivery is leased, claim-token fenced, bounded by a finite attempt timeout and a maximum live-plus-retained-outcome registry, per request-generation FIFO, and deduplicatable at-least-once by stable event_id. Bounded late-outcome eviction may replay the same identity. available_at and claim_deadline autonomously re-arm delivery even when deadline sweep is disabled; replacement timer start is retried three times without discarding an existing later timer. A poisoned stream does not block another request stream while notifier capacity remains. Manual flush and timer delivery share a lifecycle gate, and close rejects new drains then joins accepted drains and strict effects before handoff. Legacy fail-soft telemetry is deferred until commit and authority-lock release, preventing sink reentrancy from inverting dispatcher and authority locks. A coordination_notification/v1 agent-reclaim summary is causally blocked on every released-orbit predecessor, or uses a synthetic stream when no orbit exists. PROMOTION_BLOCKED and RENEW remain non-durable high-rate observations in this bounded slice."
   },
   "durability": {
     "persistence": "Persist normalized request identity, queue sequence, requested TTL, deadlines, content-addressed policy version, rank inputs, decision schema/observed time/effective priority, blockers, state, and fence before reporting a durable result.",
-    "atomic_commit": "Commit dedup claim, request state/version, wait-for cycle decision, fence allocation or queue insertion, and notification outbox in one authority transaction.",
-    "recovery": "On restart, expire due waits and leases, rebuild or verify the candidate index, then reevaluate PENDING requests with their original queue sequence and policy envelope.",
-    "effect_idempotency": "Use request_id, transition kind, request generation, and immutable argument digest; same identity with different intent is a conflict.",
-    "migration": "Additive queue metadata and target lifecycle states are introduced behind an admission protocol version; retain fixtures for legacy PENDING, HELD, RELEASED, EXPIRED, and DENIED rows."
+    "atomic_commit": "Commit dedup claim, request state/version, wait-for cycle decision, fence allocation or queue insertion, notification outbox, and any explicit cross-stream causal predecessors in one authority transaction.",
+    "recovery": "On restart, first reconcile authority state by expiring due waits and leases and reevaluating PENDING requests with their original queue sequence and policy envelope; then arm the asynchronous dispatcher, which reclaims expired notification delivery leases and replays due stream heads by stable event_id. Candidate-index rebuild or verification remains an M2 step.",
+    "effect_idempotency": "Use repository_id, request_id, orbit_id, transition kind, and request generation as the unique semantic effect key; the canonical payload has a separate digest, and the same effect key with a different event or payload is a fail-closed conflict.",
+    "migration": "The schema version is the final completion marker for additive migration. The m1-aging predecessor had no notification facts, so migration creates an empty outbox without fabricating historical effects while preserving all authority rows. A crash after outbox DDL or row insertion but before the version marker resumes idempotently and preserves the exact existing payload, digest, and dependency rows. Migration tests retain legacy PENDING, HELD, RELEASED, EXPIRED, and DENIED authority states."
   },
   "runtime_projection": {
     "semantic_source": "spec/scheduler_admission_fsm.json",
@@ -177,7 +180,7 @@
       "owner_agent": "orbits.agent_id",
       "mode": "orbits.mode",
       "queue_seq": "new durable queue_seq; legacy created_at ordering is read-only migration input, never the M1 authority",
-      "wait_deadline": "new durable wait_deadline; legacy PENDING rows require explicit migration policy before M1 authority",
+      "wait_deadline": "new durable wait_deadline; legacy PENDING rows receive the explicit deterministic migration policy (created/enqueued time plus the legacy bounded wait window) before M1 authority",
       "fence": "orbits.fence",
       "lease_deadline": "orbits.expires_at",
       "request_generation": "new monotonic request generation used with request_id and orbit_id",
@@ -200,7 +203,11 @@
     "Unknown pending policy authority blocks fail closed; malformed or drifted active policy metadata prevents startup before recovery.",
     "Index corruption or a failed soundness assertion disables the index and uses a full exact scan.",
     "Stale owner, fence, or bail epoch cannot renew, release, or cancel a current request.",
-    "Notification failure leaves an observable outbox entry and does not roll back an accepted lease fact."
+    "Notification failure, child-thread BaseException, or notifier-start failure leaves an observable retryable outbox entry and does not roll back an accepted lease fact.",
+    "A closed coordinator rejects new manual drains and cannot ACK or retry durable notification state after handoff.",
+    "A transient dispatcher timer-start failure is retried without losing an already armed later wake; exhausting the finite bound is explicitly observable.",
+    "Legacy sink reentrancy cannot run while the authority transaction or RLock is held.",
+    "An agent-reclaim summary cannot be delivered before any released-orbit event it summarizes."
   ],
   "observability": {
     "traces": [
@@ -216,7 +223,8 @@
       "promotion delay",
       "cycle denial",
       "queue rejection",
-      "deadline and cancellation outcomes"
+      "deadline and cancellation outcomes",
+      "notification backlog, attempts, delivery lease age, and retry lag"
     ],
     "redaction": "Path content and unbounded identities remain trace fields or hashes; metrics use bounded repository and mode labels."
   },
@@ -237,7 +245,7 @@
     "M1a: add metrics and a pure compatibility/rank/blocker decision table without changing production outcomes.",
     "M1b (implemented): persist queue_seq, requested TTL, wait deadline, policy version, cancellation, and repository capacity; enforce no-overtaking with the locked gate and return typed overload without a live row.",
     "M1c (implemented): add PENDING reservation edges plus deterministic dynamic-cycle resolution, a content-addressed saturating-aging v2 policy, one-clock decision evidence, schema migration, and restart/property tests.",
-    "M1d: persist a transactional notification outbox and prove crash/replay delivery without changing accepted lease facts.",
+    "M1d (implemented): persist state-changing semantic admission notifications and coordination dependencies transactionally; deliver them post-commit through lifecycle-gated, timer-start-fenced, claim-token-fenced, per-stream FIFO at-least-once replay without changing accepted lease facts.",
     "M2a: add a conservative candidate prefilter and deadline-driven sweep, retaining exact glob verification and full-scan fallback.",
     "M2b: move all Git effects out of the authority transaction before reconsidering RLock or SQLite replacement."
   ],

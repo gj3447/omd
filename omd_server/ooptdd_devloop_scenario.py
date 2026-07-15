@@ -47,5 +47,7 @@ def run(backend, cid: str) -> dict:
     omd.finish(mod)                                      # task_finished (cid)
     omd.connect(mod)                                     # connect_started→connect_merged (cid) = 실 git merge
 
+    omd.flush_admission_outbox()
+    omd.close()
     return {"cid": cid, "lifecycle": ["orbit_granted", "task_started", "task_committed",
                                       "task_finished", "connect_started", "connect_merged"]}

@@ -20,8 +20,12 @@ from contextlib import contextmanager
 
 from .admission import LEGACY_ADMISSION_POLICY_VERSION, pathspec_digest
 
-SCHEMA_VERSION = "omd/2026-07-16-m1-aging"
-MIGRATABLE_SCHEMA_VERSIONS = frozenset({None, "omd/2026-07-15-m1"})
+SCHEMA_VERSION = "omd/2026-07-16-m1-outbox"
+MIGRATABLE_SCHEMA_VERSIONS = frozenset({
+    None,
+    "omd/2026-07-15-m1",
+    "omd/2026-07-16-m1-aging",
+})
 
 
 class UnsupportedSchemaVersion(RuntimeError):
@@ -157,6 +161,47 @@ CREATE TABLE IF NOT EXISTS idempotency (
   created_at REAL, completed_at REAL,
   operation_id TEXT, owner_instance TEXT, owner_generation INTEGER
 );
+-- M1d admission notification outbox.  The authority transition and this row
+-- commit together; delivery happens only after commit and is at-least-once.
+-- Stable event_id lets consumers deduplicate a crash between ship and ACK.
+CREATE TABLE IF NOT EXISTS admission_outbox (
+  outbox_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL UNIQUE,
+  effect_key TEXT NOT NULL UNIQUE,
+  schema_version TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  request_generation INTEGER NOT NULL,
+  orbit_id TEXT NOT NULL,
+  transition_kind TEXT NOT NULL,
+  correlation_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'PENDING'
+    CHECK(state IN ('PENDING','DELIVERING','DELIVERED')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  available_at REAL NOT NULL,
+  claimed_by TEXT,
+  claim_token TEXT,
+  claim_deadline REAL,
+  created_at REAL NOT NULL,
+  delivered_at REAL,
+  last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_admission_outbox_delivery
+  ON admission_outbox(state, available_at, outbox_seq);
+-- Cross-stream causal barriers.  An auxiliary coordination fact (for example
+-- AGENT_RECLAIMED) is not claimable until every authority transition it
+-- summarizes has been delivered.  Keep this separate from per-request FIFO:
+-- unrelated poisoned streams still make progress unless they are an explicit
+-- predecessor of the summary fact.
+CREATE TABLE IF NOT EXISTS admission_outbox_dependencies (
+  event_id TEXT NOT NULL,
+  predecessor_event_id TEXT NOT NULL,
+  PRIMARY KEY(event_id, predecessor_event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_admission_outbox_dependencies_predecessor
+  ON admission_outbox_dependencies(predecessor_event_id, event_id);
 -- 증분8(§D5): 응결 랑데부 배리어. 세대(generation) 스탬프 + BROKEN 종단. 멤버십은 agent 수가
 -- 아니라 **task 집합**(reclaim 으로 task 가 requeue 되면 N 재계산). 참가자 사망(도착 전/후)·
 -- 타임아웃 → break → 도착해 있던 전원이 BROKEN 으로 기상(영구 hang 0).
@@ -266,6 +311,7 @@ class Store:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self._txn_depth = 0
+        self._after_commit_hooks = {}
         # Coordinator가 migration 전에 리더 lease를 획득할 수 있게 하는 최소 bootstrap.
         # 기존 DB에서는 no-op이며, 실제 domain schema와 data migration은 initialize()만 쓴다.
         meta_exists = self.db.execute(
@@ -453,12 +499,13 @@ class Store:
 
     # --- 트랜잭션 경계(재진입 가능) ---
     @contextmanager
-    def tx(self):
+    def tx(self, *, committed_hooks=None):
         """BEGIN IMMEDIATE … COMMIT(정상) / ROLLBACK(예외). 깊이 카운터로 재진입 안전:
         중첩 호출은 새 BEGIN을 열지 않고, 최외곽에서만 COMMIT/ROLLBACK 한다.
         예외가 최외곽까지 전파되면 전체를 롤백(부분쓰기 없음); 중간에서 잡혀 정상 종료하면 COMMIT."""
         if self._txn_depth == 0:
             self.db.execute("BEGIN IMMEDIATE")
+            self._after_commit_hooks = {}
         self._txn_depth += 1
         try:
             yield
@@ -466,11 +513,35 @@ class Store:
             self._txn_depth -= 1
             if self._txn_depth == 0:
                 self.db.execute("ROLLBACK")
+                self._after_commit_hooks = {}
             raise
         else:
             self._txn_depth -= 1
             if self._txn_depth == 0:
                 self.db.execute("COMMIT")
+                hooks = list(self._after_commit_hooks.values())
+                self._after_commit_hooks = {}
+                if committed_hooks is not None:
+                    # Coordinator._cs supplies a per-call collector so the
+                    # external notification port is entered only after its
+                    # authority RLock has been released.  The collector belongs
+                    # to the outermost tx; nested tx contexts do not commit and
+                    # therefore leave their own collectors empty.
+                    committed_hooks.extend(hooks)
+                else:
+                    # Direct Store callers have no Coordinator lock to escape.
+                    # Preserve the fail-soft after-commit behavior for them.
+                    for hook in hooks:
+                        try:
+                            hook()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+    def after_commit(self, callback, *, key=None) -> None:
+        """Run one fail-soft callback after the outermost transaction commits."""
+        if self._txn_depth <= 0:
+            raise RuntimeError("after_commit requires an active transaction")
+        self._after_commit_hooks[key if key is not None else id(callback)] = callback
 
     # --- fence: 단조 증가·유일 토큰 (P0-2: 단일문 +1, 읽고-쓰기 갭 제거) ---
     def next_fence(self) -> int:
@@ -1229,6 +1300,233 @@ class Store:
     def tasks_for_agent(self, agent_id) -> list[dict]:
         return _rows(self.db.execute("SELECT * FROM tasks WHERE agent_id=?", (agent_id,)))
 
+    # --- M1d admission notification outbox ---
+    def enqueue_admission_outbox(
+        self,
+        *,
+        event_id,
+        effect_key,
+        schema_version,
+        repository_id,
+        request_id,
+        request_generation,
+        orbit_id,
+        transition_kind,
+        correlation_id,
+        payload,
+        payload_sha256,
+        created_at,
+        predecessor_event_ids=(),
+    ) -> dict:
+        if self._txn_depth <= 0:
+            raise RuntimeError(
+                "admission outbox enqueue requires an active authority transaction"
+            )
+        predecessor_event_ids = tuple(sorted(set(predecessor_event_ids)))
+        if event_id in predecessor_event_ids:
+            raise RuntimeError("admission outbox event cannot depend on itself")
+        existing = self.get_admission_outbox(event_id)
+        effect_existing = _row(self.db.execute(
+            "SELECT * FROM admission_outbox WHERE effect_key=?", (effect_key,)
+        ))
+        if existing is None:
+            existing = effect_existing
+        if existing is not None:
+            if (
+                existing["event_id"] != event_id
+                or existing["effect_key"] != effect_key
+                or existing["schema_version"] != schema_version
+                or existing["repository_id"] != repository_id
+                or existing["request_id"] != request_id
+                or existing["request_generation"] != request_generation
+                or existing["orbit_id"] != orbit_id
+                or existing["transition_kind"] != transition_kind
+                or existing["correlation_id"] != correlation_id
+                or existing["payload"] != payload
+                or existing["payload_sha256"] != payload_sha256
+            ):
+                raise RuntimeError(
+                    f"admission outbox event_id collision: {event_id}"
+                )
+            existing_predecessors = tuple(
+                row["predecessor_event_id"]
+                for row in self.db.execute(
+                    "SELECT predecessor_event_id FROM "
+                    "admission_outbox_dependencies WHERE event_id=? "
+                    "ORDER BY predecessor_event_id",
+                    (event_id,),
+                ).fetchall()
+            )
+            if existing_predecessors != predecessor_event_ids:
+                raise RuntimeError(
+                    f"admission outbox dependency collision: {event_id}"
+                )
+            return existing
+        self.db.execute(
+            "INSERT INTO admission_outbox("
+            "event_id,effect_key,schema_version,repository_id,request_id,"
+            "request_generation,orbit_id,transition_kind,correlation_id,payload,"
+            "payload_sha256,state,attempts,available_at,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,'PENDING',0,?,?)",
+            (
+                event_id,
+                effect_key,
+                schema_version,
+                repository_id,
+                request_id,
+                request_generation,
+                orbit_id,
+                transition_kind,
+                correlation_id,
+                payload,
+                payload_sha256,
+                created_at,
+                created_at,
+            ),
+        )
+        for predecessor_event_id in predecessor_event_ids:
+            if self.get_admission_outbox(predecessor_event_id) is None:
+                raise RuntimeError(
+                    "admission outbox predecessor is missing: "
+                    f"{predecessor_event_id}"
+                )
+            self.db.execute(
+                "INSERT INTO admission_outbox_dependencies("
+                "event_id,predecessor_event_id) VALUES(?,?)",
+                (event_id, predecessor_event_id),
+            )
+        return self.get_admission_outbox(event_id)
+
+    def admission_outbox_predecessors(self, event_id) -> list[str]:
+        return [
+            row["predecessor_event_id"]
+            for row in self.db.execute(
+                "SELECT predecessor_event_id FROM admission_outbox_dependencies "
+                "WHERE event_id=? ORDER BY predecessor_event_id",
+                (event_id,),
+            ).fetchall()
+        ]
+
+    def get_admission_outbox(self, event_id) -> dict | None:
+        return _row(self.db.execute(
+            "SELECT * FROM admission_outbox WHERE event_id=?", (event_id,)
+        ))
+
+    def admission_outbox_rows(self, states=None) -> list[dict]:
+        if states:
+            q = ",".join("?" * len(states))
+            return _rows(self.db.execute(
+                f"SELECT * FROM admission_outbox WHERE state IN ({q}) "
+                "ORDER BY outbox_seq",
+                list(states),
+            ))
+        return _rows(self.db.execute(
+            "SELECT * FROM admission_outbox ORDER BY outbox_seq"
+        ))
+
+    def claim_next_admission_outbox(self, owner, now, *, lease_ttl) -> dict | None:
+        """Claim one due stream head; a poison stream cannot block another."""
+        if self._txn_depth <= 0:
+            raise RuntimeError(
+                "admission outbox claim requires an active authority transaction"
+            )
+        head = _row(self.db.execute(
+            "SELECT o.* FROM admission_outbox o WHERE o.state!='DELIVERED' "
+            "AND ((o.state='PENDING' AND o.available_at<=?) OR "
+            "(o.state='DELIVERING' AND o.claim_deadline IS NOT NULL "
+            "AND o.claim_deadline<=?)) AND NOT EXISTS ("
+            "SELECT 1 FROM admission_outbox p WHERE "
+            "p.repository_id=o.repository_id AND p.request_id=o.request_id AND "
+            "p.request_generation=o.request_generation AND "
+            "p.outbox_seq<o.outbox_seq AND p.state!='DELIVERED') "
+            "AND NOT EXISTS (SELECT 1 FROM admission_outbox_dependencies d "
+            "LEFT JOIN admission_outbox predecessor "
+            "ON predecessor.event_id=d.predecessor_event_id "
+            "WHERE d.event_id=o.event_id AND (predecessor.event_id IS NULL "
+            "OR predecessor.state!='DELIVERED')) "
+            "ORDER BY o.outbox_seq LIMIT 1",
+            (now, now),
+        ))
+        if head is None:
+            return None
+        claim_token = "outbox-claim-" + uuid.uuid4().hex
+        updated = self.db.execute(
+            "UPDATE admission_outbox SET state='DELIVERING', claimed_by=?, "
+            "claim_token=?, claim_deadline=?, attempts=attempts+1, last_error=NULL "
+            "WHERE event_id=? AND ((state='PENDING' AND available_at<=?) OR "
+            "(state='DELIVERING' AND claim_deadline IS NOT NULL "
+            "AND claim_deadline<=?))",
+            (owner, claim_token, now + lease_ttl, head["event_id"], now, now),
+        )
+        if updated.rowcount != 1:
+            return None
+        return self.get_admission_outbox(head["event_id"])
+
+    def ack_admission_outbox(self, event_id, claim_token, delivered_at) -> bool:
+        if self._txn_depth <= 0:
+            raise RuntimeError(
+                "admission outbox ACK requires an active authority transaction"
+            )
+        updated = self.db.execute(
+            "UPDATE admission_outbox SET state='DELIVERED', delivered_at=?, "
+            "claimed_by=NULL, claim_token=NULL, claim_deadline=NULL, last_error=NULL "
+            "WHERE event_id=? AND state='DELIVERING' AND claim_token=?",
+            (delivered_at, event_id, claim_token),
+        )
+        return updated.rowcount == 1
+
+    def retry_admission_outbox(
+        self, event_id, claim_token, available_at, error
+    ) -> bool:
+        if self._txn_depth <= 0:
+            raise RuntimeError(
+                "admission outbox retry requires an active authority transaction"
+            )
+        updated = self.db.execute(
+            "UPDATE admission_outbox SET state='PENDING', available_at=?, "
+            "claimed_by=NULL, claim_token=NULL, claim_deadline=NULL, last_error=? "
+            "WHERE event_id=? AND state='DELIVERING' AND claim_token=?",
+            (available_at, error, event_id, claim_token),
+        )
+        return updated.rowcount == 1
+
+    def admission_outbox_stats(self) -> dict:
+        counts = {
+            row["state"]: int(row["n"])
+            for row in self.db.execute(
+                "SELECT state,COUNT(*) AS n FROM admission_outbox GROUP BY state"
+            ).fetchall()
+        }
+        head = _row(self.db.execute(
+            "SELECT outbox_seq,event_id,state,attempts,available_at,"
+            "claim_deadline,last_error FROM admission_outbox "
+            "WHERE state!='DELIVERED' ORDER BY outbox_seq LIMIT 1"
+        ))
+        return {
+            "pending": counts.get("PENDING", 0),
+            "delivering": counts.get("DELIVERING", 0),
+            "delivered": counts.get("DELIVERED", 0),
+            "head": head,
+        }
+
+    def next_admission_outbox_due_at(self) -> float | None:
+        """Return the earliest due time among per-stream undelivered heads."""
+        row = self.db.execute(
+            "SELECT MIN(CASE WHEN o.state='PENDING' THEN o.available_at "
+            "ELSE o.claim_deadline END) AS due_at FROM admission_outbox o "
+            "WHERE o.state!='DELIVERED' AND NOT EXISTS ("
+            "SELECT 1 FROM admission_outbox p WHERE "
+            "p.repository_id=o.repository_id AND p.request_id=o.request_id AND "
+            "p.request_generation=o.request_generation AND "
+            "p.outbox_seq<o.outbox_seq AND p.state!='DELIVERED') "
+            "AND NOT EXISTS (SELECT 1 FROM admission_outbox_dependencies d "
+            "LEFT JOIN admission_outbox predecessor "
+            "ON predecessor.event_id=d.predecessor_event_id "
+            "WHERE d.event_id=o.event_id AND (predecessor.event_id IS NULL "
+            "OR predecessor.state!='DELIVERED'))"
+        ).fetchone()
+        return None if row is None or row["due_at"] is None else float(row["due_at"])
+
     def snapshot(self) -> dict:
         return {
             "orbits": _rows(self.db.execute(
@@ -1240,4 +1538,5 @@ class Store:
             )),
             "tasks": _rows(self.db.execute("SELECT task_id,name,state FROM tasks")),
             "flags": _rows(self.db.execute("SELECT key,value FROM flags")),
+            "admission_outbox": self.admission_outbox_stats(),
         }

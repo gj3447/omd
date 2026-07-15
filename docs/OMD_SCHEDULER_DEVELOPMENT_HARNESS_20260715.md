@@ -21,9 +21,13 @@ pinned per DB, and one transaction clock binds rank, authority snapshot and
 `admission_decision/v2` evidence. Reconciliation recomputes aging-dependent
 reservation edges and denies the newest participating ticket if a rank change
 or immediate grant creates a cycle. Finite boost is not a starvation proof;
-`wait_deadline` remains the bounded-resolution authority. Notification outbox,
-candidate indexing, the prepared Connect pipeline, and protected-ref control
-plane remain unimplemented. Do not
+`wait_deadline` remains the bounded-resolution authority. State-changing
+semantic admission edges now persist `admission_notification/v1` in the same
+authority transaction and deliver post-commit with stable event IDs,
+claim-token fencing, per-request-generation FIFO and at-least-once replay.
+`PROMOTION_BLOCKED` and `RENEW` remain non-durable high-rate observations in
+this bounded M1d slice. Candidate indexing, the prepared Connect pipeline, and
+protected-ref control plane remain unimplemented. Do not
 describe this slice as the complete durable waiter, an optimized scheduler, a
 production rollout, or a scientific progress result.
 
@@ -489,6 +493,39 @@ inputs and the resulting effective priority are persisted as
 `admission_decision/v2` evidence. Aging arithmetic covers subnormal positive
 quanta and signed-64 priority boundaries without a later SQLite overflow or an
 order-changing final-priority clamp.
+The M1d outbox records reducer-accepted state edges atomically with their Orbit
+fact. A notifier failure leaves the accepted lease unchanged and the event
+observable as `PENDING`; the post-commit hook only arms an asynchronous timer,
+so notifier I/O holds neither the DB/authority lock nor the repository effect
+fence. Each attempt has a finite timeout, one live thread per stable event ID,
+and a bounded process-wide attempt registry (default 8, including retained late
+outcomes). A completed late outcome is reused when possible; bounded eviction
+may produce another at-least-once attempt with the same stable identity.
+Delivery uses a fresh claim token for ACK/retry CAS and may repeat the same
+stable `event_id` after a deliver-before-ACK crash. Ordering is FIFO within one
+`(repository_id, request_id, request_generation)` stream so a poisoned stream
+does not block unrelated requests while notifier capacity remains. Startup and
+each committed edge arm the dispatcher; persisted `available_at` and
+`claim_deadline` schedule later wakes even when the authority sweep is disabled.
+Starting a replacement dispatcher timer is retried three times while any
+previous later timer remains armed; exhausting the bound emits an explicit
+schedule error instead of publishing a dead timer object. Legacy fail-soft
+telemetry is likewise deferred until commit and authority-lock release, so a
+sink that invokes public `flush_admission_outbox()` cannot invert the
+dispatcher/authority lock order.
+Manual flush is serialized with the timer worker. `close()` first closes their
+shared lifecycle gate, rejects new flushes, and joins every accepted drain and
+strict notifier attempt before handoff. OOPTDD producers explicitly flush at
+their readback boundary rather than depending on timer scheduling.
+The predecessor aging schema receives an empty outbox without historical
+backfill, while a crash-cut row created before the final version marker is
+preserved exactly; migration fixtures retain legacy `PENDING`, `HELD`,
+`RELEASED`, `EXPIRED`, and `DENIED` authority states. A distinct
+`coordination_notification/v1` follow-up uses explicit predecessor event IDs so
+every orbit release summarized by a bail/reclaim is delivered before
+`agent_reclaimed`. An empty/task-only agent receives a synthetic coordination
+stream, so rollback cannot leak legacy direct telemetry. This auxiliary fact is
+not presented as an admission-FSM event.
 Item 9 has no
 candidate index to prove yet (the runtime uses the sound full exact scan).
 Policy-denial generation rollover is implemented; explicit non-denial rollover
@@ -589,7 +626,13 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
   -p no:cacheprovider \
   tests/test_scheduler_m0_harness.py \
   tests/test_scheduler_m1_admission.py \
+  tests/test_scheduler_m1_outbox.py \
   tests/test_scheduler_admission_conformance.py \
+  tests/test_sinks.py \
+  tests/test_d2_reclaim.py \
+  tests/test_ltdd_claim.py \
+  tests/test_dogfood_parallel_dev.py \
+  tests/test_multiagent_session.py \
   tests/test_d9_idempotency.py \
   tests/test_m1_connect_process_fencing.py \
   tests/test_m1_connect_effect_process.py
@@ -655,8 +698,8 @@ slice is ready to commit only when:
 
 Landing those files makes the **M1 fairness implementation slice** durable. It
 does not make full M1 or the development cycle `CLOSED`: embedded-runtime
-default delivery, candidate-index soundness, a durable notification outbox, an independent
-scripted progress judgment and finalization receipts remain future work.
+default deadline delivery, candidate-index soundness, an independent scripted
+progress judgment and finalization receipts remain future work.
 
 ## 14. Known limitations and promotion blockers
 
@@ -674,8 +717,9 @@ scripted progress judgment and finalization receipts remain future work.
    wait cancellation, renew/release, lease expiry and both owner-reclaim paths
    are bound to the JSON semantic reducer. MCP timeout delivery is autonomous
    by default; content-addressed saturating aging and dynamic rank-cycle
-   resolution are implemented. Embedded-runtime default delivery, notification
-   outbox and candidate-index soundness remain the open M1 front. Task-bound
+   resolution plus the durable state-edge notification outbox are implemented.
+   Embedded-runtime default deadline delivery and candidate-index soundness
+   remain the open M1 front. Task-bound
    `CANCEL`/`RELEASE` projection is also implemented.
 5. The prepared candidate, expected-old ref CAS, independent ref reader and
    finalization protocol are contracts, not the current runtime path.

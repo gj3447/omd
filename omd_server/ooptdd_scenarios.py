@@ -46,4 +46,9 @@ def run(backend, cid: str) -> dict:
     omd.task_conditions(cid)
     driven += ["task_conditions"]
 
+    # Durable admission notifications are intentionally post-commit/async in
+    # production.  Evidence drivers drain explicitly before handing the backend
+    # to the independent gate evaluator.
+    omd.flush_admission_outbox()
+    omd.close()
     return {"cid": cid, "driven": driven}

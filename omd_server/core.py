@@ -95,6 +95,48 @@ LEADER_TTL_S = 30.0
 # states may retain an old claim response, but they are not admission authority.
 TASK_ADMISSION_STATES = frozenset({"PENDING", "BLOCKED", "READY"})
 
+ADMISSION_NOTIFICATION_SCHEMA = "admission_notification/v1"
+COORDINATION_NOTIFICATION_SCHEMA = "coordination_notification/v1"
+ADMISSION_NOTIFICATION_EVENTS = {
+    "ADMISSION_GRANTED": "orbit_granted",
+    "ADMISSION_QUEUED": "orbit_pending",
+    "ADMISSION_DENIED": "orbit_denied",
+    "ADMISSION_REJECTED": "orbit_rejected",
+    "PROMOTION_GRANTED": "orbit_granted",
+    "PROMOTION_DENIED": "orbit_denied",
+    "RELEASE": "orbit_released",
+    "CANCEL": "orbit_cancelled",
+    "WAIT_TIMEOUT": "orbit_timed_out",
+    "LEASE_EXPIRED": "orbit_expired",
+    "WAIT_OWNER_RECLAIMED": "orbit_released",
+    "LEASE_OWNER_RECLAIMED": "orbit_released",
+}
+AUXILIARY_NOTIFICATION_EVENTS = {
+    # Compatibility telemetry causally follows the final reclaimed orbit in
+    # the same durable request stream; it is not an admission FSM transition.
+    "AGENT_RECLAIMED": "agent_reclaimed",
+}
+OUTBOX_NOTIFICATION_EVENTS = {
+    **ADMISSION_NOTIFICATION_EVENTS,
+    **AUXILIARY_NOTIFICATION_EVENTS,
+}
+OUTBOX_NOTIFICATION_SCHEMAS = {
+    **{
+        event: ADMISSION_NOTIFICATION_SCHEMA
+        for event in ADMISSION_NOTIFICATION_EVENTS
+    },
+    **{
+        event: COORDINATION_NOTIFICATION_SCHEMA
+        for event in AUXILIARY_NOTIFICATION_EVENTS
+    },
+}
+DURABLE_ADMISSION_TELEMETRY_EVENTS = frozenset(
+    OUTBOX_NOTIFICATION_EVENTS.values()
+)
+ADMISSION_OUTBOX_LEASE_TTL = 30.0
+ADMISSION_OUTBOX_MAX_RETRY_DELAY = 60.0
+ADMISSION_OUTBOX_TIMER_START_RETRIES = 3
+
 
 _EFFECT_LOCKS_GUARD = threading.Lock()
 _EFFECT_LOCKS: dict[str, threading.Lock] = {}
@@ -170,6 +212,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                  admission_max_age_boost: int = DEFAULT_ADMISSION_MAX_AGE_BOOST,
                  strict_writeset: bool = False,
                  sweep_interval: float | None = None,
+                 notification_timeout: float = 5.0,
+                 notification_max_inflight: int = 8,
                  integration_check=None,
                  integration_check_timeout: float = 300.0,
                  integration_check_output_limit: int = 16_384,
@@ -207,6 +251,18 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             raise ValueError("admission_wait_timeout must be finite and positive") from exc
         if not math.isfinite(admission_wait_timeout) or admission_wait_timeout <= 0:
             raise ValueError("admission_wait_timeout must be finite and positive")
+        try:
+            notification_timeout = float(notification_timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("notification_timeout must be finite and positive") from exc
+        if not math.isfinite(notification_timeout) or notification_timeout <= 0:
+            raise ValueError("notification_timeout must be finite and positive")
+        if (
+            not isinstance(notification_max_inflight, int)
+            or isinstance(notification_max_inflight, bool)
+            or notification_max_inflight <= 0
+        ):
+            raise ValueError("notification_max_inflight must be a positive integer")
         if (not isinstance(admission_queue_capacity, int)
                 or isinstance(admission_queue_capacity, bool)
                 or admission_queue_capacity < 0):
@@ -284,6 +340,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # 궤도/작업이 영구 고아가 된다(사용자 핵심 우려). 권장 90s, renew는 TTL/3 주기.
         self.agent_ttl = agent_ttl
         self.events = events or NOOP
+        self.notification_timeout = notification_timeout
+        self.notification_max_inflight = notification_max_inflight
         self._lock = threading.RLock()  # 프로세스내 단일 writer(actor 대용) — D1
         # §D3/D4 주기적 백그라운드 sweep(opt-in). None/0=off(embedded 기본=inline-only). 켜면
         # 만료 lease/permit/좀비 회수가 동사 호출과 무관하게 진행 → 유휴 후 첫 호출 spike 해소.
@@ -291,6 +349,19 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         self._sweep_interval = sweep_interval
         self._sweep_stop = threading.Event()
         self._sweep_thread = None
+        # Outbox delivery is scheduled independently from authority/effect
+        # locks.  A post-commit hook only arms this timer; notifier I/O always
+        # runs on the timer worker and transient failures wake at their durable
+        # available_at/claim_deadline rather than waiting for another verb.
+        self._outbox_timer_lock = threading.Lock()
+        self._outbox_dispatch_lock = threading.Lock()
+        self._outbox_timer = None
+        self._outbox_timer_due = None
+        self._outbox_active_threads = set()
+        self._outbox_closed = False
+        self._notification_attempt_lock = threading.Lock()
+        self._notification_attempts = {}
+        self._notification_closed = False
         # §D14 + schema authority: current-version startup is a read-only fast
         # path until leader admission.  A pending migration first fences every
         # split effect on the same DB, then acquires leadership, then mutates schema.
@@ -541,6 +612,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 pass
         # 재기동 복구(§D8, 멱등) — git↔DB 조정 + dangling merge_token abort.
         self._recover()
+        # A crash after authority commit but before notification ACK leaves a
+        # durable row.  Startup only arms the dispatcher: notifier I/O must not
+        # delay construction or hold startup/effect authority.
+        self._wake_admission_outbox()
         # 리더십·복구가 끝난 *뒤*에만 백그라운드 sweep 을 발사(변이 전 writer-둘 방지).
         if self._sweep_interval is not None:
             self.start_sweep()
@@ -588,8 +663,24 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 self._emit("sweep_error", self.coordinator_id, error=repr(e))
 
     def close(self):
-        """백그라운드 sweep 스레드를 멈추고 join(멱등 — 스레드 없으면 no-op). 프로세스 종료·테스트
-        정리용. store 커넥션은 닫지 않는다(다른 참조가 살아있을 수 있음)."""
+        """Stop and join background sweep/outbox workers (idempotent)."""
+        with self._outbox_timer_lock:
+            # Close the public drain gate before taking the active-worker
+            # snapshot.  Every accepted manual/timer drain is registered under
+            # this same lock, so none can mutate durable delivery state after
+            # close() returns.
+            self._outbox_closed = True
+            outbox_timer = self._outbox_timer
+            outbox_active = list(self._outbox_active_threads)
+            self._outbox_timer = None
+            self._outbox_timer_due = None
+            if outbox_timer is not None:
+                outbox_timer.cancel()
+        with self._notification_attempt_lock:
+            # Existing registered drains may still reach delivery while close
+            # waits for them.  Stop them from starting a new strict effect;
+            # close later joins every effect that was already registered.
+            self._notification_closed = True
         self._sweep_stop.set()
         th = self._sweep_thread
         if th is not None and th.is_alive():
@@ -599,6 +690,37 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     "periodic sweep did not stop; refusing unsafe coordinator handoff"
                 )
         self._sweep_thread = None
+        if (
+            outbox_timer is not None
+            and outbox_timer is not threading.current_thread()
+            and outbox_timer.is_alive()
+        ):
+            outbox_timer.join(timeout=5.0)
+            if outbox_timer.is_alive():
+                raise RuntimeError(
+                    "admission outbox dispatcher did not stop; refusing unsafe handoff"
+                )
+        for active in outbox_active:
+            if active is threading.current_thread() or not active.is_alive():
+                continue
+            active.join(timeout=5.0)
+            if active.is_alive():
+                raise RuntimeError(
+                    "active admission outbox delivery did not stop; refusing unsafe handoff"
+                )
+        with self._notification_attempt_lock:
+            notification_attempts = list(self._notification_attempts.values())
+        for attempt in notification_attempts:
+            worker = attempt["thread"]
+            if worker is threading.current_thread() or not worker.is_alive():
+                continue
+            worker.join(timeout=5.0)
+            if worker.is_alive():
+                raise RuntimeError(
+                    "strict notifier effect is still live; refusing unsafe handoff"
+                )
+        with self._notification_attempt_lock:
+            self._notification_attempts.clear()
 
     def __enter__(self):
         return self
@@ -614,11 +736,20 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         §D14: 트랜잭션을 연 직후 leader-fence 검사 — 다른 코디네이터가 takeover 했으면(우리가
         좀비 리더) CoordinatorConflict 로 거부해 writer 둘이 한 DB 를 변이하는 것을 막는다.
         leader_guard=False 는 리더십 *획득 중*(아직 epoch 미설정)에만 쓴다."""
+        committed_hooks = []
         with self._lock:
-            with self.store.tx():
+            with self.store.tx(committed_hooks=committed_hooks):
                 if self.enforce_single_coordinator and leader_guard:
                     self._assert_leader()
                 yield
+        # External notification delivery must never run while the authority
+        # RLock is held.  Coordination is already durable, so failures remain
+        # fail-soft here and the outbox owns bounded retry.
+        for hook in committed_hooks:
+            try:
+                hook()
+            except Exception:  # noqa: BLE001
+                pass
 
     @contextmanager
     def _connect_effect(self, *, blocking=False):
@@ -691,7 +822,393 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             self._schema_effect_process_lock.release()
 
     def _emit(self, event, cid, **attrs):
-        self.events.emit(event, cid, **attrs)
+        if event in DURABLE_ADMISSION_TELEMETRY_EVENTS:
+            # Semantic admission edges are emitted only by the committed outbox
+            # dispatcher.  Direct in-transaction telemetry can survive a
+            # rollback (notably begin's SAVEPOINT) and is therefore forbidden.
+            return
+        port = self.events
+        if self.store._txn_depth > 0:
+            # Legacy telemetry is still fail-soft, but external callbacks must
+            # never run under the authority transaction/RLock. Besides avoiding
+            # rollback ghosts, this establishes one lock order when a sink
+            # re-enters the public outbox flush seam.
+            frozen_attrs = dict(attrs)
+            self.store.after_commit(
+                lambda: port.emit(event, cid, **frozen_attrs)
+            )
+            return
+        port.emit(event, cid, **attrs)
+
+    def _has_admission_notifier(self) -> bool:
+        """Whether the injected events port exposes strict outbox delivery."""
+        deliver = getattr(self.events, "deliver", None)
+        if not callable(deliver):
+            return False
+        sentinel = object()
+        backend = getattr(self.events, "backend", sentinel)
+        return backend is sentinel or backend is not None
+
+    def _schedule_admission_outbox_at(self, due_at, *, immediate=False) -> None:
+        """Arm at most one daemon dispatcher timer, preferring an earlier wake."""
+        if not self._has_admission_notifier():
+            return
+        due_at = float(due_at)
+        start_error = None
+        with self._outbox_timer_lock:
+            if self._outbox_closed:
+                return
+            previous_timer = self._outbox_timer
+            previous_due = self._outbox_timer_due
+            if (
+                previous_timer is not None
+                and previous_timer.is_alive()
+                and previous_due is not None
+                and previous_due <= due_at
+            ):
+                return
+            delay = 0.0 if immediate else max(0.0, due_at - time.time())
+            for _ in range(ADMISSION_OUTBOX_TIMER_START_RETRIES):
+                timer = threading.Timer(
+                    delay,
+                    self._run_admission_outbox_dispatch,
+                )
+                timer.name = f"omd-outbox-{self.coordinator_id}"
+                timer.daemon = True
+                self._outbox_timer = timer
+                self._outbox_timer_due = due_at
+                try:
+                    timer.start()
+                except Exception as exc:  # noqa: BLE001 — transient runtime seam.
+                    start_error = exc
+                    self._outbox_timer = previous_timer
+                    self._outbox_timer_due = previous_due
+                    continue
+                if previous_timer is not None:
+                    previous_timer.cancel()
+                return
+        # Do not emit while holding the timer lock: an observability backend may
+        # be slow. Existing later timers remain armed; otherwise surface a
+        # bounded, explicit degradation instead of publishing a dead timer.
+        self._emit(
+            "admission_outbox_schedule_error",
+            self.coordinator_id,
+            error=repr(start_error),
+            attempts=ADMISSION_OUTBOX_TIMER_START_RETRIES,
+        )
+        raise RuntimeError("admission outbox timer could not start") from start_error
+
+    def _wake_admission_outbox(self) -> None:
+        """After-commit hook: schedule only; never enter a notifier port."""
+        # Do not consume the authority wall clock: admission/begin/sweep tests
+        # bind one exact observed time to the whole transaction.
+        self._schedule_admission_outbox_at(0.0, immediate=True)
+
+    def _schedule_next_admission_outbox(self) -> None:
+        if not self._has_admission_notifier() or self._outbox_closed:
+            return
+        with self._cs():
+            due_at = self.store.next_admission_outbox_due_at()
+        if due_at is not None:
+            self._schedule_admission_outbox_at(due_at)
+
+    def _run_admission_outbox_dispatch(self) -> None:
+        current = threading.current_thread()
+        with self._outbox_timer_lock:
+            if self._outbox_timer is current:
+                self._outbox_timer = None
+                self._outbox_timer_due = None
+            if self._outbox_closed:
+                return
+        if not self._outbox_dispatch_lock.acquire(blocking=False):
+            return
+        with self._outbox_timer_lock:
+            if self._outbox_closed:
+                self._outbox_dispatch_lock.release()
+                return
+            self._outbox_active_threads.add(current)
+        reschedule = True
+        try:
+            try:
+                self._drain_admission_outbox(_schedule=False)
+            except CoordinatorConflict:
+                reschedule = False
+                self._emit(
+                    "admission_outbox_stopped",
+                    self.coordinator_id,
+                    reason="not_leader",
+                )
+            except Exception as exc:  # noqa: BLE001 — durable rows remain retryable.
+                self._emit(
+                    "admission_outbox_error",
+                    self.coordinator_id,
+                    error=repr(exc),
+                )
+                self._schedule_admission_outbox_at(time.time() + 1.0)
+            finally:
+                self._outbox_dispatch_lock.release()
+            if reschedule:
+                try:
+                    self._schedule_next_admission_outbox()
+                except CoordinatorConflict:
+                    pass
+                except Exception as exc:  # noqa: BLE001 — preserve autonomous retry.
+                    self._emit(
+                        "admission_outbox_error",
+                        self.coordinator_id,
+                        error=repr(exc),
+                        phase="schedule_next",
+                    )
+                    self._schedule_admission_outbox_at(time.time() + 1.0)
+        finally:
+            # Keep close() aware of this worker through the final DB read and
+            # possible timer arm; clearing earlier permits post-close access.
+            with self._outbox_timer_lock:
+                self._outbox_active_threads.discard(current)
+
+    def _deliver_admission_notification(self, envelope) -> None:
+        """Run one bounded, registered strict attempt without per-retry leaks."""
+        port = self.events
+        event_id = envelope["event_id"]
+
+        def raise_delivery_error(delivery_error):
+            if isinstance(delivery_error, Exception):
+                raise delivery_error
+            raise RuntimeError(
+                "strict notifier child raised "
+                f"{type(delivery_error).__name__}: {delivery_error}"
+            ) from delivery_error
+
+        with self._notification_attempt_lock:
+            if self._notification_closed:
+                raise RuntimeError("strict notification dispatcher is closed")
+            prior = self._notification_attempts.get(event_id)
+            if prior is not None:
+                if not prior["done"].is_set():
+                    raise TimeoutError(
+                        "a prior strict notification attempt is still live"
+                    )
+                self._notification_attempts.pop(event_id, None)
+                if prior["errors"]:
+                    raise_delivery_error(prior["errors"][0])
+                # The prior attempt completed after the dispatcher's timeout.
+                # Reuse that outcome so the freshly claimed row can be ACKed
+                # without starting a duplicate external effect.
+                return
+            # Late completions are a bounded best-effort outcome cache.  Keep
+            # the registry itself within max_inflight even if another
+            # coordinator ACKed the row and this process never sees the same
+            # event again.  Eviction can cause an at-least-once duplicate, but
+            # the stable event/effect identities make that explicitly
+            # deduplicatable by the sink.
+            if len(self._notification_attempts) >= self.notification_max_inflight:
+                for completed_event_id, completed in list(
+                    self._notification_attempts.items()
+                ):
+                    if completed["done"].is_set():
+                        self._notification_attempts.pop(completed_event_id, None)
+                    if (
+                        len(self._notification_attempts)
+                        < self.notification_max_inflight
+                    ):
+                        break
+            active = sum(
+                not attempt["done"].is_set()
+                for attempt in self._notification_attempts.values()
+            )
+            if active >= self.notification_max_inflight:
+                raise RuntimeError("strict notification in-flight capacity exhausted")
+            attempt = {"done": threading.Event(), "errors": [], "thread": None}
+
+            def deliver():
+                try:
+                    port.deliver(envelope)
+                except BaseException as exc:  # noqa: BLE001 — child-thread outcome.
+                    # BaseException in this child thread is a delivery failure,
+                    # not a process-control signal for the coordinator caller.
+                    # Recording it prevents SystemExit/KeyboardInterrupt from
+                    # being mistaken for a successful strict effect and ACKed.
+                    attempt["errors"].append(exc)
+                finally:
+                    attempt["done"].set()
+
+            worker = threading.Thread(
+                target=deliver,
+                name=f"omd-notify-{envelope.get('event_id', 'unknown')}",
+                daemon=True,
+            )
+            attempt["thread"] = worker
+            self._notification_attempts[event_id] = attempt
+            try:
+                worker.start()
+            except BaseException:
+                if self._notification_attempts.get(event_id) is attempt:
+                    self._notification_attempts.pop(event_id, None)
+                attempt["done"].set()
+                raise
+        if not attempt["done"].wait(self.notification_timeout):
+            raise TimeoutError(
+                "strict notification attempt exceeded "
+                f"{self.notification_timeout:g}s"
+            )
+        with self._notification_attempt_lock:
+            if self._notification_attempts.get(event_id) is attempt:
+                self._notification_attempts.pop(event_id, None)
+        if attempt["errors"]:
+            raise_delivery_error(attempt["errors"][0])
+
+    def flush_admission_outbox(self, *, limit=100, now=None, _schedule=True):
+        """Run one lifecycle-fenced public outbox drain.
+
+        The timer dispatcher calls the private drain after registering itself;
+        manual callers register here.  close() closes the shared gate and joins
+        every accepted caller before allowing a coordinator handoff.
+        """
+        current = threading.current_thread()
+        with self._outbox_timer_lock:
+            if self._outbox_closed:
+                raise RuntimeError("admission outbox dispatcher is closed")
+            self._outbox_active_threads.add(current)
+        try:
+            # Serialize with the timer worker.  This makes an explicit flush a
+            # deterministic readback barrier instead of returning while a timer
+            # still owns due rows as DELIVERING.
+            with self._outbox_dispatch_lock:
+                with self._outbox_timer_lock:
+                    if self._outbox_closed:
+                        raise RuntimeError("admission outbox dispatcher is closed")
+                return self._drain_admission_outbox(
+                    limit=limit, now=now, _schedule=_schedule
+                )
+        finally:
+            with self._outbox_timer_lock:
+                self._outbox_active_threads.discard(current)
+
+    def _drain_admission_outbox(self, *, limit=100, now=None, _schedule=True):
+        """Deliver due admission notifications with leased at-least-once replay."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise ValueError("admission outbox delivery limit must be positive")
+        if not self._has_admission_notifier():
+            with self._cs():
+                stats = self.store.admission_outbox_stats()
+                return {
+                    "delivered": 0,
+                    "failed": 0,
+                    "delivered_total": stats["delivered"],
+                    "pending": stats["pending"],
+                    "delivering": stats["delivering"],
+                    "head": stats["head"],
+                }
+        delivered = failed = 0
+        for _ in range(limit):
+            observed_at = time.time() if now is None else now
+            with self._cs():
+                row = self.store.claim_next_admission_outbox(
+                    self.instance_id,
+                    observed_at,
+                    lease_ttl=ADMISSION_OUTBOX_LEASE_TTL,
+                )
+            if row is None:
+                break
+            claim_token = row["claim_token"]
+            error = None
+            try:
+                envelope = json.loads(row["payload"])
+                if canonical_json(envelope) != row["payload"]:
+                    raise ValueError("notification payload is non-canonical")
+                if sha256_json(envelope) != row["payload_sha256"]:
+                    raise ValueError("notification payload digest mismatch")
+                expected_schema = OUTBOX_NOTIFICATION_SCHEMAS.get(
+                    row["transition_kind"]
+                )
+                if expected_schema is None:
+                    raise ValueError("notification transition is not durable")
+                if envelope.get("notification_schema") != expected_schema:
+                    raise ValueError("notification schema mismatch")
+                if row["schema_version"] != expected_schema:
+                    raise ValueError("outbox row schema mismatch")
+                if envelope.get("event_id") != row["event_id"]:
+                    raise ValueError("notification event identity mismatch")
+                for field in (
+                    "repository_id",
+                    "request_id",
+                    "request_generation",
+                    "orbit_id",
+                ):
+                    if envelope.get(field) != row[field]:
+                        raise ValueError(
+                            f"notification {field} does not match outbox row"
+                        )
+                if envelope.get("semantic_event") != row["transition_kind"]:
+                    raise ValueError("notification transition does not match outbox row")
+                expected_event = OUTBOX_NOTIFICATION_EVENTS.get(
+                    row["transition_kind"]
+                )
+                if expected_event is None or envelope.get("event") != expected_event:
+                    raise ValueError("notification event does not match transition")
+                if (
+                    envelope.get("cid") != row["correlation_id"]
+                    or envelope.get("correlation_id") != row["correlation_id"]
+                    or envelope.get("cycle_id") != row["correlation_id"]
+                ):
+                    raise ValueError("notification correlation identity mismatch")
+                effect_prefix = (
+                    "admission-effect-"
+                    if expected_schema == ADMISSION_NOTIFICATION_SCHEMA
+                    else "coordination-effect-"
+                )
+                expected_effect_key = effect_prefix + sha256_json({
+                    "schema": expected_schema,
+                    "repository_id": row["repository_id"],
+                    "request_id": row["request_id"],
+                    "request_generation": row["request_generation"],
+                    "orbit_id": row["orbit_id"],
+                    "transition_kind": row["transition_kind"],
+                })
+                if (
+                    row["effect_key"] != expected_effect_key
+                    or envelope.get("effect_key") != expected_effect_key
+                ):
+                    raise ValueError("notification effect identity mismatch")
+                self._deliver_admission_notification(envelope)
+            except Exception as exc:  # noqa: BLE001 — durable retry owns failure.
+                error = f"{type(exc).__name__}: {exc}"[:1000]
+            finished_at = time.time() if now is None else now
+            if error is None:
+                with self._cs():
+                    if not self.store.ack_admission_outbox(
+                        row["event_id"], claim_token, finished_at
+                    ):
+                        raise RuntimeError(
+                            "admission outbox claim token was lost before ACK"
+                        )
+                delivered += 1
+                continue
+            delay = min(
+                ADMISSION_OUTBOX_MAX_RETRY_DELAY,
+                float(2 ** min(max(int(row["attempts"]) - 1, 0), 6)),
+            )
+            with self._cs():
+                if not self.store.retry_admission_outbox(
+                    row["event_id"], claim_token, finished_at + delay, error
+                ):
+                    raise RuntimeError(
+                        "admission outbox claim token was lost before retry"
+                    )
+            failed += 1
+        with self._cs():
+            stats = self.store.admission_outbox_stats()
+            result = {
+                "delivered": delivered,
+                "failed": failed,
+                "delivered_total": stats["delivered"],
+                "pending": stats["pending"],
+                "delivering": stats["delivering"],
+                "head": stats["head"],
+            }
+        if _schedule:
+            self._schedule_next_admission_outbox()
+        return result
 
     # ---- D14 코디네이터 singleton / HA 입장 (§D14) ----
     @staticmethod
@@ -898,8 +1415,139 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         }
         return bind_decision_id(event_type, payload)
 
-    @staticmethod
-    def _assert_admission_projection(context, event_type, payload, snapshot_hash, expected):
+    def _enqueue_admission_notification(
+        self, event_type, payload, context, *, predecessor_event_ids=()
+    ):
+        telemetry_event = OUTBOX_NOTIFICATION_EVENTS.get(event_type)
+        if telemetry_event is None:
+            return None
+        notification_schema = OUTBOX_NOTIFICATION_SCHEMAS[event_type]
+        required = (
+            "repository_id",
+            "request_id",
+            "request_generation",
+            "orbit_id",
+            "event_id",
+        )
+        missing = [key for key in required if key not in payload]
+        if missing:
+            raise RuntimeError(
+                f"admission notification identity missing: {missing}"
+            )
+        effect_prefix = (
+            "admission-effect-"
+            if notification_schema == ADMISSION_NOTIFICATION_SCHEMA
+            else "coordination-effect-"
+        )
+        effect_key = effect_prefix + sha256_json({
+            "schema": notification_schema,
+            "repository_id": payload["repository_id"],
+            "request_id": payload["request_id"],
+            "request_generation": payload["request_generation"],
+            "orbit_id": payload["orbit_id"],
+            "transition_kind": event_type,
+        })
+        correlation_id = (
+            context.get("owner_agent")
+            or payload.get("owner_agent")
+            or payload["request_id"]
+        )
+        envelope = {
+            "cid": correlation_id,
+            "correlation_id": correlation_id,
+            "cycle_id": correlation_id,
+            "service": getattr(self.events, "service", "omd"),
+            "event": telemetry_event,
+            "notification_schema": notification_schema,
+            "semantic_event": event_type,
+            "effect_key": effect_key,
+            "promoted": event_type == "PROMOTION_GRANTED",
+            "deadlock": event_type == "PROMOTION_DENIED",
+            **payload,
+        }
+        encoded = canonical_json(envelope)
+        created_at = (
+            float(payload["observed_at"])
+            if payload.get("observed_at") is not None
+            else time.time()
+        )
+        self.store.enqueue_admission_outbox(
+            event_id=payload["event_id"],
+            effect_key=effect_key,
+            schema_version=notification_schema,
+            repository_id=payload["repository_id"],
+            request_id=payload["request_id"],
+            request_generation=payload["request_generation"],
+            orbit_id=payload["orbit_id"],
+            transition_kind=event_type,
+            correlation_id=correlation_id,
+            payload=encoded,
+            payload_sha256=sha256_json(envelope),
+            created_at=created_at,
+            predecessor_event_ids=predecessor_event_ids,
+        )
+        self.store.after_commit(
+            self._wake_admission_outbox,
+            key=("admission-outbox", id(self)),
+        )
+        return effect_key
+
+    def _enqueue_agent_reclaimed_notification(
+        self,
+        agent_id,
+        final_orbit,
+        *,
+        voluntary,
+        observed_at,
+        orbit_count,
+        task_count,
+        predecessor_event_ids=(),
+    ):
+        predecessor_event_ids = tuple(sorted(set(predecessor_event_ids)))
+        if final_orbit is None:
+            agent = self.store.get_agent(agent_id)
+            bail_epoch = int((agent or {}).get("bail_epoch") or 0)
+            stream_identity = {
+                "repository_id": self.repository_id,
+                "agent_id": agent_id,
+                "bail_epoch": bail_epoch,
+            }
+            final_orbit = {
+                "request_id": f"internal:agent-reclaim:{agent_id}",
+                "request_generation": bail_epoch,
+                "orbit_id": "agent-reclaim:" + sha256_json(stream_identity),
+                "authority_snapshot_hash": authority_snapshot_hash(
+                    self.store.held_orbits(),
+                    self.store.pending_orbits(),
+                    coordinator_epoch=self.leader_epoch,
+                ),
+            }
+        payload = {
+            "repository_id": self.repository_id,
+            "request_id": final_orbit.get("request_id")
+            or f"internal:{final_orbit['orbit_id']}",
+            "request_generation": int(final_orbit.get("request_generation") or 0),
+            "orbit_id": final_orbit["orbit_id"],
+            "owner_agent": agent_id,
+            "actor": self.coordinator_id,
+            "event_id": f"evt-{uuid.uuid4().hex}",
+            "authority_snapshot_hash": final_orbit["authority_snapshot_hash"],
+            "voluntary": bool(voluntary),
+            "orbits": int(orbit_count),
+            "tasks": int(task_count),
+            "observed_at": observed_at,
+            "predecessor_event_ids": list(predecessor_event_ids),
+        }
+        return self._enqueue_admission_notification(
+            "AGENT_RECLAIMED",
+            payload,
+            {"owner_agent": agent_id},
+            predecessor_event_ids=predecessor_event_ids,
+        )
+
+    def _assert_admission_projection(
+        self, context, event_type, payload, snapshot_hash, expected
+    ):
         reduced = admission_step(
             context,
             event_type,
@@ -916,6 +1564,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 f"admission projection mismatch: semantic={reduced.context['state']} "
                 f"legacy={projection.state} expected={expected}"
             )
+        self._enqueue_admission_notification(event_type, payload, reduced.context)
         return reduced
 
     def _reduce_orbit_lifecycle(self, orbit, event_type, **variant):
@@ -1443,7 +2092,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # §D6: bail_epoch bump — 회수 전 epoch를 든 GC-pause 좀비가 살아나도 모든 변이가
         # stale bail_epoch로 FENCED_OUT (부활 방지). state 리셋(heartbeat)으로 못 우회.
         self.store.bump_bail_epoch(agent_id)
-        freed, requeued = [], []
+        freed, requeued, release_event_ids = [], [], []
         # 죽은 보유자의 merge_token: dangling merge를 abort 후 토큰 반납(§D11/§E).
         for mt in self.store.merge_tokens_owned_by(agent_id, ("HELD",)):
             self._abort_dangling_merge(mt)
@@ -1475,19 +2124,22 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 (agent_id,)).fetchall():
             self.store.set_sem_waiter(w["waiter_id"], state="CANCELLED")
         for o in self.store.orbits_owned_by_agent(agent_id, ("HELD", "PENDING")):
+            reclaim_reason = "bail" if voluntary else "reclaim"
             trig = "expire" if o["state"] == "HELD" else "deny"  # HELD→EXPIRED, PENDING→DENIED
             if o["state"] == "HELD":
                 decision_type = "LEASE_OWNER_RECLAIMED"
                 terminal_reason = "lease_owner_reclaimed"
-                snapshot_hash, _, _ = self._reduce_orbit_lifecycle(
-                    o, decision_type, observed_at=now
+                snapshot_hash, release_payload, _ = self._reduce_orbit_lifecycle(
+                    o, decision_type, observed_at=now, reason=reclaim_reason
                 )
             else:
                 decision_type = "WAIT_OWNER_RECLAIMED"
                 terminal_reason = "wait_owner_reclaimed"
-                snapshot_hash, _, _ = self._reduce_orbit_lifecycle(
-                    o, decision_type, observed_at=now, no_lease_fence=0
+                snapshot_hash, release_payload, _ = self._reduce_orbit_lifecycle(
+                    o, decision_type, observed_at=now, no_lease_fence=0,
+                    reason=reclaim_reason,
                 )
+            release_event_ids.append(release_payload["event_id"])
             # merging pin은 회수와 함께 해제(§E pin은 유계 — 보유자 사망도 한 경계).
             self.store.set_orbit(
                 o["orbit_id"],
@@ -1506,7 +2158,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 self._clear_read_stale_signal(o["orbit_id"])
             freed.append(o["orbit_id"])
             self._emit("orbit_released", agent_id, orbit_id=o["orbit_id"],
-                       reason="bail" if voluntary else "reclaim")
+                       reason=reclaim_reason)
         # §D5/§3.D: 이 agent 의 **모든** task 를 멤버로 둔 활성 배리어를 재평가 대상에 모은다.
         # 이 agent 의 write-orbit 이 위에서 이미 해제됐으므로(lease 사망), 그 task 가 requeue
         # 되든(IN_ORBIT 등) 안 되든(이미 DONE) 배리어 입장에선 참가자 사망이다 → break/shrink.
@@ -1528,8 +2180,15 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         for bid in affected_barriers:
             self._barrier_eval(bid)
         self.store.set_agent_state(agent_id, "RETIRED")
-        self._emit("agent_reclaimed", agent_id, voluntary=voluntary,
-                   orbits=len(freed), tasks=len(requeued))
+        self._enqueue_agent_reclaimed_notification(
+            agent_id,
+            self.store.get_orbit(freed[-1]) if freed else None,
+            voluntary=voluntary,
+            observed_at=now,
+            orbit_count=len(freed),
+            task_count=len(requeued),
+            predecessor_event_ids=release_event_ids,
+        )
         for sem_id in reclaimed_sems:
             self._promote_sem_waiters(sem_id)  # 복구된 슬롯을 줄선 순서로 부여(§D7)
         if promote:
@@ -3514,7 +4173,11 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             with self._cs():
                 self._sweep_inline()
                 after = {o["orbit_id"] for o in self.store.held_orbits()}
-                return {"expired": sorted(before - after)}
+                result = {"expired": sorted(before - after)}
+            self._wake_admission_outbox()
+            with self._cs():
+                result["admission_outbox"] = self.store.admission_outbox_stats()
+            return result
 
     def next_task(self, agent_id):
         """deps 충족 + write-set이 활성 HELD와 서로소인 작업 1개 → READY로 올려 반환.

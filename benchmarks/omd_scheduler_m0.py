@@ -245,6 +245,11 @@ def fairness_probe(
                     row is not None for row in (holder_row, older_row, newer_row)
                 ),
             }
+            # The notification contract is intentionally asynchronous.  The
+            # benchmark/gate boundary needs an explicit durable readback barrier
+            # so timer scheduling cannot make the same trace nondeterministically
+            # GREEN or RED.
+            omd.flush_admission_outbox()
             Emitter(collector).emit(
                 "scheduler_fairness_probe_completed",
                 cid,

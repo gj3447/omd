@@ -19,8 +19,24 @@ grants. A content-addressed saturating-aging v2 policy is pinned per DB (the
 operational default is a 60-second quantum and +10 ceiling), uses one observed
 time per authority transaction, persists rank evidence, and rechecks dynamic
 reservation cycles after rank changes and immediate grants. Finite aging does
-not replace the wait-deadline liveness bound. Candidate indexing, notification
-outbox and the prepared Connect pipeline remain
+not replace the wait-deadline liveness bound. State-changing semantic admission
+edges now share one authority transaction with a durable notification outbox;
+post-commit delivery is stable-ID, claim-token fenced, per request-generation
+FIFO and deduplicatable at-least-once. The commit hook only arms a timer;
+strict notifier attempts run outside authority/effect locks with finite timeout,
+one live attempt per event and a bounded live/late-outcome registry. Manual
+flush and timer delivery share one lifecycle gate; shutdown rejects new drains
+and joins accepted drains/effects before handoff. Retry wakes derive from
+durable `available_at`/`claim_deadline`, independently of the deadline sweep.
+Replacement timer start has a finite three-attempt retry while an existing later
+timer is preserved. Legacy fail-soft telemetry also enters its sink only after
+the authority transaction and RLock are released, preventing sink reentrancy
+from creating a dispatcher/authority lock inversion.
+Cross-stream predecessor rows keep a multi-orbit reclaim's
+`coordination_notification/v1` summary behind every released-orbit fact, while
+empty-agent reclaim uses a synthetic coordination stream. Candidate indexing
+and the prepared
+Connect pipeline remain
 implementation fronts. Do not describe this branch as the complete
 durable waiter, an optimized scheduler, a production rollout or a scientific
 progress result. The governing `L_IDE` lifecycle is documented in
@@ -394,7 +410,6 @@ producer/readback backend. It explicitly records no separate oracle and awaits
 independent judgment; it is not promoted to `external_verdict`.
 
 Still open before full M1: embedded-runtime default wait-deadline delivery,
-notification outbox,
 candidate-index soundness, explicit non-denial request-generation rollover,
 independent judgment and finalization. The current exact full scan is sound but is not an implemented
 candidate index. The existing Connect path now has process-tree effect fencing,
@@ -562,7 +577,13 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
   -p no:cacheprovider \
   tests/test_scheduler_m0_harness.py \
   tests/test_scheduler_m1_admission.py \
+  tests/test_scheduler_m1_outbox.py \
   tests/test_scheduler_admission_conformance.py \
+  tests/test_sinks.py \
+  tests/test_d2_reclaim.py \
+  tests/test_ltdd_claim.py \
+  tests/test_dogfood_parallel_dev.py \
+  tests/test_multiagent_session.py \
   tests/test_d9_idempotency.py \
   tests/test_m1_connect_process_fencing.py \
   tests/test_m1_connect_effect_process.py
@@ -621,7 +642,8 @@ SHA-256 is
   owner-reclaim variants, are bound to current runtime code. MCP deadline
   delivery is default-on; repository capacity and typed overload are bound;
   content-addressed aging and dynamic rank-cycle resolution are implemented;
-  embedded-runtime default delivery, outbox and candidate-index soundness remain open. Task-bound
+  the state-edge notification outbox has crash/replay and claim-token fencing;
+  embedded-runtime default deadline delivery and candidate-index soundness remain open. Task-bound
   `CANCEL`/`RELEASE` projection is also implemented. The prepared Connect
   pipeline is still contract-only.
 - M0's measured numbers and LakatoTree `partial` verdict describe reproducible
