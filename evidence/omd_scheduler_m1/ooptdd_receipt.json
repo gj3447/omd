@@ -11,7 +11,7 @@
     "injection": "Ignore conflicting PENDING predecessors in decide_admission.",
     "observed_verdict": "red",
     "receipt_path": "evidence/omd_scheduler_m1/ooptdd_run.json",
-    "receipt_sha256": "7e5e5292ef3e59b8f003ff689a437cc46d775779c52c0bea7498d6e64a9cecb2",
+    "receipt_sha256": "1d001a231795b372cef81db911a7202dc4fcfa6cc682b9c89b2cf70bb49217f6",
     "restored": true,
     "spec_sha256": "586d8b7e92e7f1974c7acbb1d12969337f57c5f678670243e215b46bb8c2d995",
     "technique": "fault_injection"
@@ -28,14 +28,14 @@
     "forbidden_events_passed": true,
     "observed_verdict": "green",
     "receipt_path": "evidence/omd_scheduler_m1/ooptdd_run.json",
-    "receipt_sha256": "7e5e5292ef3e59b8f003ff689a437cc46d775779c52c0bea7498d6e64a9cecb2"
+    "receipt_sha256": "1d001a231795b372cef81db911a7202dc4fcfa6cc682b9c89b2cf70bb49217f6"
   },
   "producer": {
     "command": "/Users/lagyeongjun/CD/omd/.venv/bin/python /Users/lagyeongjun/CD/omd/benchmarks/produce_scheduler_m1_receipt.py --gate gates/scheduler_fairness.yaml --cid omd-scheduler-m1-newer --output evidence/omd_scheduler_m1/ooptdd_run.json --receipt-output evidence/omd_scheduler_m1/ooptdd_receipt.json",
     "cwd": "/Users/lagyeongjun/CD/omd",
     "entrypoint": "benchmarks.produce_scheduler_m1_receipt:produce",
     "exit_code": 0,
-    "git_head": "fea9a81a491f5498c09bf6ab7856ed2d2ee6cad4",
+    "git_head": "a1d2ddde2a337425162eb8f6457bbc0920892480",
     "real_code_path": true,
     "source_path": "benchmarks/produce_scheduler_m1_receipt.py",
     "source_symbol": "produce"
@@ -69,8 +69,8 @@
     "admission_path": "omd_server/admission.py",
     "admission_sha256": "05ef13014b60e3ef318ebecd14bf5bd85ab30d8df8918150dc025bc67593bdd2",
     "core_path": "omd_server/core.py",
-    "core_sha256": "f2166a25ada66899477d5c3609b95da7ea398abd97274097859a97dd2e5d3e8e",
-    "git_head_before_evidence_commit": "fea9a81a491f5498c09bf6ab7856ed2d2ee6cad4"
+    "core_sha256": "6ec1abddffff80af2befc809c27cf8d07062b79009ee40ef767bae2b3e97f7e5",
+    "git_head_before_evidence_commit": "a1d2ddde2a337425162eb8f6457bbc0920892480"
   },
   "template_only": false
 }

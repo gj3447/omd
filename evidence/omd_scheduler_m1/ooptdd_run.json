@@ -1,6 +1,6 @@
 {
   "cid": "omd-scheduler-m1-newer",
-  "completed_at": "2026-07-15T13:12:24.811454+00:00",
+  "completed_at": "2026-07-15T14:18:55.684633+00:00",
   "gate": {
     "path": "gates/scheduler_fairness.yaml",
     "sha256": "7e249d738e941c2a56e6d8846ddc2d5b6489c95a0238d5471301c63bea19c4d1"
@@ -50,7 +50,7 @@
           "charged": true,
           "firsts": {
             "orbit_pending": null,
-            "orbit_requested": 1784121144782935
+            "orbit_requested": 1784125135652649
           },
           "grounding": "derived-self",
           "kind": "must_order",
@@ -131,12 +131,12 @@
       },
       "holder_state": "HELD",
       "newer_claim_state": "HELD",
-      "newer_created_at": 1784121144.78303,
+      "newer_created_at": 1784125135.65274,
       "newer_granted_while_older_pending": true,
       "newer_priority": 0,
       "no_overtaking_passed": false,
       "older_arrived_first": true,
-      "older_created_at": 1784121144.7826931,
+      "older_created_at": 1784125135.652417,
       "older_priority": 10,
       "older_waiter_state": "PENDING",
       "pending_predecessor_bypass_injected": true,
@@ -189,8 +189,8 @@
         {
           "charged": true,
           "firsts": {
-            "orbit_pending": 1784121144778504,
-            "orbit_requested": 1784121144778330
+            "orbit_pending": 1784125135644740,
+            "orbit_requested": 1784125135644546
           },
           "grounding": "derived-self",
           "kind": "must_order",
@@ -267,12 +267,12 @@
       },
       "holder_state": "HELD",
       "newer_claim_state": "PENDING",
-      "newer_created_at": 1784121144.778435,
+      "newer_created_at": 1784125135.644663,
       "newer_granted_while_older_pending": false,
       "newer_priority": 0,
       "no_overtaking_passed": true,
       "older_arrived_first": true,
-      "older_created_at": 1784121144.778071,
+      "older_created_at": 1784125135.6442492,
       "older_priority": 10,
       "older_waiter_state": "PENDING",
       "pending_predecessor_bypass_injected": false,
@@ -288,7 +288,7 @@
     "entrypoint_path": "benchmarks/omd_scheduler_m1.py",
     "entrypoint_sha256": "b7e8dc77f19d4d472a976a73ef073479edadcd42169d121f9ee93498f93d2bc1",
     "exit_code": 0,
-    "git_head": "fea9a81a491f5498c09bf6ab7856ed2d2ee6cad4",
+    "git_head": "a1d2ddde2a337425162eb8f6457bbc0920892480",
     "path": "benchmarks/produce_scheduler_m1_receipt.py",
     "real_code_path": true,
     "scenario_entrypoint": "benchmarks.omd_scheduler_m1:run_ooptdd",
@@ -339,8 +339,8 @@
         {
           "charged": true,
           "firsts": {
-            "orbit_pending": 1784121144787306,
-            "orbit_requested": 1784121144787146
+            "orbit_pending": 1784125135660803,
+            "orbit_requested": 1784125135660651
           },
           "grounding": "derived-self",
           "kind": "must_order",
@@ -417,12 +417,12 @@
       },
       "holder_state": "HELD",
       "newer_claim_state": "PENDING",
-      "newer_created_at": 1784121144.787245,
+      "newer_created_at": 1784125135.660744,
       "newer_granted_while_older_pending": false,
       "newer_priority": 0,
       "no_overtaking_passed": true,
       "older_arrived_first": true,
-      "older_created_at": 1784121144.7869,
+      "older_created_at": 1784125135.660411,
       "older_priority": 10,
       "older_waiter_state": "PENDING",
       "pending_predecessor_bypass_injected": false,
@@ -441,7 +441,7 @@
     "admission_path": "omd_server/admission.py",
     "admission_sha256": "05ef13014b60e3ef318ebecd14bf5bd85ab30d8df8918150dc025bc67593bdd2",
     "core_path": "omd_server/core.py",
-    "core_sha256": "f2166a25ada66899477d5c3609b95da7ea398abd97274097859a97dd2e5d3e8e",
-    "git_head_before_evidence_commit": "fea9a81a491f5498c09bf6ab7856ed2d2ee6cad4"
+    "core_sha256": "6ec1abddffff80af2befc809c27cf8d07062b79009ee40ef767bae2b3e97f7e5",
+    "git_head_before_evidence_commit": "a1d2ddde2a337425162eb8f6457bbc0920892480"
   }
 }
