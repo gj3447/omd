@@ -434,7 +434,13 @@ property/differential traces:
 - live admission identities own the global request-id namespace, and terminal
   rows preserve their generation history; policy-denial retry advances the
   durable request generation, while exact completed claim replay cannot create
-  a second generation-zero effect;
+  a second generation-zero effect. A separate `rollover_claim` command now
+  requires a distinct operation ID and the exact latest predecessor
+  orbit/owner/generation/current bail epoch before copying the immutable intent
+  into generation `N+1`; ordinary non-policy terminal `claim()` replay remains
+  non-rolling, while policy denial retains its existing automatic retry rule.
+  The operation receipt replays exactly within `idem_ttl`; after retention GC,
+  the latest-predecessor fence still prevents a second successor;
 - split-phase Connect and barrier trips reserve their exact request envelope
   across unlocked effects. Deterministically ordered DB- and repo-scoped
   process/file effect locks span
@@ -551,8 +557,14 @@ Hypothesis examples per run. Each generated workload asserts that every exact
 full-scan overlap remains in the candidate set and that indexed grant/blocker
 semantics equal an explicitly disabled full scan. Candidate counts and bounded
 fallback reasons are emitted separately from the canonical decision envelope.
-Policy-denial generation rollover is implemented; explicit non-denial rollover
-remains open. Public `RENEW`/`RELEASE`, due lease expiry, PENDING-owner reclaim,
+Policy-denial generation rollover and explicit non-policy terminal rollover are
+implemented. The latter supports `RELEASED`, `LEASE_EXPIRED`, `CANCEL`,
+and `WAIT_TIMEOUT`; owner-reclaim projections are excluded because no authority
+exists to resurrect a retired owner. It rejects active/policy/owner-reclaim/unknown or
+exhausted predecessors, and leaves row-less `QUEUE_FULL` on its existing fresh
+semantic request-ID contract. Within `idem_ttl`, exact operation replay returns
+the same receipt; after GC, the latest-predecessor fence preserves at-most-once
+successor creation. Public `RENEW`/`RELEASE`, due lease expiry, PENDING-owner reclaim,
 HELD-owner reclaim, standalone wait cancellation and the task-bound cancel path
 all pass through the semantic reducer before legacy mutation. The attempt
 fencing above hardens the existing Connect
@@ -724,9 +736,11 @@ slice is ready to commit only when:
   harness cleanup. Admission wait cancellation is a separate `cancel_wait`
   capability bound to the PENDING row's owner, generation and bail epoch.
 
-Landing those files makes the **M1 fairness implementation slice** durable. It
-does not make full M1 or the development cycle `CLOSED`: an independent scripted
-progress judgment and finalization receipts remain future work.
+Landing those files plus the explicit request-generation rollover makes the
+**M1 fairness implementation slice** durable. It does not make the development
+cycle `CLOSED`: the existing M1 evidence was produced before an M1-specific
+preregistration and remains `AWAITING_INDEPENDENT_JUDGE`; protected-ref
+finalization receipts also remain future work.
 
 ## 14. Known limitations and promotion blockers
 
@@ -751,7 +765,10 @@ progress judgment and finalization receipts remain future work.
    authority/outbox timer separation are runtime-tested. Heartbeat-before-sweep,
    constructor rollback, terminal close/start linearization and immediate
    context-manager handoff are also runtime-tested. Task-bound
-   `CANCEL`/`RELEASE` projection is also implemented.
+   `CANCEL`/`RELEASE` projection and explicit fenced non-policy terminal
+   generation rollover are also implemented. Ordinary non-policy terminal claim
+   replay does not roll forward, policy denial keeps its existing automatic retry,
+   and row-less `QUEUE_FULL` still requires a fresh request ID.
 5. The prepared candidate, expected-old ref CAS, independent ref reader and
    finalization protocol are contracts, not the current runtime path.
 6. The connect loop is a conservative `loop-contract/v1` runner aggregate over

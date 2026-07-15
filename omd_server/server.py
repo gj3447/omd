@@ -6,6 +6,7 @@ fastmcp 미설치 시 import만 가드 (core/cli/tests는 fastmcp 없이 동작)
 툴 표면:
   about()                                   OMD 가 뭔지/뭐가 아닌지 + 표준 운행 루프 (오리엔테이션)
   claim(agent, paths, mode, ttl, task)      궤도 lease 획득 (입체 검사 → HELD or PENDING)
+  rollover_claim(prior_orbit_id, generation)  명시적 비정책 종단 N→N+1
   release(orbit_id) / renew(orbit_id, ttl) / cancel_wait(orbit_id, generation)
   declare(task, name, writes, reads, deps)  write-set(궤도) 선언
   next(agent)                               서로소(입체) READY 작업 추천
@@ -188,6 +189,20 @@ def build_server(db_path: str = "omd.db"):
         request_id로 멱등(재시도가 누수 lease를 안 만듦), bail_epoch로 회수된 좀비 차단(§D6)."""
         return omd.claim(agent, paths, mode, ttl=ttl, task_id=task, priority=priority,
                          request_id=request_id, bail_epoch=bail_epoch)
+
+    @mcp.tool()
+    def rollover_claim(prior_orbit_id: str, agent: str, expected_generation: int,
+                       bail_epoch: int, request_id: str) -> dict:
+        """RELEASED/EXPIRED/CANCELLED/TIMED_OUT claim을 명시적으로 N+1 세대로 재입장한다.
+        request_id는 원 claim ID와 다른 rollover 작업 ID다. 보존 기간 안의 exact retry는
+        같은 결과를 재생하며, 이후에도 predecessor fence가 중복 세대 생성을 막는다."""
+        return omd.rollover_claim(
+            prior_orbit_id,
+            agent,
+            expected_generation,
+            bail_epoch=bail_epoch,
+            request_id=request_id,
+        )
 
     @mcp.tool()
     def release(orbit_id: str, agent: str, fence: int,

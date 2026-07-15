@@ -397,6 +397,55 @@ def test_cancel_wait_tool_exposes_and_forwards_authority_tuple(tmp_path, monkeyp
     }
 
 
+def test_rollover_claim_tool_requires_and_forwards_fenced_predecessor(
+    tmp_path, monkeypatch
+):
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server.core import Coordinator
+    from omd_server.server import build_server
+
+    mcp = build_server(str(tmp_path / "rollover-claim.db"))
+    observed = {}
+
+    def fake_rollover(self, prior_orbit_id, agent_id, expected_generation, **kwargs):
+        observed.update(
+            prior_orbit_id=prior_orbit_id,
+            agent_id=agent_id,
+            expected_generation=expected_generation,
+            **kwargs,
+        )
+        return {"ok": True, "request_generation": expected_generation + 1}
+
+    monkeypatch.setattr(Coordinator, "rollover_claim", fake_rollover)
+
+    async def inspect_and_call():
+        tool = next(t for t in await mcp.list_tools() if t.name == "rollover_claim")
+        required = {
+            "prior_orbit_id", "agent", "expected_generation", "bail_epoch",
+            "request_id",
+        }
+        assert required <= set(tool.parameters["properties"])
+        assert required <= set(tool.parameters["required"])
+        result = tool.fn(
+            prior_orbit_id="orb-1",
+            agent="worker",
+            expected_generation=4,
+            bail_epoch=2,
+            request_id="rollover-op",
+        )
+        assert result == {"ok": True, "request_generation": 5}
+
+    anyio.run(inspect_and_call)
+    assert observed == {
+        "prior_orbit_id": "orb-1",
+        "agent_id": "worker",
+        "expected_generation": 4,
+        "bail_epoch": 2,
+        "request_id": "rollover-op",
+    }
+
+
 def test_server_builds(tmp_path):
     pytest.importorskip("fastmcp")
     from omd_server.server import build_server

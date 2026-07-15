@@ -812,12 +812,30 @@ FEEDBACK §P3 잔여("경보 이후가 비어있다") 응답. 선행문헌: Zuul
 - 긴 검사 동안 coordinator-owned bounded pin이 zombie reclaim을 미루며, 일반 connect와 barrier
   trip이 동일 Phase B gate를 공유한다. red barrier member는 전체 barrier를 `BROKEN`으로 깨운다.
 
+### ✅ 증분 16 — 명시적 비정책 종단 request-generation rollover — DONE
+
+- 일반 비정책 종단 `claim()` 재전송은 계속 exact replay다. 종단 상태에서 자동으로 새 lease를
+  만들지 않는다. policy `DENIED`는 기존 자동 세대 증가 규칙을 유지한다.
+- `rollover_claim(prior_orbit_id, agent, expected_generation, bail_epoch,
+  request_id=<distinct operation id>)`만 최신 predecessor의 orbit/owner/generation/current bail epoch와
+  task admission eligibility를 한 authority transaction에서 검증한 뒤 immutable claim intent를 복제해
+  새 OrbitRequest `N+1`을 만든다. 이전 종단 행은 보존된다.
+- 지원 predecessor는 `RELEASED`, `LEASE_EXPIRED`, `CANCEL`, `WAIT_TIMEOUT`이다. owner-reclaim projection은
+  RETIRED owner를 부활시킬 권한이 없으므로 명시적으로 제외한다(새 owner는 fresh semantic request ID 사용).
+  active, policy denial, unknown migration terminal, stale authority, signed-64 generation exhaustion은 새
+  ticket/fence/row/outbox 없이 거부된다.
+- operation ID는 semantic claim ID와 분리된다. `idem_ttl` 안의 exact retry는 같은 새
+  orbit/generation을 재생하고, GC 이후에는 같은 receipt를 약속하지 않지만 latest-predecessor fence가
+  둘째 successor를 막는다. row가 없는 `QUEUE_FULL`은 기존대로 fresh semantic request ID를 요구한다.
+- Core/MCP/CLI가 동일 명령을 노출하고, release/expiry/cancel/timeout, exact replay/conflict, stale fence,
+  concurrent `N→N+1`, restart, intent 복제 및 generation exhaustion을 회귀 테스트한다.
+
 ### ⬜ 다음 증분 후보
 D13 git/FS 장애 분류 · P3-O3 resolve-태스크 승격 · Contract dual declare-time gate
 (`docs/OMD_DEMPSEY_ROLL.md`의 `PRELIMINARY/VerdictPending`, 사용자 verdict 전 강제 금지).
 (P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6, D4 = 증분7, D5 = 증분8, D12+D14 = 증분9,
 P2 shared 레인 = 증분10, §3.D 배리어 재기동+CONSUMED = 증분11, D14 멀티프로세스 실측 = 증분12,
-P3 충돌 복구 UX = 증분13, runtime guardrails = 증분14~15 에서 닫힘.)
+P3 충돌 복구 UX = 증분13, runtime guardrails = 증분14~15, request-generation rollover = 증분16에서 닫힘.)
 
 ---
 

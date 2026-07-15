@@ -27,6 +27,12 @@ def main(argv=None):
     c.add_argument("--task"); c.add_argument("--priority", type=int, default=0)
     c.add_argument("--request-id"); c.add_argument("--bail-epoch", type=int)
 
+    rc = sub.add_parser("rollover-claim")
+    rc.add_argument("prior_orbit_id"); rc.add_argument("agent")
+    rc.add_argument("expected_generation", type=int)
+    rc.add_argument("--bail-epoch", type=int, required=True)
+    rc.add_argument("--request-id", required=True)
+
     for verb in ("release", "renew"):
         s = sub.add_parser(verb)
         s.add_argument("orbit_id"); s.add_argument("agent"); s.add_argument("fence", type=int)
@@ -156,6 +162,13 @@ def main(argv=None):
         out = {
             "claim": lambda: omd.claim(a.agent, a.paths, a.mode, ttl=a.ttl, task_id=a.task,
                                        priority=a.priority, request_id=rid(), bail_epoch=be()),
+            "rollover-claim": lambda: omd.rollover_claim(
+                a.prior_orbit_id,
+                a.agent,
+                a.expected_generation,
+                bail_epoch=a.bail_epoch,
+                request_id=a.request_id,
+            ),
             "release": lambda: omd.release(a.orbit_id, a.agent, a.fence,
                                            request_id=rid(), bail_epoch=be()),
             "renew": lambda: omd.renew(a.orbit_id, a.agent, a.fence, a.ttl,

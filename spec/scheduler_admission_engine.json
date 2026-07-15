@@ -96,6 +96,7 @@
   "protocol": {
     "commands": [
       "SubmitClaim",
+      "RolloverClaim",
       "ReevaluatePending",
       "RenewLease",
       "ReleaseLease",
@@ -121,7 +122,8 @@
       "ScheduleDeadline",
       "EmitAdmissionTelemetry"
     ],
-    "versioning": "Request, policy, event, snapshot, queue rank, and path-normalization versions are recorded. Breaking compatibility or ordering changes require a new major version and replay fixtures."
+    "versioning": "Request, policy, event, snapshot, queue rank, and path-normalization versions are recorded. Breaking compatibility or ordering changes require a new major version and replay fixtures.",
+    "rollover": "RolloverClaim is a separate operation, not an outgoing transition from a terminal OrbitRequest. It requires a distinct operation request ID plus the exact latest predecessor orbit, owner, generation, live-agent state and current bail epoch; copies the immutable claim intent; and creates generation N+1 only from RELEASED, LEASE_EXPIRED, CANCEL, or WAIT_TIMEOUT projections. Owner-reclaim projections are excluded because reclaim retires the owner; a replacement owner uses a fresh semantic request ID. Policy denial keeps its existing automatic retry rule. Queue-full REJECTED has no durable predecessor row and still requires a fresh semantic request ID. Exact operation replay is retained for idem_ttl; after GC the latest-predecessor fence preserves at-most-once successor creation without promising the old receipt."
   },
   "invariants": [
     "Two live HELD requests whose modes are incompatible never have overlapping pathspecs.",
@@ -131,6 +133,7 @@
     "A queue insertion that would close the combined HELD-plus-reservation wait-for cycle is denied before exposure.",
     "Because aging can change reservation precedence after insertion, every reconciliation recomputes the combined graph at one observed time and deterministically denies the newest participating queue ticket until it is acyclic.",
     "Every live lease has a unique monotonic fence and only its current owner, fence, and bail epoch may renew or release it.",
+    "Ordinary non-policy terminal claim replay never rolls a request forward; policy DENIED retains its existing automatic retry rule. Explicit non-policy rollover preserves the terminal predecessor, validates that it is the latest generation, and atomically creates at most one fresh N+1 OrbitRequest under a distinct operation idempotency key; skipped, stale, active, policy-denied, owner-reclaimed, unknown, or signed-64-exhausted predecessors fail without a new ticket, fence, row, or notification.",
     "Every admission and promotion decision binds the canonical nine-field request identity (repository, request, orbit, generation, owner, bail epoch, mode, pathspec digest, policy version), decision-specific output fields, decision_id, and a fresh authority snapshot; lifecycle maintenance facts bind the applicable owner/fence/deadline tuple. An event for another identity or generation cannot advance this lifecycle.",
     "Owner reclaim of a HELD request requires the current owner, fence, bail epoch, request generation, and authority snapshot; reclaim of a PENDING request requires the current owner, bail epoch, request generation, and authority snapshot.",
     "Every wait has a durable sequence, deadline, cancellation path, and bounded capacity outcome.",
@@ -156,7 +159,7 @@
   },
   "durability": {
     "persistence": "Persist normalized request identity, queue sequence, requested TTL, deadlines, content-addressed policy version, rank inputs, decision schema/observed time/effective priority, blockers, state, and fence before reporting a durable result.",
-    "atomic_commit": "Commit dedup claim, request state/version, wait-for cycle decision, fence allocation or queue insertion, notification outbox, and any explicit cross-stream causal predecessors in one authority transaction.",
+    "atomic_commit": "Commit dedup claim or rollover operation receipt, request state/version, wait-for cycle decision, fence allocation or queue insertion, notification outbox, and any explicit cross-stream causal predecessors in one authority transaction.",
     "recovery": "On restart, first reconcile authority state by expiring due waits and leases and reevaluating PENDING requests with their original queue sequence and policy envelope; then arm the asynchronous dispatcher, which reclaims expired notification delivery leases and replays due stream heads by stable event_id. The candidate index has no persisted authority or stale recovery state: every decision rebuilds it from that decision's complete active snapshot.",
     "effect_idempotency": "Use repository_id, request_id, orbit_id, transition kind, and request generation as the unique semantic effect key; the canonical payload has a separate digest, and the same effect key with a different event or payload is a fail-closed conflict.",
     "migration": "The schema version is the final completion marker for additive migration. The m1-aging predecessor had no notification facts, so migration creates an empty outbox without fabricating historical effects while preserving all authority rows. A crash after outbox DDL or row insertion but before the version marker resumes idempotently and preserves the exact existing payload, digest, and dependency rows. Migration tests retain legacy PENDING, HELD, RELEASED, EXPIRED, and DENIED authority states."
@@ -204,6 +207,7 @@
     "Unknown pending policy authority blocks fail closed; malformed or drifted active policy metadata prevents startup before recovery.",
     "Candidate-index disable, an unknown request prefix, malformed active pathspec, coverage failure, or build/query error uses the complete active set and the unchanged exact oracle.",
     "Stale owner, fence, or bail epoch cannot renew, release, or cancel a current request.",
+    "A stale, active, policy-denied, unknown, task-ineligible, or exhausted rollover predecessor cannot create another request generation. A queue-full rollover attempt remains retryable and cannot fabricate a durable predecessor row.",
     "Notification failure, child-thread BaseException, or notifier-start failure leaves an observable retryable outbox entry and does not roll back an accepted lease fact.",
     "A closed coordinator rejects new manual drains and cannot ACK or retry durable notification state after handoff.",
     "A transient dispatcher timer-start failure is retried without losing an already armed later wake; exhausting the finite bound is explicitly observable.",
@@ -242,6 +246,7 @@
     "Property-test indexed candidates against a full exact scan with the assertion full_conflicts is a subset of indexed_candidates.",
     "Run real Coordinator positive readback and injected-negative OOPTDD receipts for no-overtaking.",
     "Crash-test queue insertion, grant, release-plus-promotion, cancellation, deadline, and notification cut points; verify omitted embedded default, explicit off, timeout-before-promotion, heartbeat independence from a blocked sweep, heartbeat retention through accepted-effect joins, worker-start rollback, terminal close/start linearization, context-manager resign, immediate weak-reference worker wakeup, actual server outbox deferral, CLI opt-out, and authority/outbox timer separation.",
+    "Use production Coordinator contract tests as the rollover verification authority: cover every supported non-policy terminal projection, within-retention exact operation replay, post-retention at-most-once fencing, envelope conflicts, stale orbit/generation/owner/bail epoch, owner-reclaim exclusion, task eligibility, signed-64 exhaustion, restart, concurrent N-to-N+1 attempts, and distinct per-generation decision/outbox identity while retaining ordinary non-policy terminal replay, policy-denial automatic retry, and queue-full fresh-ID behavior.",
     "Model-check bounded safety and liveness with conflicting partial orders and restart."
   ],
   "implementation_slices": [
@@ -251,6 +256,7 @@
     "M1d (implemented): persist state-changing semantic admission notifications and coordination dependencies transactionally; deliver them post-commit through lifecycle-gated, timer-start-fenced, claim-token-fenced, per-stream FIFO at-least-once replay without changing accepted lease facts.",
     "M2a-index (implemented): derive a conservative maximal-literal-prefix candidate trie from every complete authority snapshot, retain exact glob verification and full-scan fallback, and property/differential-test it against the full oracle.",
     "M2a-deadline (implemented): make embedded-runtime authority ticks lifecycle-safe by default with singleton heartbeat, retain explicit deterministic opt-out, keep server construction background-worker-free until its lifespan, keep CLI one-shot, and prove that notification timers do not create deadline transitions.",
+    "M2a-rollover (implemented): expose an explicit, fenced non-policy terminal rollover command that preserves the old OrbitRequest and creates at most one fresh monotonic request generation through the shared admission kernel. Operation receipts replay exactly within idem_ttl; the latest-predecessor fence prevents duplicate successor creation after retention GC without broadening ordinary non-policy claim replay, policy-denial retry, or queue-full rejection semantics.",
     "M2b: move all Git effects out of the authority transaction before reconsidering RLock or SQLite replacement."
   ],
   "falsifiers": [

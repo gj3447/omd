@@ -370,6 +370,16 @@
       "sha256": "69b0520200a01695",
       "layer": "infrastructure",
       "frege_sinn": "단일 관측 sink 실패도 coordination을 막지 않는 fail-soft 이벤트 방출 seam"
+    },
+    {
+      "sourceId": "core.Coordinator.rollover_claim",
+      "file": "omd_server/core.py",
+      "symbol": "rollover_claim",
+      "kind": "method",
+      "line_hint": 4122,
+      "sha256": "66ff733a211be2b1",
+      "layer": "domain-policy",
+      "frege_sinn": "최신 지원 비정책 종단 OrbitRequest를 orbit/owner/generation/bail epoch로 fencing한 뒤 immutable intent의 새 N+1 머신을 최대 한 번 생성; idem_ttl 내 receipt replay와 GC 후 latest-predecessor fence, 정책 DENIED/owner-reclaim/row-less overload 경계를 보존"
     }
   ]
 }

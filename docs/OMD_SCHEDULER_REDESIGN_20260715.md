@@ -375,8 +375,14 @@ Implemented fairness slice:
   `idempotency_conflict` without repeating the effect;
 - due PENDING requests take the semantic `WAIT_TIMEOUT` path before promotion
   during sweep and restart reconciliation;
-- policy-denial retry advances the durable request generation, while terminal
-  replay cannot create another generation-zero admission effect;
+- policy-denial retry advances the durable request generation, while ordinary
+  non-policy terminal replay cannot create another admission generation. Explicit
+  non-policy retry is a separate `rollover_claim` operation fenced by a distinct
+  operation ID and the exact latest predecessor orbit, owner, generation and
+  current bail epoch; it creates a new `N+1` machine rather than reopening a
+  final state. Owner-reclaim projections are excluded because reclaim retires
+  the owner. Exact operation receipt replay is retained for `idem_ttl`; after
+  GC, the latest-predecessor fence still prevents another successor;
 - split-phase Connect and barrier effects reserve the exact idempotency
   envelope until their unlocked phase completes or is safely cleared. A
   deterministically ordered DB- and repo-scoped process/file effect locks
@@ -412,8 +418,11 @@ The materialized M1 receipt is `arrived` evidence from one in-memory
 producer/readback backend. It explicitly records no separate oracle and awaits
 independent judgment; it is not promoted to `external_verdict`.
 
-Still open before full M1: explicit non-denial request-generation rollover, independent judgment and
-finalization. Candidate-index soundness is implemented as a transaction-local
+The explicit non-policy request-generation rollover runtime is implemented.
+Still open before a closed development cycle: a prospective M1-specific
+preregistration and identity-distinct judgment, plus protected-ref
+finalization. The existing materialized receipt remains execution evidence and
+cannot be retrospectively promoted. Candidate-index soundness is implemented as a transaction-local
 maximal-literal-prefix prefilter with exact verification, full-scan fallback and
 indexed/full property tests. It reduces exact glob comparisons but is neither
 persisted authority nor a sublinear database lookup. The existing Connect path now has process-tree effect fencing,

@@ -89,6 +89,17 @@ MERGE_TIMEOUT_S = 120.0
 # 옛 리더의 잔여 변이는 stale leader_epoch 로 차단). 권장: leader heartbeat 주기 = TTL/3.
 LEADER_TTL_S = 30.0
 
+# SQLite INTEGER and the persisted request-generation contract share the signed
+# 64-bit domain.  Refuse rollover at the boundary instead of surfacing a late
+# adapter OverflowError after authority work has begun.
+MAX_REQUEST_GENERATION = (1 << 63) - 1
+
+# ``claim`` has one private entry used only after ``rollover_claim`` has fenced
+# and authorized an exact terminal predecessor in the same authority
+# transaction.  A distinct token keeps the ordinary public claim surface from
+# silently becoming an automatic terminal-state retry API.
+_ROLLOVER_CLAIM_AUTHORITY = object()
+
 # Repository-authority PENDING rows are bounded by default.  This is an
 # operational default, not a value derived from the scheduler proof contract.
 
@@ -3637,7 +3648,20 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
 
     def claim(self, agent_id, pathspec, mode="write", *, ttl=600.0, task_id=None,
               reason="", priority=0, request_id=None, bail_epoch=None,
-              _observed_at=None):
+              _observed_at=None, _request_generation=None,
+              _rollover_authority=None, _cache_terminal_rejection=True):
+        authorized_rollover = _rollover_authority is _ROLLOVER_CLAIM_AUTHORITY
+        if not authorized_rollover and (
+            _request_generation is not None or not _cache_terminal_rejection
+        ):
+            raise TypeError("private rollover claim controls require authority")
+        if authorized_rollover and (
+            not isinstance(_request_generation, int)
+            or isinstance(_request_generation, bool)
+            or _request_generation < 1
+            or _request_generation > MAX_REQUEST_GENERATION
+        ):
+            raise RuntimeError("invalid authorized request generation")
         if not isinstance(agent_id, str) or not agent_id:
             return {"ok": False, "state": "REJECTED", "reason": "invalid_agent_id"}
         if request_id is not None and (
@@ -3706,9 +3730,23 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 self._emit("orbit_requested", agent_id, mode=mode, paths=pathspec, task=task_id)
                 # PENDING is not stored in the generic DONE cache, but its durable
                 # request identity still forbids a same-id/different-intent mutation.
-                request_generation = 0
+                request_generation = (
+                    _request_generation if authorized_rollover else 0
+                )
                 request_dup = self.store.latest_orbit_by_request(request_id)
-                if request_dup is not None:
+                if authorized_rollover:
+                    if request_dup is None:
+                        raise RuntimeError(
+                            "authorized rollover predecessor disappeared"
+                        )
+                    expected_generation = self.store.next_request_generation(
+                        request_id
+                    )
+                    if request_generation != expected_generation:
+                        raise RuntimeError(
+                            "authorized rollover generation lost authority"
+                        )
+                elif request_dup is not None:
                     same_request = (
                         request_dup["agent_id"] == agent_id
                         and request_dup["mode"] == mode
@@ -3734,6 +3772,16 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                         in ("ADMISSION_DENIED", "PROMOTION_DENIED")
                     )
                     if retryable_policy_denial:
+                        if int(request_dup["request_generation"] or 0) >= MAX_REQUEST_GENERATION:
+                            return cache.set({
+                                "ok": False,
+                                "state": "REJECTED",
+                                "reason": "request_generation_exhausted",
+                                "request_id": request_id,
+                                "request_generation": int(
+                                    request_dup["request_generation"] or 0
+                                ),
+                            })
                         # §3.C treats a policy denial as a retryable attempt.  The
                         # retry advances the durable generation so the same request
                         # id never creates two generation-zero effects.
@@ -3886,7 +3934,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                         # REJECTED is terminal for this request identity.  A later
                         # retry uses a fresh request id; exact retries replay this
                         # byte-equivalent receipt even if capacity has since freed.
-                        return cache.set_terminal(rejected)
+                        if _cache_terminal_rejection:
+                            return cache.set_terminal(rejected)
+                        return cache.set(rejected)
                     committed_seq = self.store.next_seq()
                     if committed_seq != queue_seq:
                         raise RuntimeError(
@@ -4068,6 +4118,255 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                                   "observed_at": decision.observed_at,
                                   "decision_id": payload["decision_id"],
                                   "bail_epoch": effective_bail_epoch})
+
+    def rollover_claim(self, prior_orbit_id, agent_id, expected_generation, *,
+                       bail_epoch, request_id):
+        """Start generation ``N+1`` from one exact non-policy terminal claim.
+
+        Ordinary non-policy terminal ``claim`` retries remain pure replay;
+        policy denial retains its existing automatic-generation retry rule.
+        This separate operation requires a distinct idempotency key and fences
+        the predecessor by orbit, owner, generation and current bail epoch
+        before copying its immutable intent into a fresh OrbitRequest machine.
+        Exact operation replay is retained for ``idem_ttl``; after that window
+        the latest-row
+        fence still prevents another generation from the same predecessor.
+        """
+        if not isinstance(prior_orbit_id, str) or not prior_orbit_id:
+            return {
+                "ok": False,
+                "state": "REJECTED",
+                "reason": "invalid_prior_orbit_id",
+            }
+        if not isinstance(agent_id, str) or not agent_id:
+            return {
+                "ok": False,
+                "state": "REJECTED",
+                "reason": "invalid_agent_id",
+            }
+        if (
+            not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+            or expected_generation > MAX_REQUEST_GENERATION
+        ):
+            return {
+                "ok": False,
+                "state": "REJECTED",
+                "reason": "invalid_request_generation",
+            }
+        if (
+            not isinstance(bail_epoch, int)
+            or isinstance(bail_epoch, bool)
+            or bail_epoch < 0
+        ):
+            return {
+                "ok": False,
+                "state": "REJECTED",
+                "reason": "invalid_bail_epoch",
+            }
+        if not isinstance(request_id, str) or not request_id:
+            return {
+                "ok": False,
+                "state": "REJECTED",
+                "reason": "invalid_request_id",
+            }
+
+        operation_args = [prior_orbit_id, expected_generation, bail_epoch]
+        supported_terminals = {
+            ("RELEASED", "RELEASE"),
+            ("EXPIRED", "LEASE_EXPIRED"),
+            ("DENIED", "CANCEL"),
+            ("DENIED", "WAIT_TIMEOUT"),
+        }
+        with self._cs():
+            predecessor = self.store.get_orbit(prior_orbit_id)
+            if predecessor is None:
+                return {
+                    "ok": False,
+                    "state": "REJECTED",
+                    "reason": "no such orbit",
+                    "prior_orbit_id": prior_orbit_id,
+                }
+            semantic_request_id = predecessor.get("request_id")
+            if request_id == semantic_request_id:
+                return {
+                    "ok": False,
+                    "state": "REJECTED",
+                    "reason": "rollover_request_id_must_be_distinct",
+                    "request_id": request_id,
+                }
+            with self._idem(
+                request_id,
+                agent_id,
+                "rollover_claim",
+                operation_args,
+            ) as cache:
+                if cache.hit:
+                    return cache.value
+
+                observed_at = self._sweep_inline()
+                predecessor = self.store.get_orbit(prior_orbit_id)
+                if predecessor is None or predecessor.get("kind") != "orbit":
+                    return cache.set({
+                        "ok": False,
+                        "state": "REJECTED",
+                        "reason": "no such orbit",
+                        "prior_orbit_id": prior_orbit_id,
+                    })
+                semantic_request_id = predecessor.get("request_id")
+                if not semantic_request_id:
+                    return cache.set({
+                        "ok": False,
+                        "state": "REJECTED",
+                        "reason": "rollover_requires_explicit_claim_id",
+                        "prior_orbit_id": prior_orbit_id,
+                    })
+                if predecessor["agent_id"] != agent_id:
+                    return cache.set({
+                        "ok": False,
+                        "state": "REJECTED",
+                        "reason": "not owner",
+                        "owner": predecessor["agent_id"],
+                        "fenced_out": True,
+                    })
+                actual_generation = int(
+                    predecessor.get("request_generation") or 0
+                )
+                if actual_generation != expected_generation:
+                    return cache.set({
+                        "ok": False,
+                        "state": "REJECTED",
+                        "reason": "stale request_generation",
+                        "current": actual_generation,
+                        "yours": expected_generation,
+                        "fenced_out": True,
+                    })
+                latest = self.store.latest_orbit_by_request(
+                    semantic_request_id
+                )
+                if latest is None or latest["orbit_id"] != prior_orbit_id:
+                    return cache.set({
+                        "ok": False,
+                        "state": "REJECTED",
+                        "reason": "stale rollover predecessor",
+                        "prior_orbit_id": prior_orbit_id,
+                        "latest_orbit_id": latest["orbit_id"] if latest else None,
+                        "fenced_out": True,
+                    })
+                terminal_identity = (
+                    predecessor["state"], predecessor.get("decision_type")
+                )
+                if terminal_identity not in supported_terminals:
+                    return cache.set({
+                        "ok": False,
+                        "state": "REJECTED",
+                        "reason": "rollover_predecessor_not_supported",
+                        "prior_state": predecessor["state"],
+                        "prior_decision_type": predecessor.get("decision_type"),
+                    })
+                if expected_generation >= MAX_REQUEST_GENERATION:
+                    return cache.set({
+                        "ok": False,
+                        "state": "REJECTED",
+                        "reason": "request_generation_exhausted",
+                        "request_generation": expected_generation,
+                    })
+                dead = self._check_alive(agent_id, bail_epoch)
+                if dead:
+                    return cache.set(dead)
+                agent = self.store.get_agent(agent_id)
+                if agent is not None and int(agent["bail_epoch"] or 0) != bail_epoch:
+                    return cache.set({
+                        "ok": False,
+                        "state": "REJECTED",
+                        "reason": "stale bail_epoch",
+                        "current": int(agent["bail_epoch"] or 0),
+                        "yours": bail_epoch,
+                        "fenced_out": True,
+                    })
+                task_id = predecessor.get("task_id")
+                if task_id is not None:
+                    task = self.store.get_task(task_id)
+                    if task is None:
+                        return cache.set({
+                            "ok": False,
+                            "state": "REJECTED",
+                            "reason": "no such task",
+                            "task_id": task_id,
+                        })
+                    if task["state"] not in TASK_ADMISSION_STATES:
+                        return cache.set({
+                            "ok": False,
+                            "state": "REJECTED",
+                            "reason": "task_not_admission_eligible",
+                            "task_id": task_id,
+                            "task_state": task["state"],
+                        })
+                next_generation = self.store.next_request_generation(
+                    semantic_request_id
+                )
+                if next_generation != expected_generation + 1:
+                    return cache.set({
+                        "ok": False,
+                        "state": "REJECTED",
+                        "reason": "stale rollover predecessor",
+                        "expected_next_generation": expected_generation + 1,
+                        "current_next_generation": next_generation,
+                        "fenced_out": True,
+                    })
+
+                # The generic claim cache is keyed by the semantic request id,
+                # not generation.  Remove the predecessor receipt only after all
+                # rollover guards pass; the durable Orbit row remains the replay
+                # authority for generation N.
+                self.store.clear_idem(semantic_request_id)
+                admission = self.claim(
+                    agent_id,
+                    json.loads(predecessor["pathspec"]),
+                    predecessor["mode"],
+                    ttl=float(predecessor["requested_ttl"] or 600.0),
+                    task_id=task_id,
+                    reason=predecessor.get("reason") or "",
+                    priority=int(predecessor.get("priority") or 0),
+                    request_id=semantic_request_id,
+                    bail_epoch=bail_epoch,
+                    _observed_at=observed_at,
+                    _request_generation=next_generation,
+                    _rollover_authority=_ROLLOVER_CLAIM_AUTHORITY,
+                    # REJECTED/QUEUE_FULL has no durable generation row.  Keep it
+                    # retryable and preserve the existing fresh-ID contract.
+                    _cache_terminal_rejection=False,
+                )
+                if (
+                    admission.get("state") == "REJECTED"
+                    or admission.get("ok") is False
+                ):
+                    return cache.set({
+                        "ok": False,
+                        "state": "REJECTED",
+                        "reason": "rollover_admission_rejected",
+                        "retry": bool(admission.get("retry")),
+                        "admission": admission,
+                        "prior_orbit_id": prior_orbit_id,
+                        "request_id": semantic_request_id,
+                        "operation_request_id": request_id,
+                    })
+                if admission.get("request_generation") != next_generation:
+                    raise RuntimeError(
+                        "rollover result did not bind the authorized generation"
+                    )
+                result = dict(admission)
+                result.update({
+                    "ok": True,
+                    "rollover": True,
+                    "prior_orbit_id": prior_orbit_id,
+                    "operation_request_id": request_id,
+                })
+                # The operation is complete even when the new admission machine
+                # is PENDING or reaches a policy DENIED state.  Exact retries of
+                # this operation must never create another generation.
+                return cache.set_terminal(result)
 
     def cancel_wait(self, orbit_id, agent_id, request_generation, *, bail_epoch,
                     request_id=None):

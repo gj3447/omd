@@ -142,6 +142,12 @@ def test_begin_forwards_full_onboarding_contract(spy, capsys):
              {"bail_epoch": 2, "request_id": "req-cancel-wait"}),
         ),
         (
+            ["rollover-claim", "orb-1", "worker", "4", "--bail-epoch", "2",
+             "--request-id", "req-rollover"],
+            ("rollover_claim", ("orb-1", "worker", 4),
+             {"bail_epoch": 2, "request_id": "req-rollover"}),
+        ),
+        (
             ["barrier-consume", "ready", "--agent", "worker", "--request-id", "req-b",
              "--bail-epoch", "6"],
             ("barrier_consume", ("ready", "worker"),
