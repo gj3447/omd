@@ -267,7 +267,7 @@
       "FAILED_PERMANENT with publication_outcome=not_landed": {"admission": "RELEASED", "connect": "VALIDATED with invalidated approval at the runtime layer; this L_IDE generation is closed", "task": "DONE and a fresh cycle generation is required"},
       "FAILED_PERMANENT with repair_required=true": {"admission": "HELD until repair authority supplies release/reclaim evidence", "connect": "NEEDS_REPAIR", "task": "CONNECTING fail-stop"},
       "SUSPEND_RELEASING": {"admission": "HELD until the bound release effect is acknowledged", "connect": "absent", "rule": "editing is stopped"},
-      "SUSPENDED": {"admission": "PENDING, RELEASED, LOST, or another authoritative non-HELD readback", "connect": "absent", "rule": "no editing until a fresh generation reacquires HELD"}
+      "SUSPENDED": {"lease_status": "pending, released, or lost; lost is an L_IDE discriminator, not an admission state", "admission": "PENDING or an authoritative FSM-valid non-HELD outcome such as RELEASED, EXPIRED, DENIED, CANCELLED, or TIMED_OUT; REJECTED may have no live row", "connect": "absent", "rule": "no editing until a fresh generation reacquires HELD"}
     },
     "identity_bindings": ["development_context_hash", "owner_agent", "bail_epoch", "coordinator_epoch", "authority_snapshot_hash", "fence_set_digest", "attempt_generation", "receipt_hash", "environment_digest", "candidate_commit_sha", "candidate_tree_sha", "publish_effect_id", "finalization_receipt_hash"],
     "rule": "The L_IDE loop never synthesizes runtime success. It consumes typed admission and connect receipts and projects their exact identities into its checkpoint and terminal outcome."

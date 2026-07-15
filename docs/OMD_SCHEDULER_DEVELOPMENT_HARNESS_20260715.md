@@ -278,7 +278,7 @@ A same-tree but wrong-commit readback is not success.
 | `LEASE_PENDING` | An `OrbitRequest` is `REQUESTED` or `PENDING`; edits are forbidden |
 | `LEASE_HELD` | The request is `HELD` with current owner, full fence set, bail epoch, expiry and write-set digest |
 | `SUSPEND_RELEASING` | Editing is stopped; admission remains `HELD` only until the bound release effect is acknowledged |
-| `SUSPENDED` | Admission is `PENDING`, `RELEASED`, `LOST`, or another authoritative non-`HELD` state; a fresh request and generation are required |
+| `SUSPENDED` | L_IDE `lease_status` is `pending`, `released`, or `lost`; `lost` is a local discriminator, not an admission state. Admission readback is `PENDING` or an authoritative FSM-valid non-`HELD` outcome such as `RELEASED`, `EXPIRED`, `DENIED`, `CANCELLED`, or `TIMED_OUT`; a fresh request and generation are required |
 | Cycle finalization | The edit lease is `RELEASED` or otherwise terminal and read back; a lease-only OMD task is canceled after release |
 
 Initial admission and later promotion must use the same compatibility,
