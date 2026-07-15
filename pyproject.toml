@@ -28,3 +28,8 @@ verify = "warn"     # 관측은 보고만(빌드 verdict를 뒤집지 않음)
 
 [tool.setuptools]
 packages = ["omd_server"]
+
+# Longinus audits installed wheels against their packaged Python sources.  Keep
+# the canonical manifest in docs/ while shipping it as an installation data file.
+[tool.setuptools.data-files]
+"share/omd/docs" = ["docs/longinus_bindings.json"]

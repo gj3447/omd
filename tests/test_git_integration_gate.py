@@ -13,6 +13,7 @@ from omd_server.gitio import (
     GitIntegrationCheckFailed,
     GitIntegrationCheckTimeout,
     GitIntegrationMutation,
+    GitIntegrationPreconditionError,
     GitRepo,
     GitRollbackError,
 )
@@ -77,6 +78,51 @@ def test_green_check_commits_candidate_merge_only_after_check(tmp_path: Path) ->
     assert _git(["rev-parse", "--abbrev-ref", "HEAD"], repo).stdout.strip() == "dev"
 
 
+@pytest.mark.parametrize("checked", [False, True])
+def test_merge_publication_cas_preserves_external_ref_winner(
+    tmp_path: Path, monkeypatch, checked: bool,
+) -> None:
+    git, repo, integration_wt, base = _fixture(tmp_path)
+    external_wt = tmp_path / "external-wt"
+    _git(["worktree", "add", "-b", "external", str(external_wt), "main"], repo)
+    (external_wt / "external.txt").write_text("external winner\n")
+    _git(["add", "external.txt"], external_wt)
+    _git(["commit", "-m", "external winner"], external_wt)
+    external_sha = _git(["rev-parse", "HEAD"], external_wt).stdout.strip()
+    original_git = git._git
+    injected = False
+
+    def race_before_cas(*args, **kwargs):
+        nonlocal injected
+        if not injected and args[:2] == ("update-ref", "refs/heads/main"):
+            injected = True
+            _git(["update-ref", "refs/heads/main", external_sha, base], repo)
+        return original_git(*args, **kwargs)
+
+    monkeypatch.setattr(git, "_git", race_before_cas)
+    options = (
+        {"check_argv": [sys.executable, "-c", "pass"], "check_timeout": 2}
+        if checked else {}
+    )
+    with pytest.raises(GitIntegrationPreconditionError, match="publication"):
+        git.merge_into(
+            str(integration_wt), "main", "feature", "must lose CAS",
+            expected_base=base, **options,
+        )
+
+    assert injected
+    assert _git(["rev-parse", "main"], repo).stdout.strip() == external_sha
+    assert (integration_wt / "external.txt").read_text() == "external winner\n"
+    assert not (integration_wt / "feature.txt").exists()
+    assert _git(
+        ["rev-parse", "-q", "--verify", "MERGE_HEAD"], integration_wt,
+        check=False,
+    ).returncode != 0
+    assert _git(
+        ["status", "--porcelain", "--untracked-files=no"], integration_wt
+    ).stdout.strip() == ""
+
+
 def test_red_check_exposes_bounded_output_and_does_not_commit(tmp_path: Path) -> None:
     git, _repo, integration_wt, base = _fixture(tmp_path)
     argv = [
@@ -96,6 +142,39 @@ def test_red_check_exposes_bounded_output_and_does_not_commit(tmp_path: Path) ->
     assert len(error.stdout.encode()) <= 80 and "truncated" in error.stdout
     assert len(error.stderr.encode()) <= 80 and "truncated" in error.stderr
     _assert_rolled_back(integration_wt, base)
+
+
+def test_red_check_rollback_never_clobbers_external_ref_winner(tmp_path: Path) -> None:
+    git, repo, integration_wt, base = _fixture(tmp_path)
+    external_wt = tmp_path / "external-red-wt"
+    _git(["worktree", "add", "-b", "external-red", str(external_wt), "main"], repo)
+    (external_wt / "external.txt").write_text("external red winner\n")
+    _git(["add", "external.txt"], external_wt)
+    _git(["commit", "-m", "external red winner"], external_wt)
+    external_sha = _git(["rev-parse", "HEAD"], external_wt).stdout.strip()
+    argv = [
+        sys.executable, "-c",
+        (
+            "import subprocess, sys; "
+            f"subprocess.run(['git','update-ref','refs/heads/main',"
+            f"'{external_sha}','{base}'], check=True); sys.exit(7)"
+        ),
+    ]
+
+    with pytest.raises(GitRollbackError) as caught:
+        git.merge_into(
+            str(integration_wt), "main", "feature", "red ref race",
+            check_argv=argv, check_timeout=2, expected_base=base,
+        )
+
+    assert isinstance(caught.value.cause, GitIntegrationCheckFailed)
+    assert _git(["rev-parse", "main"], repo).stdout.strip() == external_sha
+    assert (integration_wt / "external.txt").read_text() == "external red winner\n"
+    assert not (integration_wt / "feature.txt").exists()
+    assert _git(
+        ["rev-parse", "-q", "--verify", "MERGE_HEAD"], integration_wt,
+        check=False,
+    ).returncode != 0
 
 
 def test_timed_out_check_is_killed_and_candidate_is_aborted(tmp_path: Path) -> None:
@@ -203,3 +282,48 @@ def test_green_check_cannot_mutate_tracked_worktree_or_index(
         assert isinstance(caught.value.cause, GitIntegrationMutation)
         assert "tracked tree is not clean" in " ".join(caught.value.problems)
         assert _git(["rev-parse", "HEAD"], integration_wt).stdout.strip() == base
+
+
+@pytest.mark.parametrize("metadata", ["MERGE_HEAD", "MERGE_MSG"])
+def test_green_check_cannot_mutate_merge_metadata(
+    tmp_path: Path, metadata: str,
+) -> None:
+    git, repo, integration_wt, base = _fixture(tmp_path)
+    replacement = base if metadata == "MERGE_HEAD" else "forged message\n"
+    code = (
+        "from pathlib import Path; import subprocess; "
+        f"raw=subprocess.check_output(['git','rev-parse','--git-path',"
+        f"'{metadata}'], text=True).strip(); "
+        f"Path(raw).write_text({replacement!r})"
+    )
+
+    with pytest.raises(GitIntegrationMutation) as caught:
+        git.merge_into(
+            str(integration_wt), "main", "feature", "trusted merge message",
+            check_argv=[sys.executable, "-c", code], check_timeout=2,
+        )
+
+    assert metadata in " ".join(caught.value.mutations)
+    assert _git(["rev-parse", "main"], repo).stdout.strip() == base
+    _assert_rolled_back(integration_wt, base)
+
+
+def test_green_check_cannot_retarget_symbolic_head(tmp_path: Path) -> None:
+    git, repo, integration_wt, base = _fixture(tmp_path)
+    code = (
+        "import subprocess; "
+        "subprocess.run(['git','branch','checker-escape','HEAD'],check=True); "
+        "subprocess.run(['git','symbolic-ref','HEAD',"
+        "'refs/heads/checker-escape'],check=True)"
+    )
+
+    with pytest.raises(GitRollbackError) as caught:
+        git.merge_into(
+            str(integration_wt), "main", "feature", "trusted merge message",
+            check_argv=[sys.executable, "-c", code], check_timeout=2,
+        )
+
+    assert isinstance(caught.value.cause, GitIntegrationMutation)
+    assert "symbolic HEAD" in " ".join(caught.value.cause.mutations)
+    assert "symbolic HEAD" in " ".join(caught.value.problems)
+    assert _git(["rev-parse", "main"], repo).stdout.strip() == base

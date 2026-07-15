@@ -11,6 +11,7 @@
 """
 
 import os
+import sqlite3
 import subprocess
 import threading
 import time
@@ -166,10 +167,8 @@ def test_connect_fenced_out_on_bumped_fence(tmp_path):
     assert not (Path(omd.integration_worktree) / "a" / "x.py").exists()
 
 
-def test_connect_fenced_out_on_aba_fence_while_held(tmp_path):
-    """순수 ABA(P0-4): write-orbit가 여전히 HELD지만 fence가 captured와 다르면(=만료 후
-    재부여로 토큰이 바뀜) connect는 FENCED_OUT — 'state==HELD'만 보는 게 아니라 fence 동일성을
-    본다. (state!=HELD 베이직 검사로는 안 잡히는, fence-equality 가드의 이빨 확인.)"""
+def test_database_blocks_aba_fence_rewrite_while_held(tmp_path):
+    """R3에서는 granted fence 자체가 immutable provenance라 DB에서 ABA를 먼저 막는다."""
     repo = tmp_path / "repo"
     _init_repo(repo)
     omd = Coordinator(db_path=str(tmp_path / "omd.db"), repo=str(repo),
@@ -184,13 +183,9 @@ def test_connect_fenced_out_on_aba_fence_while_held(tmp_path):
     omd.commit("A", "feat: a/x")
     omd.finish("A")
 
-    # ABA: 궤도는 HELD인 채로 fence만 바뀜(만료→재부여가 같은 행을 재발급한 것처럼).
-    # captured_fence는 이제 낡았다 — basic state 검사는 통과하지만 fence-equality가 잡아야 한다.
-    with omd.store.tx():
-        omd.store.set_orbit(r["orbit_id"], state="HELD", fence=captured_fence + 100)
-
-    res = omd.connect("A", "agA", captured_fence)
-    assert res["ok"] is False and res.get("fenced_out"), res
+    with pytest.raises(sqlite3.IntegrityError, match="grant fence"):
+        with omd.store.tx():
+            omd.store.set_orbit(r["orbit_id"], state="HELD", fence=captured_fence + 100)
     assert not (Path(omd.integration_worktree) / "a" / "x.py").exists()  # merge 없음
 
 

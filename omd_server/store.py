@@ -13,10 +13,18 @@ Coordinator가 한 동사 안에서 sweep/_promote_pending을 같은 트랜잭�
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
+
+from ._const import LEGACY_ATTEMPT_OPENERS
+
+_LEGACY_ATTEMPT_OPENERS_SQL = ",".join(
+    "'" + opener.replace("'", "''") + "'"
+    for opener in sorted(LEGACY_ATTEMPT_OPENERS)
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -25,6 +33,16 @@ CREATE TABLE IF NOT EXISTS orbits (
   pathspec TEXT NOT NULL, mode TEXT NOT NULL, state TEXT NOT NULL,
   fence INTEGER, expires_at REAL, created_at REAL, released_at REAL, reason TEXT,
   priority INTEGER DEFAULT 0,
+  -- R3 attempt provenance v1. Legacy rows stay NULL: created_at/expires_at must not be
+  -- promoted into facts that the old coordinator never observed.
+  attempt_id TEXT,
+  requested_at REAL,
+  granted_at REAL,
+  requested_ttl REAL,
+  terminal_at REAL,                  -- coordinator observation time
+  terminal_effective_at REAL,        -- lease semantics time (expiry deadline or action time)
+  reclaimed_at REAL,
+  terminal_reason TEXT,
   -- 증분3(§4.1 LEASE 통합): orbit|merge_token. merge_token=repo-wide Semaphore(max=1, §D11).
   kind TEXT NOT NULL DEFAULT 'orbit',
   resource_key TEXT,                  -- merge_token이면 통합 레포 키(cloud_id 등)
@@ -38,11 +56,6 @@ CREATE TABLE IF NOT EXISTS orbits (
   read_gen INTEGER,
   stale INTEGER NOT NULL DEFAULT 0     -- 1=read-궤도가 낡음(겹치는 응결이 일어남). connect 차단.
 );
-CREATE INDEX IF NOT EXISTS idx_orbits_state ON orbits(state);
-CREATE INDEX IF NOT EXISTS idx_orbits_task ON orbits(task_id);
-CREATE INDEX IF NOT EXISTS idx_orbits_intent ON orbits(intent_key, state);
--- 발급된 fence는 단조·전역 유일(P0-2). 코드 회귀로 중복을 만들면 IntegrityError로 fail-closed.
-CREATE UNIQUE INDEX IF NOT EXISTS uq_orbits_fence ON orbits(fence) WHERE fence IS NOT NULL;
 CREATE TABLE IF NOT EXISTS tasks (
   task_id TEXT PRIMARY KEY, name TEXT, writes TEXT, reads TEXT, deps TEXT,
   state TEXT NOT NULL, agent_id TEXT, priority INTEGER, created_at REAL,
@@ -54,11 +67,71 @@ CREATE TABLE IF NOT EXISTS tasks (
   integration_base_sha TEXT,    -- Q11 후보 merge 전 통합 HEAD(rollback proof/recovery 기준)
   merge_sha TEXT,               -- 응결된 merge 커밋(MERGED 증거, P0-6: release 전에 기록)
   merged_at REAL,
+  -- Mutable projection only. Durable authority lives in task_attempts/connect_attempts.
+  attempt_id TEXT,
+  connect_attempt_id TEXT,
   -- 증분9(§D12): consumer 가 자기 read-set 을 마지막으로 통합과 동기화한 generation. claim(read)
   -- /read_refresh 시 현 integration_gen 으로 박힌다. connect 때 이 gen 이후의 merge 가 이 task 의
   -- 선언 reads 와 겹치면 = 유령 읽기(옛 base 위 빌드) → connect 거부. read-궤도 release 후에도
   -- 유지되므로(궤도 생명과 분리) read↔write 배타성을 안 깨고 코히런스를 추적한다.
   read_synced_gen INTEGER
+);
+-- R3: one immutable execution-generation header per task/agent ownership epoch.
+-- Lifecycle fields are single-assignment projections; connect retries never overwrite this row.
+CREATE TABLE IF NOT EXISTS task_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  attempt_ordinal INTEGER NOT NULL,
+  agent_id TEXT NOT NULL,
+  repo_id TEXT,
+  repo_root TEXT,
+  integration_branch TEXT,
+  writes TEXT NOT NULL,
+  shared TEXT NOT NULL,
+  opened_at REAL NOT NULL,
+  opened_by TEXT NOT NULL,
+  started_at REAL,
+  finished_at REAL,
+  finish_source TEXT,
+  finished_by TEXT,
+  worktree_base_sha TEXT,
+  branch TEXT,
+  terminal_at REAL,
+  terminal_state TEXT,
+  terminal_reason TEXT,
+  actor_trust TEXT NOT NULL DEFAULT 'SELF_ASSERTED',
+  UNIQUE(task_id, attempt_ordinal)
+);
+-- One row per admitted Phase-A try. A retry is a new row; tip/base/outcome history is retained.
+CREATE TABLE IF NOT EXISTS connect_attempts (
+  connect_attempt_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  connect_seq INTEGER NOT NULL,
+  token_id TEXT NOT NULL,
+  orbit_ids TEXT NOT NULL,
+  orbit_fences TEXT NOT NULL,
+  coordinator_epoch INTEGER,
+  trigger_kind TEXT NOT NULL DEFAULT 'DIRECT',
+  barrier_id TEXT,
+  barrier_generation INTEGER,
+  started_at REAL NOT NULL,
+  branch_tip_sha TEXT,
+  integration_base_sha TEXT,
+  -- Phase B prepares the exact commit object before its ref CAS, then seals this
+  -- attestation in SQLite.  Recovery trusts the durable OID, never a self-asserted
+  -- trailer/tree discovered only after a crash.
+  candidate_tree_sha TEXT,
+  candidate_commit_sha TEXT,
+  candidate_prepared_at REAL,
+  terminal_at REAL,
+  outcome TEXT,
+  outcome_code TEXT,
+  merge_sha TEXT,
+  merge_gen INTEGER,
+  resolution_source TEXT,
+  detail TEXT,
+  UNIQUE(attempt_id, connect_seq)
 );
 -- 증분9(§D12): 응결 로그 — gen 마다 통합에 추가/변경된 write-globs. consumer connect 가
 -- read_synced_gen 이후 merge 들 중 자기 reads 와 겹치는 게 있는지 본다(유령 읽기 판정).
@@ -131,7 +204,8 @@ CREATE TABLE IF NOT EXISTS barriers (
 -- (응결 trip 직전 재검증 기준 — ABA 차단). owner stale=참가자 사망 판정.
 CREATE TABLE IF NOT EXISTS barrier_parties (
   barrier_id TEXT, generation INTEGER, task_id TEXT, agent_id TEXT,
-  arrived INTEGER NOT NULL DEFAULT 0, arrive_fence INTEGER,
+  arrived INTEGER NOT NULL DEFAULT 0 CHECK(arrived IN (0,1)),
+  arrive_fence INTEGER, arrive_attempt_id TEXT,
   PRIMARY KEY(barrier_id, generation, task_id)
 );
 CREATE INDEX IF NOT EXISTS idx_barrier_parties_task ON barrier_parties(task_id);
@@ -171,7 +245,332 @@ _MIGRATIONS = [
     # P2 shared 레인: hot 공유파일 glob 선언(배타 writes 와 분리 — next_task 가 shared HELD
     # 와의 겹침은 허용, connect 응결은 3-way).
     ("tasks", "shared", "TEXT NOT NULL DEFAULT '[]'"),
+    # R3 attempt provenance v1. No historical backfill: absence is evidence of legacy
+    # incompleteness and the analyzer must keep it that way.
+    ("orbits", "attempt_id", "TEXT"),
+    ("orbits", "requested_at", "REAL"),
+    ("orbits", "granted_at", "REAL"),
+    ("orbits", "requested_ttl", "REAL"),
+    ("orbits", "terminal_at", "REAL"),
+    ("orbits", "terminal_effective_at", "REAL"),
+    ("orbits", "reclaimed_at", "REAL"),
+    ("orbits", "terminal_reason", "TEXT"),
+    ("tasks", "attempt_id", "TEXT"),
+    ("tasks", "connect_attempt_id", "TEXT"),
+    ("task_attempts", "finished_at", "REAL"),
+    ("task_attempts", "finish_source", "TEXT"),
+    ("task_attempts", "finished_by", "TEXT"),
+    # Existing connect rows predate these observations.  NULL is evidence of
+    # legacy incompleteness; never synthesize DIRECT/empty-fence provenance.
+    ("connect_attempts", "orbit_fences", "TEXT"),
+    ("connect_attempts", "trigger_kind", "TEXT"),
+    ("connect_attempts", "barrier_id", "TEXT"),
+    ("connect_attempts", "barrier_generation", "INTEGER"),
+    ("connect_attempts", "candidate_tree_sha", "TEXT"),
+    ("connect_attempts", "candidate_commit_sha", "TEXT"),
+    ("connect_attempts", "candidate_prepared_at", "REAL"),
+    ("barrier_parties", "arrive_attempt_id", "TEXT"),
 ]
+
+
+# These objects reference migrated columns, so they are deliberately created only
+# after _migrate(). This also lets a genuinely old DB (without intent_key) boot.
+_POST_MIGRATION_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_orbits_state ON orbits(state)",
+    "CREATE INDEX IF NOT EXISTS idx_orbits_task ON orbits(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_orbits_intent ON orbits(intent_key, state)",
+    "CREATE INDEX IF NOT EXISTS idx_orbits_attempt ON orbits(attempt_id, state)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_orbits_fence ON orbits(fence) "
+    "WHERE fence IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_attempts_active "
+    "ON task_attempts(task_id,agent_id,terminal_at)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_attempts_one_active_task "
+    "ON task_attempts(task_id) WHERE terminal_at IS NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_connect_one_active_attempt "
+    "ON connect_attempts(attempt_id) WHERE terminal_at IS NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_connect_token "
+    "ON connect_attempts(token_id)",
+    "CREATE INDEX IF NOT EXISTS idx_connect_attempts_attempt "
+    "ON connect_attempts(attempt_id,connect_seq)",
+    "DROP TRIGGER IF EXISTS task_attempt_identity_immutable",
+    "DROP TRIGGER IF EXISTS task_attempt_no_delete",
+    "DROP TRIGGER IF EXISTS task_attempt_no_replace",
+    "DROP TRIGGER IF EXISTS task_attempt_parent_valid",
+    "DROP TRIGGER IF EXISTS task_attempt_start_immutable",
+    "DROP TRIGGER IF EXISTS task_attempt_finish_immutable",
+    "DROP TRIGGER IF EXISTS task_attempt_terminal_immutable",
+    "DROP TRIGGER IF EXISTS connect_attempt_identity_immutable",
+    "DROP TRIGGER IF EXISTS connect_attempt_no_delete",
+    "DROP TRIGGER IF EXISTS connect_attempt_no_replace",
+    "DROP TRIGGER IF EXISTS connect_attempt_parent_valid",
+    "DROP TRIGGER IF EXISTS connect_attempt_candidate_shape_insert",
+    "DROP TRIGGER IF EXISTS connect_attempt_candidate_single_assignment",
+    "DROP TRIGGER IF EXISTS connect_attempt_terminal_immutable",
+    "DROP TRIGGER IF EXISTS orbit_identity_immutable",
+    "DROP TRIGGER IF EXISTS orbit_fence_immutable",
+    "DROP TRIGGER IF EXISTS orbit_grant_immutable",
+    "DROP TRIGGER IF EXISTS orbit_terminal_immutable",
+    "DROP TRIGGER IF EXISTS orbit_attempt_valid",
+    "DROP TRIGGER IF EXISTS task_attempt_pointer_valid",
+    "DROP TRIGGER IF EXISTS task_connect_pointer_valid",
+    "DROP TRIGGER IF EXISTS barrier_party_identity_immutable",
+    "DROP TRIGGER IF EXISTS barrier_party_no_replace",
+    "DROP TRIGGER IF EXISTS barrier_party_arrived_domain_insert",
+    "DROP TRIGGER IF EXISTS barrier_party_arrived_domain",
+    "DROP TRIGGER IF EXISTS barrier_party_insert_valid",
+    "DROP TRIGGER IF EXISTS barrier_party_arrival_immutable",
+    "DROP TRIGGER IF EXISTS barrier_party_arrival_valid",
+    """CREATE TRIGGER IF NOT EXISTS task_attempt_identity_immutable
+       BEFORE UPDATE OF attempt_id,task_id,attempt_ordinal,agent_id,repo_id,repo_root,
+                        integration_branch,writes,shared,opened_at,opened_by,actor_trust
+       ON task_attempts
+       BEGIN SELECT RAISE(ABORT, 'task_attempt identity is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS task_attempt_no_delete
+       BEFORE DELETE ON task_attempts
+       BEGIN SELECT RAISE(ABORT, 'task_attempt is append-preserved'); END""",
+    """CREATE TRIGGER IF NOT EXISTS task_attempt_no_replace
+       BEFORE INSERT ON task_attempts
+       WHEN EXISTS(SELECT 1 FROM task_attempts WHERE attempt_id=NEW.attempt_id)
+       BEGIN SELECT RAISE(ABORT, 'task_attempt replacement is forbidden'); END""",
+    """CREATE TRIGGER IF NOT EXISTS task_attempt_parent_valid
+       BEFORE INSERT ON task_attempts
+       WHEN NOT EXISTS(SELECT 1 FROM tasks WHERE task_id=NEW.task_id)
+       BEGIN SELECT RAISE(ABORT, 'task_attempt task identity is invalid'); END""",
+    """CREATE TRIGGER IF NOT EXISTS task_attempt_start_immutable
+       BEFORE UPDATE OF started_at,branch,worktree_base_sha ON task_attempts
+       WHEN OLD.started_at IS NOT NULL AND
+            (NEW.started_at IS NOT OLD.started_at OR NEW.branch IS NOT OLD.branch OR
+             NEW.worktree_base_sha IS NOT OLD.worktree_base_sha)
+       BEGIN SELECT RAISE(ABORT, 'task_attempt start is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS task_attempt_finish_immutable
+       BEFORE UPDATE OF finished_at,finish_source,finished_by ON task_attempts
+       WHEN OLD.finished_at IS NOT NULL AND
+            (NEW.finished_at IS NOT OLD.finished_at OR
+             NEW.finish_source IS NOT OLD.finish_source OR
+             NEW.finished_by IS NOT OLD.finished_by)
+       BEGIN SELECT RAISE(ABORT, 'task_attempt finish is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS task_attempt_terminal_immutable
+       BEFORE UPDATE OF started_at,branch,worktree_base_sha,finished_at,finish_source,
+                        finished_by,terminal_at,terminal_state,terminal_reason
+       ON task_attempts
+       WHEN OLD.terminal_at IS NOT NULL AND
+            (NEW.started_at IS NOT OLD.started_at OR NEW.branch IS NOT OLD.branch OR
+             NEW.worktree_base_sha IS NOT OLD.worktree_base_sha OR
+             NEW.finished_at IS NOT OLD.finished_at OR
+             NEW.finish_source IS NOT OLD.finish_source OR
+             NEW.finished_by IS NOT OLD.finished_by OR
+             NEW.terminal_at IS NOT OLD.terminal_at OR
+             NEW.terminal_state IS NOT OLD.terminal_state OR
+             NEW.terminal_reason IS NOT OLD.terminal_reason)
+       BEGIN SELECT RAISE(ABORT, 'task_attempt terminal facts are immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS connect_attempt_identity_immutable
+       BEFORE UPDATE OF connect_attempt_id,attempt_id,task_id,connect_seq,token_id,
+                        orbit_ids,orbit_fences,coordinator_epoch,trigger_kind,barrier_id,
+                        barrier_generation,started_at,branch_tip_sha,integration_base_sha
+       ON connect_attempts
+       BEGIN SELECT RAISE(ABORT, 'connect_attempt identity is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS connect_attempt_no_delete
+       BEFORE DELETE ON connect_attempts
+       BEGIN SELECT RAISE(ABORT, 'connect_attempt is append-preserved'); END""",
+    """CREATE TRIGGER IF NOT EXISTS connect_attempt_no_replace
+       BEFORE INSERT ON connect_attempts
+       WHEN EXISTS(SELECT 1 FROM connect_attempts
+                   WHERE connect_attempt_id=NEW.connect_attempt_id)
+       BEGIN SELECT RAISE(ABORT, 'connect_attempt replacement is forbidden'); END""",
+    """CREATE TRIGGER IF NOT EXISTS connect_attempt_parent_valid
+       BEFORE INSERT ON connect_attempts
+       WHEN NOT EXISTS(
+              SELECT 1 FROM task_attempts
+              WHERE attempt_id=NEW.attempt_id AND task_id=NEW.task_id
+                    AND terminal_at IS NULL
+            ) OR NOT EXISTS(
+              SELECT 1 FROM orbits
+              WHERE orbit_id=NEW.token_id AND kind='merge_token' AND state='HELD'
+            )
+       BEGIN SELECT RAISE(ABORT, 'connect_attempt parent identity is invalid'); END""",
+    """CREATE TRIGGER IF NOT EXISTS connect_attempt_candidate_shape_insert
+       BEFORE INSERT ON connect_attempts
+       WHEN (NEW.candidate_tree_sha IS NULL) !=
+            (NEW.candidate_commit_sha IS NULL)
+            OR (NEW.candidate_tree_sha IS NULL) !=
+               (NEW.candidate_prepared_at IS NULL)
+       BEGIN SELECT RAISE(ABORT, 'connect candidate attestation must be complete'); END""",
+    """CREATE TRIGGER IF NOT EXISTS connect_attempt_candidate_single_assignment
+       BEFORE UPDATE OF candidate_tree_sha,candidate_commit_sha,candidate_prepared_at
+       ON connect_attempts
+       WHEN OLD.candidate_tree_sha IS NOT NULL
+            OR OLD.candidate_commit_sha IS NOT NULL
+            OR OLD.candidate_prepared_at IS NOT NULL
+            OR NEW.candidate_tree_sha IS NULL
+            OR NEW.candidate_commit_sha IS NULL
+            OR NEW.candidate_prepared_at IS NULL
+            OR OLD.terminal_at IS NOT NULL
+       BEGIN SELECT RAISE(ABORT, 'connect candidate attestation is single-assignment'); END""",
+    """CREATE TRIGGER IF NOT EXISTS connect_attempt_terminal_immutable
+       BEFORE UPDATE OF terminal_at,outcome,outcome_code,merge_sha,merge_gen,
+                        resolution_source,detail ON connect_attempts
+       WHEN OLD.terminal_at IS NOT NULL AND
+            (NEW.terminal_at IS NOT OLD.terminal_at OR NEW.outcome IS NOT OLD.outcome OR
+             NEW.outcome_code IS NOT OLD.outcome_code OR
+             NEW.merge_sha IS NOT OLD.merge_sha OR NEW.merge_gen IS NOT OLD.merge_gen OR
+             NEW.resolution_source IS NOT OLD.resolution_source OR
+             NEW.detail IS NOT OLD.detail)
+       BEGIN SELECT RAISE(ABORT, 'connect_attempt terminal facts are immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS orbit_identity_immutable
+       BEFORE UPDATE OF orbit_id,task_id,agent_id,pathspec,mode,kind,attempt_id,
+                        requested_at,requested_ttl ON orbits
+       BEGIN SELECT RAISE(ABORT, 'orbit provenance identity is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS orbit_fence_immutable
+       BEFORE UPDATE OF fence ON orbits
+       WHEN OLD.fence IS NOT NULL AND NEW.fence IS NOT OLD.fence
+       BEGIN SELECT RAISE(ABORT, 'orbit grant fence is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS orbit_grant_immutable
+       BEFORE UPDATE OF granted_at ON orbits
+       WHEN OLD.granted_at IS NOT NULL AND NEW.granted_at IS NOT OLD.granted_at
+       BEGIN SELECT RAISE(ABORT, 'orbit grant is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS orbit_terminal_immutable
+       BEFORE UPDATE OF state,expires_at,released_at,terminal_at,terminal_effective_at,
+                        reclaimed_at,terminal_reason
+       ON orbits
+       WHEN OLD.terminal_at IS NOT NULL AND
+            (NEW.state IS NOT OLD.state OR NEW.expires_at IS NOT OLD.expires_at OR
+             NEW.released_at IS NOT OLD.released_at OR
+             NEW.terminal_at IS NOT OLD.terminal_at OR
+             NEW.terminal_effective_at IS NOT OLD.terminal_effective_at OR
+             NEW.reclaimed_at IS NOT OLD.reclaimed_at OR
+             NEW.terminal_reason IS NOT OLD.terminal_reason)
+       BEGIN SELECT RAISE(ABORT, 'orbit terminal facts are immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS orbit_attempt_valid
+       BEFORE INSERT ON orbits
+       WHEN NEW.attempt_id IS NOT NULL AND NOT EXISTS(
+         SELECT 1 FROM task_attempts
+         WHERE attempt_id=NEW.attempt_id AND task_id=NEW.task_id
+               AND agent_id=NEW.agent_id AND terminal_at IS NULL
+       )
+       BEGIN SELECT RAISE(ABORT, 'orbit attempt identity is invalid'); END""",
+    """CREATE TRIGGER IF NOT EXISTS task_attempt_pointer_valid
+       BEFORE UPDATE OF attempt_id ON tasks
+       WHEN NEW.attempt_id IS NOT NULL AND NOT EXISTS(
+         SELECT 1 FROM task_attempts
+         WHERE attempt_id=NEW.attempt_id AND task_id=NEW.task_id
+       )
+       BEGIN SELECT RAISE(ABORT, 'task attempt pointer is invalid'); END""",
+    """CREATE TRIGGER IF NOT EXISTS task_connect_pointer_valid
+       BEFORE UPDATE OF connect_attempt_id ON tasks
+       WHEN NEW.connect_attempt_id IS NOT NULL AND NOT EXISTS(
+         SELECT 1 FROM connect_attempts
+         WHERE connect_attempt_id=NEW.connect_attempt_id AND task_id=NEW.task_id
+               AND attempt_id=NEW.attempt_id
+       )
+       BEGIN SELECT RAISE(ABORT, 'task connect pointer is invalid'); END""",
+    """CREATE TRIGGER IF NOT EXISTS barrier_party_identity_immutable
+       BEFORE UPDATE OF barrier_id,generation,task_id ON barrier_parties
+       BEGIN SELECT RAISE(ABORT, 'barrier party identity is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS barrier_party_no_replace
+       BEFORE INSERT ON barrier_parties
+       WHEN EXISTS(
+         SELECT 1 FROM barrier_parties
+         WHERE barrier_id=NEW.barrier_id AND generation=NEW.generation
+               AND task_id=NEW.task_id
+       )
+       BEGIN SELECT RAISE(ABORT, 'barrier party replacement is forbidden'); END""",
+    """CREATE TRIGGER IF NOT EXISTS barrier_party_arrived_domain_insert
+       BEFORE INSERT ON barrier_parties
+       WHEN NEW.arrived NOT IN (0,1)
+       BEGIN SELECT RAISE(ABORT, 'barrier arrived must be 0 or 1'); END""",
+    """CREATE TRIGGER IF NOT EXISTS barrier_party_arrived_domain
+       BEFORE UPDATE OF arrived ON barrier_parties
+       WHEN NEW.arrived NOT IN (0,1)
+       BEGIN SELECT RAISE(ABORT, 'barrier arrived must be 0 or 1'); END""",
+    f"""CREATE TRIGGER IF NOT EXISTS barrier_party_insert_valid
+       BEFORE INSERT ON barrier_parties
+       WHEN NEW.arrived=1 AND (
+         NEW.arrive_fence IS NULL OR NEW.agent_id IS NULL OR
+         NOT EXISTS(
+           SELECT 1 FROM orbits
+           WHERE task_id=NEW.task_id AND agent_id=NEW.agent_id
+                 AND state='HELD' AND mode IN ('write','shared')
+                 AND fence=NEW.arrive_fence
+                 AND (
+                   (NEW.arrive_attempt_id IS NULL AND attempt_id IS NULL) OR
+                   attempt_id=NEW.arrive_attempt_id OR
+                   (
+                     attempt_id IS NULL AND NEW.arrive_attempt_id IS NOT NULL AND
+                     EXISTS(
+                       SELECT 1 FROM task_attempts AS adapter
+                       WHERE adapter.attempt_id=NEW.arrive_attempt_id
+                             AND adapter.task_id=NEW.task_id
+                             AND adapter.agent_id=NEW.agent_id
+                             AND adapter.terminal_at IS NULL
+                             AND adapter.opened_by IN ({_LEGACY_ATTEMPT_OPENERS_SQL})
+                     )
+                   )
+                 )
+         ) OR
+         (
+           NEW.arrive_attempt_id IS NULL AND EXISTS(
+             SELECT 1 FROM task_attempts WHERE task_id=NEW.task_id
+           )
+         ) OR
+         (
+           NEW.arrive_attempt_id IS NOT NULL AND NOT EXISTS(
+             SELECT 1 FROM task_attempts
+             WHERE attempt_id=NEW.arrive_attempt_id AND task_id=NEW.task_id
+                   AND agent_id=NEW.agent_id AND terminal_at IS NULL
+           )
+         )
+       )
+       BEGIN SELECT RAISE(ABORT, 'barrier arrival provenance is invalid'); END""",
+    """CREATE TRIGGER IF NOT EXISTS barrier_party_arrival_immutable
+       BEFORE UPDATE OF arrived,arrive_fence,arrive_attempt_id,agent_id
+       ON barrier_parties
+       WHEN OLD.arrived=1 AND
+            (NEW.arrived IS NOT OLD.arrived OR
+             NEW.arrive_fence IS NOT OLD.arrive_fence OR
+             NEW.arrive_attempt_id IS NOT OLD.arrive_attempt_id OR
+             NEW.agent_id IS NOT OLD.agent_id)
+       BEGIN SELECT RAISE(ABORT, 'barrier arrival is single-assignment'); END""",
+    f"""CREATE TRIGGER IF NOT EXISTS barrier_party_arrival_valid
+       BEFORE UPDATE OF arrived,arrive_fence,arrive_attempt_id,agent_id
+       ON barrier_parties
+       WHEN OLD.arrived=0 AND NEW.arrived=1 AND (
+         NEW.arrive_fence IS NULL OR NEW.agent_id IS NULL OR
+         NOT EXISTS(
+           SELECT 1 FROM orbits
+           WHERE task_id=NEW.task_id AND agent_id=NEW.agent_id
+                 AND state='HELD' AND mode IN ('write','shared')
+                 AND fence=NEW.arrive_fence
+                 AND (
+                   (NEW.arrive_attempt_id IS NULL AND attempt_id IS NULL) OR
+                   attempt_id=NEW.arrive_attempt_id OR
+                   (
+                     attempt_id IS NULL AND NEW.arrive_attempt_id IS NOT NULL AND
+                     EXISTS(
+                       SELECT 1 FROM task_attempts AS adapter
+                       WHERE adapter.attempt_id=NEW.arrive_attempt_id
+                             AND adapter.task_id=NEW.task_id
+                             AND adapter.agent_id=NEW.agent_id
+                             AND adapter.terminal_at IS NULL
+                             AND adapter.opened_by IN ({_LEGACY_ATTEMPT_OPENERS_SQL})
+                     )
+                   )
+                 )
+         ) OR
+         (
+           NEW.arrive_attempt_id IS NULL AND EXISTS(
+             SELECT 1 FROM task_attempts WHERE task_id=NEW.task_id
+           )
+         ) OR
+         (
+           NEW.arrive_attempt_id IS NOT NULL AND NOT EXISTS(
+             SELECT 1 FROM task_attempts
+             WHERE attempt_id=NEW.arrive_attempt_id AND task_id=NEW.task_id
+                   AND agent_id=NEW.agent_id AND terminal_at IS NULL
+           )
+         )
+       )
+       BEGIN SELECT RAISE(ABORT, 'barrier arrival provenance is invalid'); END""",
+)
 
 
 def _row(c) -> dict | None:
@@ -194,10 +593,31 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.execute("PRAGMA foreign_keys=ON")
+        self.db.execute("PRAGMA recursive_triggers=ON")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(_SCHEMA)
-        self._migrate()
         self._txn_depth = 0
+        # Column discovery + ALTER must be one cross-process writer transaction.
+        # A second stdio coordinator waits at BEGIN IMMEDIATE, then observes the
+        # completed schema instead of racing the same ALTER TABLE.
+        with self.tx():
+            self._migrate()
+            duplicate_attempts = self.db.execute(
+                "SELECT task_id,COUNT(*) AS n FROM task_attempts "
+                "WHERE terminal_at IS NULL GROUP BY task_id HAVING COUNT(*)>1"
+            ).fetchall()
+            duplicate_connects = self.db.execute(
+                "SELECT attempt_id,COUNT(*) AS n FROM connect_attempts "
+                "WHERE terminal_at IS NULL GROUP BY attempt_id HAVING COUNT(*)>1"
+            ).fetchall()
+            if duplicate_attempts or duplicate_connects:
+                raise RuntimeError(
+                    "provenance migration requires resolving duplicate active rows: "
+                    f"attempts={[(r['task_id'], r['n']) for r in duplicate_attempts]}, "
+                    f"connects={[(r['attempt_id'], r['n']) for r in duplicate_connects]}"
+                )
+            for statement in _POST_MIGRATION_SQL:
+                self.db.execute(statement)
 
     def _migrate(self):
         """멱등 컬럼 추가(증분3) — 기존 DB도 안전하게 신규 컬럼을 얻는다(fresh-DB 친화)."""
@@ -322,16 +742,24 @@ class Store:
     def add_orbit(self, *, task_id, agent_id, pathspec, mode, state,
                   fence=None, expires_at=None, reason="", priority=0,
                   kind="orbit", resource_key=None, intent_key=None,
-                  read_gen=None) -> str:
+                  read_gen=None, attempt_id=None, requested_ttl=None) -> str:
         oid = "orb-" + uuid.uuid4().hex[:12]
+        now = time.time()
+        # A task label without a declared task/attempt is legacy-compatible
+        # unbound demand, not an execution generation.  Do not manufacture
+        # native provenance for it; v3 readers classify it outside the field cohort.
+        native_provenance = kind == "orbit" and (attempt_id is not None or task_id is None)
+        requested_at = now if native_provenance else None
+        granted_at = now if native_provenance and state == "HELD" else None
         self.db.execute(
             "INSERT INTO orbits(orbit_id,task_id,agent_id,pathspec,mode,state,"
             "fence,expires_at,created_at,reason,priority,kind,resource_key,intent_key,"
-            "read_gen) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "read_gen,attempt_id,requested_at,granted_at,requested_ttl) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (oid, task_id, agent_id, json.dumps(pathspec), mode, state,
-             fence, expires_at, time.time(), reason, priority, kind, resource_key,
-             intent_key, read_gen))
+             fence, expires_at, now, reason, priority, kind, resource_key,
+             intent_key, read_gen, attempt_id, requested_at, granted_at,
+             requested_ttl if native_provenance else None))
         return oid
 
     def orbit_by_intent(self, intent_key) -> dict | None:
@@ -346,7 +774,12 @@ class Store:
 
     def set_orbit(self, oid, *, state=..., expires_at=..., released_at=..., fence=...,
                   merging=..., merge_deadline=..., merge_started_mono=...,
-                  read_gen=..., stale=...):
+                  read_gen=..., stale=..., terminal_reason=..., reclaimed=False,
+                  transition_at=None, terminal_effective_at=...):
+        current = self.get_orbit(oid)
+        if current is None:
+            return
+        transition_at = time.time() if transition_at is None else transition_at
         sets, args = [], []
         for col, val in (("state", state), ("expires_at", expires_at),
                          ("released_at", released_at), ("fence", fence),
@@ -355,6 +788,16 @@ class Store:
                          ("read_gen", read_gen), ("stale", stale)):
             if val is not ...:
                 sets.append(f"{col}=?"); args.append(val)
+        if state is not ... and state != current["state"]:
+            if state == "HELD" and current["granted_at"] is None:
+                sets.append("granted_at=?"); args.append(transition_at)
+            if state in ("RELEASED", "EXPIRED", "DENIED") and current["terminal_at"] is None:
+                effective = transition_at if terminal_effective_at is ... else terminal_effective_at
+                reason = state.lower() if terminal_reason is ... else terminal_reason
+                sets.extend(("terminal_at=?", "terminal_effective_at=?", "terminal_reason=?"))
+                args.extend((transition_at, effective, reason))
+                if reclaimed and current["reclaimed_at"] is None:
+                    sets.append("reclaimed_at=?"); args.append(transition_at)
         if not sets:
             return
         args.append(oid)
@@ -374,6 +817,17 @@ class Store:
     def orbits_for_task(self, task_id) -> list[dict]:
         return _rows(self.db.execute(
             "SELECT * FROM orbits WHERE task_id=? AND kind='orbit'", (task_id,)))
+
+    def orbits_for_attempt(self, attempt_id) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE attempt_id=? AND kind='orbit' "
+            "ORDER BY created_at,orbit_id", (attempt_id,)))
+
+    def live_orbits_for_attempt(self, attempt_id) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE attempt_id=? AND kind='orbit' "
+            "AND state IN ('HELD','PENDING') ORDER BY created_at,orbit_id",
+            (attempt_id,)))
 
     def due_orbits(self, now) -> list[dict]:
         # merging=1(connect Phase B pin) 궤도는 만료 sweep에서 skip(§E). merge_token 도 제외.
@@ -398,7 +852,7 @@ class Store:
     def set_task(self, task_id, *, state=..., agent_id=..., worktree=..., branch=...,
                  connect_fence=..., connect_intent_at=..., branch_tip_sha=...,
                  integration_base_sha=..., merge_sha=..., merged_at=...,
-                 read_synced_gen=...):
+                 read_synced_gen=..., attempt_id=..., connect_attempt_id=...):
         sets, args = [], []
         for col, val in (("state", state), ("agent_id", agent_id),
                          ("worktree", worktree), ("branch", branch),
@@ -407,13 +861,272 @@ class Store:
                          ("branch_tip_sha", branch_tip_sha),
                          ("integration_base_sha", integration_base_sha),
                          ("merge_sha", merge_sha), ("merged_at", merged_at),
-                         ("read_synced_gen", read_synced_gen)):
+                         ("read_synced_gen", read_synced_gen),
+                         ("attempt_id", attempt_id),
+                         ("connect_attempt_id", connect_attempt_id)):
             if val is not ...:
                 sets.append(f"{col}=?"); args.append(val)
         if not sets:
             return
         args.append(task_id)
         self.db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE task_id=?", args)
+
+    # --- R3 task/connect attempt provenance ---
+    def add_attempt(self, *, task_id, agent_id, writes, shared, opened_by,
+                    repo_id=None, repo_root=None, integration_branch=None,
+                    opened_at=None) -> str:
+        opened_at = time.time() if opened_at is None else opened_at
+        ordinal = int(self.db.execute(
+            "SELECT COALESCE(MAX(attempt_ordinal),0)+1 FROM task_attempts WHERE task_id=?",
+            (task_id,),
+        ).fetchone()[0])
+        attempt_id = "att-" + uuid.uuid4().hex
+        self.db.execute(
+            "INSERT INTO task_attempts(attempt_id,task_id,attempt_ordinal,agent_id,repo_id,"
+            "repo_root,integration_branch,writes,shared,opened_at,opened_by) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (attempt_id, task_id, ordinal, agent_id, repo_id, repo_root,
+             integration_branch, json.dumps(writes), json.dumps(shared), opened_at,
+             opened_by),
+        )
+        return attempt_id
+
+    def get_attempt(self, attempt_id) -> dict | None:
+        return _row(self.db.execute(
+            "SELECT * FROM task_attempts WHERE attempt_id=?", (attempt_id,)))
+
+    def active_attempt(self, task_id, agent_id=None) -> dict | None:
+        if agent_id is None:
+            return _row(self.db.execute(
+                "SELECT * FROM task_attempts WHERE task_id=? AND terminal_at IS NULL "
+                "ORDER BY attempt_ordinal DESC LIMIT 1", (task_id,)))
+        return _row(self.db.execute(
+            "SELECT * FROM task_attempts WHERE task_id=? AND agent_id=? "
+            "AND terminal_at IS NULL ORDER BY attempt_ordinal DESC LIMIT 1",
+            (task_id, agent_id)))
+
+    def active_attempts_for_task(self, task_id) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM task_attempts WHERE task_id=? AND terminal_at IS NULL "
+            "ORDER BY attempt_ordinal", (task_id,)))
+
+    def attempts_for_task(self, task_id) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM task_attempts WHERE task_id=? ORDER BY attempt_ordinal",
+            (task_id,)))
+
+    def active_attempts_for_agent(self, agent_id) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM task_attempts WHERE agent_id=? AND terminal_at IS NULL "
+            "ORDER BY task_id,attempt_ordinal", (agent_id,)))
+
+    def start_attempt(self, attempt_id, *, branch=None, worktree_base_sha=None,
+                      started_at=None) -> bool:
+        started_at = time.time() if started_at is None else started_at
+        cur = self.db.execute(
+            "UPDATE task_attempts SET started_at=?,branch=?,worktree_base_sha=? "
+            "WHERE attempt_id=? AND started_at IS NULL AND terminal_at IS NULL",
+            (started_at, branch, worktree_base_sha, attempt_id),
+        )
+        if cur.rowcount == 0:
+            row = self.get_attempt(attempt_id)
+            if row is None:
+                raise KeyError(attempt_id)
+            if row["terminal_at"] is not None:
+                raise RuntimeError("cannot start a terminal task attempt")
+            if (row["branch"], row["worktree_base_sha"]) != (
+                branch,
+                worktree_base_sha,
+            ):
+                raise RuntimeError("task attempt was already started with other facts")
+            return False
+        return True
+
+    def finish_attempt(self, attempt_id, *, source, finished_by=None,
+                       finished_at=None) -> bool:
+        finished_at = time.time() if finished_at is None else finished_at
+        cur = self.db.execute(
+            "UPDATE task_attempts SET finished_at=?,finish_source=?,finished_by=? "
+            "WHERE attempt_id=? AND finished_at IS NULL AND terminal_at IS NULL",
+            (finished_at, source, finished_by, attempt_id),
+        )
+        return cur.rowcount == 1
+
+    def close_attempt(self, attempt_id, terminal_state, terminal_reason,
+                      terminal_at=None) -> bool:
+        terminal_at = time.time() if terminal_at is None else terminal_at
+        cur = self.db.execute(
+            "UPDATE task_attempts SET terminal_at=?,terminal_state=?,terminal_reason=? "
+            "WHERE attempt_id=? AND terminal_at IS NULL",
+            (terminal_at, terminal_state, terminal_reason, attempt_id),
+        )
+        return cur.rowcount == 1
+
+    def add_connect_attempt(self, *, attempt_id, task_id, token_id, orbit_ids,
+                            orbit_fences, coordinator_epoch, branch_tip_sha,
+                            integration_base_sha, started_at=None,
+                            trigger_kind="DIRECT", barrier_id=None,
+                            barrier_generation=None) -> str:
+        started_at = time.time() if started_at is None else started_at
+        attempt = self.get_attempt(attempt_id)
+        if attempt is None or attempt["task_id"] != task_id \
+                or attempt["terminal_at"] is not None:
+            raise ValueError("connect attempt requires a live matching task attempt")
+        token = self.get_orbit(token_id)
+        if token is None or token["kind"] != "merge_token" or token["state"] != "HELD":
+            raise ValueError("connect attempt requires a live merge token")
+        orbit_ids = list(orbit_ids)
+        if not orbit_ids or len(set(orbit_ids)) != len(orbit_ids) \
+                or set(orbit_fences) != set(orbit_ids):
+            raise ValueError("connect attempt orbit snapshot is incomplete")
+        legacy = attempt["opened_by"] in LEGACY_ATTEMPT_OPENERS
+        orbits = self.orbits_by_ids(orbit_ids)
+        if len(orbits) != len(orbit_ids) or any(
+            orbit["task_id"] != task_id
+            or orbit["mode"] not in ("write", "shared")
+            or orbit["state"] != "HELD"
+            or orbit["fence"] != orbit_fences.get(orbit["orbit_id"])
+            or (orbit["attempt_id"] != attempt_id and not (
+                legacy and orbit["attempt_id"] is None
+            ))
+            for orbit in orbits
+        ):
+            raise ValueError("connect attempt orbit identity is invalid")
+        seq = int(self.db.execute(
+            "SELECT COALESCE(MAX(connect_seq),0)+1 FROM connect_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()[0])
+        connect_id = "con-" + uuid.uuid4().hex
+        self.db.execute(
+            "INSERT INTO connect_attempts(connect_attempt_id,attempt_id,task_id,connect_seq,"
+            "token_id,orbit_ids,orbit_fences,coordinator_epoch,trigger_kind,barrier_id,"
+            "barrier_generation,started_at,branch_tip_sha,integration_base_sha) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (connect_id, attempt_id, task_id, seq, token_id, json.dumps(orbit_ids),
+             json.dumps(orbit_fences, sort_keys=True), coordinator_epoch, trigger_kind,
+             barrier_id, barrier_generation, started_at, branch_tip_sha,
+             integration_base_sha),
+        )
+        return connect_id
+
+    def get_connect_attempt(self, connect_attempt_id) -> dict | None:
+        return _row(self.db.execute(
+            "SELECT * FROM connect_attempts WHERE connect_attempt_id=?",
+            (connect_attempt_id,)))
+
+    def seal_connect_candidate(self, connect_attempt_id, *, tree_sha, commit_sha,
+                               prepared_at=None) -> bool:
+        """Single-assign the exact pre-publication Git candidate identity.
+
+        ``commit-tree`` has already created the object but no integration ref has
+        moved yet.  Repeating the same seal is an idempotent no-op; any conflicting
+        value or terminal row fails closed.
+        """
+        if (
+            not isinstance(tree_sha, str)
+            or not tree_sha.strip()
+            or tree_sha != tree_sha.strip()
+            or not isinstance(commit_sha, str)
+            or not commit_sha.strip()
+            or commit_sha != commit_sha.strip()
+        ):
+            raise ValueError("connect candidate requires tree and commit identities")
+        prepared_at = time.time() if prepared_at is None else prepared_at
+        current = self.get_connect_attempt(connect_attempt_id)
+        if current is None:
+            raise KeyError(connect_attempt_id)
+        if (
+            isinstance(prepared_at, bool)
+            or not isinstance(prepared_at, (int, float))
+            or not math.isfinite(prepared_at)
+            or prepared_at < current["started_at"]
+        ):
+            raise ValueError(
+                "connect candidate prepared_at must be finite and follow started_at"
+            )
+        existing = (
+            current["candidate_tree_sha"],
+            current["candidate_commit_sha"],
+            current["candidate_prepared_at"],
+        )
+        if current["terminal_at"] is not None:
+            raise RuntimeError("cannot attest a terminal connect attempt")
+        if any(value is not None for value in existing):
+            existing_complete = (
+                all(value is not None for value in existing)
+                and isinstance(existing[0], str)
+                and bool(existing[0].strip())
+                and existing[0] == existing[0].strip()
+                and isinstance(existing[1], str)
+                and bool(existing[1].strip())
+                and existing[1] == existing[1].strip()
+                and not isinstance(existing[2], bool)
+                and isinstance(existing[2], (int, float))
+                and math.isfinite(existing[2])
+                and existing[2] >= current["started_at"]
+            )
+            if existing_complete and existing[:2] == (tree_sha, commit_sha):
+                return False
+            raise RuntimeError("connect candidate attestation conflicts with durable seal")
+        cur = self.db.execute(
+            "UPDATE connect_attempts SET candidate_tree_sha=?,candidate_commit_sha=?,"
+            "candidate_prepared_at=? WHERE connect_attempt_id=? AND terminal_at IS NULL "
+            "AND candidate_tree_sha IS NULL AND candidate_commit_sha IS NULL "
+            "AND candidate_prepared_at IS NULL",
+            (tree_sha, commit_sha, prepared_at, connect_attempt_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("connect candidate attestation CAS failed")
+        return True
+
+    def finish_connect_attempt(self, connect_attempt_id, *, outcome, outcome_code,
+                               merge_sha=None, merge_gen=None,
+                               resolution_source="LIVE", detail=None,
+                               terminal_at=None) -> bool:
+        terminal_at = time.time() if terminal_at is None else terminal_at
+        cur = self.db.execute(
+            "UPDATE connect_attempts SET terminal_at=?,outcome=?,outcome_code=?,"
+            "merge_sha=?,merge_gen=?,resolution_source=?,detail=? "
+            "WHERE connect_attempt_id=? AND terminal_at IS NULL",
+            (terminal_at, outcome, outcome_code, merge_sha, merge_gen,
+             resolution_source, detail, connect_attempt_id),
+        )
+        return cur.rowcount == 1
+
+    def mark_connect_indeterminate(self, connect_attempt_id, *, outcome_code,
+                                   resolution_source="LIVE", detail=None) -> bool:
+        """Record a fail-stop observation while keeping the try recoverable.
+
+        ``terminal_at`` deliberately remains NULL. Recovery may later prove a merge
+        or rollback and single-assign the authoritative terminal result.
+        """
+        cur = self.db.execute(
+            "UPDATE connect_attempts SET outcome='INDETERMINATE',outcome_code=?,"
+            "resolution_source=?,detail=? WHERE connect_attempt_id=? "
+            "AND terminal_at IS NULL",
+            (outcome_code, resolution_source, detail, connect_attempt_id),
+        )
+        return cur.rowcount == 1
+
+    def connect_attempts_for_attempt(self, attempt_id) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM connect_attempts WHERE attempt_id=? ORDER BY connect_seq",
+            (attempt_id,)))
+
+    def active_connect_attempts_for_attempt(self, attempt_id) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM connect_attempts WHERE attempt_id=? AND terminal_at IS NULL "
+            "ORDER BY connect_seq", (attempt_id,)))
+
+    def orbits_by_ids(self, orbit_ids) -> list[dict]:
+        orbit_ids = list(orbit_ids)
+        if not orbit_ids:
+            return []
+        q = ",".join("?" * len(orbit_ids))
+        rows = _rows(self.db.execute(
+            f"SELECT * FROM orbits WHERE orbit_id IN ({q})", orbit_ids))
+        by_id = {row["orbit_id"]: row for row in rows}
+        return [by_id[orbit_id] for orbit_id in orbit_ids if orbit_id in by_id]
 
     def all_tasks(self) -> list[dict]:
         """모든 task — 의존 DAG 사이클 검사(P0-10)용 전역 그래프 빌드."""
@@ -727,9 +1440,13 @@ class Store:
 
     def add_barrier_party(self, barrier_id, generation, task_id, agent_id=None):
         self.db.execute(
-            "INSERT OR IGNORE INTO barrier_parties(barrier_id,generation,task_id,agent_id,"
-            "arrived,arrive_fence) VALUES(?,?,?,?,0,NULL)",
-            (barrier_id, generation, task_id, agent_id))
+            "INSERT INTO barrier_parties(barrier_id,generation,task_id,agent_id,"
+            "arrived,arrive_fence,arrive_attempt_id) "
+            "SELECT ?,?,?,?,0,NULL,NULL WHERE NOT EXISTS("
+            "SELECT 1 FROM barrier_parties WHERE barrier_id=? AND generation=? "
+            "AND task_id=?)",
+            (barrier_id, generation, task_id, agent_id,
+             barrier_id, generation, task_id))
 
     def barrier_parties(self, barrier_id, generation) -> list[dict]:
         return _rows(self.db.execute(
@@ -742,9 +1459,10 @@ class Store:
             (barrier_id, generation, task_id)))
 
     def set_barrier_party(self, barrier_id, generation, task_id, *, arrived=...,
-                          arrive_fence=..., agent_id=...):
+                          arrive_fence=..., arrive_attempt_id=..., agent_id=...):
         sets, args = [], []
         for col, val in (("arrived", arrived), ("arrive_fence", arrive_fence),
+                         ("arrive_attempt_id", arrive_attempt_id),
                          ("agent_id", agent_id)):
             if val is not ...:
                 sets.append(f"{col}=?"); args.append(val)

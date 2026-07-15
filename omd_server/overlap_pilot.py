@@ -39,15 +39,32 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
+from ._const import LEGACY_ATTEMPT_OPENERS
 from .disjoint import sets_overlap
 
 
-SCHEMA = "omd-base-overlap-pilot/v2"
+SCHEMA_V2 = "omd-base-overlap-pilot/v2"
+SCHEMA_V3 = "omd-base-overlap-pilot/v3"
+# Public compatibility name: callers which imported SCHEMA before provenance v3
+# still describe the legacy report.  Native reports select SCHEMA_V3 at runtime.
+SCHEMA = SCHEMA_V2
 ORACLE_POLICY = "isolated-bare-pairwise-tip-merge-tree/v1"
 SNAPSHOT_POLICY = "stable-filesystem-copy-db-plus-wal/v1"
+LEGACY_V2 = "LEGACY_V2"
+NATIVE_V3 = "NATIVE_V3"
 _WRITE_CAPABLE_MODES = frozenset(("exclusive", "shared", "write"))
 _OID_LENGTH = {"sha1": 40, "sha256": 64}
 _SNAPSHOT_ATTEMPTS = 3
+_NATIVE_ORBIT_COLUMNS = (
+    "attempt_id",
+    "requested_at",
+    "granted_at",
+    "requested_ttl",
+    "terminal_at",
+    "terminal_effective_at",
+    "reclaimed_at",
+    "terminal_reason",
+)
 
 
 class PilotDataError(RuntimeError):
@@ -77,7 +94,9 @@ class ScopeRule:
         return cls(name=name, pattern=pattern)
 
     def matches(self, attempt: "TaskAttempt") -> bool:
-        haystack = "\n".join((attempt.task_id, attempt.agent_id, *attempt.paths))
+        haystack = "\n".join(
+            (attempt.task_id, attempt.agent_id, *attempt.scope_paths)
+        )
         return re.search(self.pattern, haystack, flags=re.MULTILINE) is not None
 
 
@@ -92,6 +111,35 @@ class OrbitIntent:
     end_source: str
     mode: str
     state: str
+    provenance_mode: str = LEGACY_V2
+
+
+@dataclass(frozen=True)
+class ConnectAttempt:
+    """One immutable, admitted native connect try."""
+
+    connect_attempt_id: str
+    connect_seq: int
+    token_id: str
+    orbit_ids: tuple[str, ...]
+    orbit_fences: tuple[tuple[str, int], ...]
+    coordinator_epoch: int | None
+    trigger_kind: str
+    barrier_id: str | None
+    barrier_generation: int | None
+    started_at: float
+    branch_tip_sha: str
+    integration_base_sha: str
+    candidate_tree_sha: str | None
+    candidate_commit_sha: str | None
+    candidate_prepared_at: float | None
+    terminal_at: float
+    outcome: str
+    outcome_code: str
+    merge_sha: str | None
+    merge_gen: int | None
+    resolution_source: str
+    detail: str | None
 
 
 @dataclass(frozen=True)
@@ -106,18 +154,69 @@ class TaskAttempt:
     branch_tip_provenance: str
     merge_sha: str | None
     merged_at: float | None
+    attempt_id: str | None = None
+    attempt_ordinal: int | None = None
+    repo_id: str | None = None
+    repo_root: str | None = None
+    integration_branch: str | None = None
+    declared_writes: tuple[str, ...] = ()
+    declared_shared: tuple[str, ...] = ()
+    opened_at: float | None = None
+    opened_by: str | None = None
+    attempt_started_at: float | None = None
+    finished_at: float | None = None
+    finish_source: str | None = None
+    finished_by: str | None = None
+    worktree_base_sha: str | None = None
+    branch: str | None = None
+    terminal_at: float | None = None
+    terminal_state: str | None = None
+    terminal_reason: str | None = None
+    actor_trust: str | None = None
+    canonical_connect_outcome: str | None = None
+    canonical_connect_outcome_code: str | None = None
+    connect_attempts: tuple[ConnectAttempt, ...] = ()
+    provenance_mode: str = LEGACY_V2
 
     @property
     def paths(self) -> tuple[str, ...]:
         return tuple(sorted({path for orbit in self.orbits for path in orbit.paths}))
 
     @property
+    def scope_paths(self) -> tuple[str, ...]:
+        if self.provenance_mode == NATIVE_V3:
+            return tuple(sorted(set(self.declared_writes + self.declared_shared)))
+        return self.paths
+
+    @property
+    def node_id(self) -> str | tuple[str, str]:
+        if self.attempt_id is not None:
+            return self.attempt_id
+        return self.task_id, self.agent_id
+
+    @property
+    def display_id(self) -> str:
+        if self.attempt_id is not None:
+            return f"{self.task_id}@{self.agent_id}#{self.attempt_id}"
+        return f"{self.task_id}@{self.agent_id}"
+
+    @property
     def started_at(self) -> float:
-        return min(orbit.started_at for orbit in self.orbits)
+        if self.orbits:
+            return min(orbit.started_at for orbit in self.orbits)
+        if self.attempt_started_at is not None:
+            return self.attempt_started_at
+        if self.opened_at is not None:
+            return self.opened_at
+        raise PilotDataError(f"attempt {self.display_id}: no start timestamp")
 
     @property
     def ended_at(self) -> float:
-        return max(orbit.ended_at for orbit in self.orbits)
+        if self.orbits:
+            return max(orbit.ended_at for orbit in self.orbits)
+        if self.terminal_at is not None:
+            return self.terminal_at
+        return self.started_at
 
     @property
     def orbit_rows(self) -> int:
@@ -164,11 +263,60 @@ class _GitRepoFacts:
         }
 
 
+@dataclass(frozen=True)
+class _LoadedPilotInput:
+    attempts: tuple[TaskAttempt, ...]
+    provenance_mode: str
+    canonical_input_sha256: str
+    source_metadata: dict
+
+
 def _require_columns(db: sqlite3.Connection, table: str, required: set[str]) -> None:
     columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
     missing = sorted(required - columns)
     if missing:
         raise PilotDataError(f"{table} missing required columns: {', '.join(missing)}")
+
+
+def _table_columns(db: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in db.execute(f"PRAGMA table_info({table})")}
+
+
+def _table_has_rows(db: sqlite3.Connection, table: str) -> bool:
+    if not _table_columns(db, table):
+        return False
+    return db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+
+
+def _detect_provenance_mode(db: sqlite3.Connection) -> str:
+    """Detect writer generation from durable content, never schema presence alone."""
+
+    if _table_has_rows(db, "task_attempts") or _table_has_rows(
+        db, "connect_attempts"
+    ):
+        return NATIVE_V3
+
+    orbit_columns = _table_columns(db, "orbits")
+    native_orbit_columns = set(_NATIVE_ORBIT_COLUMNS) & orbit_columns
+    if native_orbit_columns:
+        predicate = " OR ".join(
+            f"{column} IS NOT NULL" for column in sorted(native_orbit_columns)
+        )
+        if db.execute(f"SELECT 1 FROM orbits WHERE {predicate} LIMIT 1").fetchone():
+            return NATIVE_V3
+
+    task_columns = _table_columns(db, "tasks")
+    pointer_columns = {"attempt_id", "connect_attempt_id"} & task_columns
+    if pointer_columns:
+        predicate = " OR ".join(
+            f"{column} IS NOT NULL" for column in sorted(pointer_columns)
+        )
+        if db.execute(f"SELECT 1 FROM tasks WHERE {predicate} LIMIT 1").fetchone():
+            return NATIVE_V3
+
+    # Store migration creates empty native tables and NULL provenance columns.  That
+    # is deliberately still the legacy dataset: no historical facts were invented.
+    return LEGACY_V2
 
 
 def _file_signature(path: Path) -> tuple[int, int, int, int] | None:
@@ -264,6 +412,33 @@ def _finite_timestamp(value: object, *, field: str, orbit_id: str) -> float:
     return timestamp
 
 
+def _finite_native_timestamp(value: object, *, field: str, entity: str) -> float:
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PilotDataError(f"{entity}: {field} is not numeric") from exc
+    if not math.isfinite(timestamp):
+        raise PilotDataError(f"{entity}: {field} must be finite")
+    return timestamp
+
+
+def _native_string_list(
+    raw: object, *, field: str, entity: str, allow_empty: bool = True
+) -> tuple[str, ...]:
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else None
+    except json.JSONDecodeError as exc:
+        raise PilotDataError(f"{entity}: invalid {field} JSON") from exc
+    if (
+        not isinstance(value, list)
+        or (not allow_empty and not value)
+        or not all(isinstance(item, str) and item.strip() for item in value)
+    ):
+        qualifier = "non-empty " if not allow_empty else ""
+        raise PilotDataError(f"{entity}: {field} must be a {qualifier}string list")
+    return tuple(value)
+
+
 def _acquisition_epoch_count(orbits: Sequence[OrbitIntent]) -> int:
     """Count disconnected nominal windows inside one task/agent grouping."""
 
@@ -281,14 +456,698 @@ def _acquisition_epoch_count(orbits: Sequence[OrbitIntent]) -> int:
     return epochs
 
 
-def load_attempts(
+def _optional_native_timestamp(
+    value: object, *, field: str, entity: str
+) -> float | None:
+    if value is None:
+        return None
+    return _finite_native_timestamp(value, field=field, entity=entity)
+
+
+def _native_row_payload(row: sqlite3.Row, columns: Sequence[str]) -> dict:
+    return {column: row[column] for column in columns}
+
+
+def _load_native_v3(
+    db: sqlite3.Connection,
+    *,
+    created_before: float | None,
+    exclude_task_ids: Iterable[str],
+    max_paths_per_orbit: int,
+    max_pathspec_bytes: int,
+) -> _LoadedPilotInput:
+    """Load immutable attempt provenance; no mutable task projection is read."""
+
+    orbit_columns = {
+        "orbit_id", "task_id", "agent_id", "pathspec", "mode", "state",
+        "kind", "fence", "created_at", "expires_at", "released_at",
+        *_NATIVE_ORBIT_COLUMNS,
+    }
+    attempt_order = (
+        "attempt_id", "task_id", "attempt_ordinal", "agent_id", "repo_id",
+        "repo_root", "integration_branch", "writes", "shared", "opened_at",
+        "opened_by", "started_at", "finished_at", "finish_source",
+        "finished_by", "worktree_base_sha", "branch", "terminal_at",
+        "terminal_state", "terminal_reason", "actor_trust",
+    )
+    connect_order = (
+        "connect_attempt_id", "attempt_id", "task_id", "connect_seq",
+        "token_id", "orbit_ids", "orbit_fences", "coordinator_epoch",
+        "trigger_kind", "barrier_id", "barrier_generation", "started_at",
+        "branch_tip_sha", "integration_base_sha", "candidate_tree_sha",
+        "candidate_commit_sha", "candidate_prepared_at", "terminal_at", "outcome",
+        "outcome_code", "merge_sha", "merge_gen", "resolution_source", "detail",
+    )
+    orbit_order = (
+        "orbit_id", "task_id", "agent_id", "pathspec", "mode", "state",
+        "kind", "fence", "created_at", "expires_at", "released_at",
+        *_NATIVE_ORBIT_COLUMNS,
+    )
+    _require_columns(db, "orbits", orbit_columns)
+    _require_columns(db, "task_attempts", set(attempt_order))
+    _require_columns(db, "connect_attempts", set(connect_order))
+    attempt_rows = list(db.execute(
+        f"SELECT {','.join(attempt_order)} FROM task_attempts "
+        "ORDER BY task_id,attempt_ordinal,attempt_id"
+    ))
+    connect_rows = list(db.execute(
+        f"SELECT {','.join(connect_order)} FROM connect_attempts "
+        "ORDER BY attempt_id,connect_seq,connect_attempt_id"
+    ))
+    orbit_rows = list(db.execute(
+        f"SELECT {','.join(orbit_order)} FROM orbits "
+        "ORDER BY kind,requested_at,created_at,orbit_id"
+    ))
+
+    attempts_by_id: dict[str, dict] = {}
+    ordinal_keys: set[tuple[str, int]] = set()
+    legacy_adapter_attempt_ids: set[str] = set()
+    legacy_adapter_owner_keys: set[tuple[str, str]] = set()
+    for row in attempt_rows:
+        attempt_id = str(row["attempt_id"] or "")
+        entity = f"task_attempt {attempt_id or '<missing>'}"
+        task_id = str(row["task_id"] or "")
+        agent_id = str(row["agent_id"] or "")
+        if not attempt_id or not task_id or not agent_id:
+            raise PilotDataError(
+                f"{entity}: attempt_id, task_id, and agent_id must be non-empty"
+            )
+        if attempt_id in attempts_by_id:
+            raise PilotDataError(f"duplicate task_attempt attempt_id: {attempt_id}")
+        try:
+            ordinal = int(row["attempt_ordinal"])
+        except (TypeError, ValueError) as exc:
+            raise PilotDataError(f"{entity}: attempt_ordinal must be an integer") from exc
+        if ordinal < 1 or ordinal != row["attempt_ordinal"]:
+            raise PilotDataError(f"{entity}: attempt_ordinal must be a positive integer")
+        ordinal_key = task_id, ordinal
+        if ordinal_key in ordinal_keys:
+            raise PilotDataError(f"task {task_id}: duplicate attempt_ordinal {ordinal}")
+        ordinal_keys.add(ordinal_key)
+
+        opened_at = _finite_native_timestamp(
+            row["opened_at"], field="opened_at", entity=entity
+        )
+        opened_by = str(row["opened_by"] or "")
+        legacy_adapter = opened_by in LEGACY_ATTEMPT_OPENERS
+        if legacy_adapter:
+            legacy_adapter_attempt_ids.add(attempt_id)
+            legacy_adapter_owner_keys.add((task_id, agent_id))
+            attempts_by_id[attempt_id] = {
+                "row": row, "task_id": task_id, "agent_id": agent_id,
+                "ordinal": ordinal, "opened_at": opened_at,
+                "opened_by": opened_by, "legacy_adapter": True,
+                "orbits": [], "connects": [],
+            }
+            continue
+        started_at = _optional_native_timestamp(
+            row["started_at"], field="started_at", entity=entity
+        )
+        finished_at = _optional_native_timestamp(
+            row["finished_at"], field="finished_at", entity=entity
+        )
+        terminal_at = _optional_native_timestamp(
+            row["terminal_at"], field="terminal_at", entity=entity
+        )
+        if started_at is not None and started_at < opened_at:
+            raise PilotDataError(f"{entity}: started_at precedes opened_at")
+        if finished_at is not None and (started_at is None or finished_at < started_at):
+            raise PilotDataError(
+                f"{entity}: finished_at requires and must follow started_at"
+            )
+        if (finished_at is None) != (row["finish_source"] is None):
+            raise PilotDataError(
+                f"{entity}: finished_at and finish_source must be recorded together"
+            )
+        terminal_state = str(row["terminal_state"] or "") or None
+        terminal_reason = str(row["terminal_reason"] or "") or None
+        if terminal_at is None or terminal_state is None or terminal_reason is None:
+            raise PilotDataError(
+                f"{entity}: native attempt is structurally incomplete (terminal projection)"
+            )
+        if terminal_at < opened_at:
+            raise PilotDataError(f"{entity}: terminal_at precedes opened_at")
+        if opened_by not in ("CLAIM", "START"):
+            raise PilotDataError(f"{entity}: unsupported opened_by {opened_by!r}")
+        actor_trust = str(row["actor_trust"] or "")
+        if not actor_trust:
+            raise PilotDataError(f"{entity}: actor_trust must be non-empty")
+        attempts_by_id[attempt_id] = {
+            "row": row, "task_id": task_id, "agent_id": agent_id,
+            "ordinal": ordinal,
+            "writes": _native_string_list(row["writes"], field="writes", entity=entity),
+            "shared": _native_string_list(row["shared"], field="shared", entity=entity),
+            "opened_at": opened_at, "started_at": started_at,
+            "finished_at": finished_at, "terminal_at": terminal_at,
+            "terminal_state": terminal_state, "terminal_reason": terminal_reason,
+            "opened_by": opened_by, "actor_trust": actor_trust,
+            "legacy_adapter": False,
+            "orbits": [], "connects": [],
+        }
+
+    merge_generations: dict[int, str] = {}
+    legacy_adapter_connect_rows: list[sqlite3.Row] = []
+    legacy_adapter_connect_snapshots: list[
+        tuple[str, dict, tuple[str, ...], dict[str, int]]
+    ] = []
+    for row in connect_rows:
+        connect_id = str(row["connect_attempt_id"] or "")
+        entity = f"connect_attempt {connect_id or '<missing>'}"
+        attempt_id = str(row["attempt_id"] or "")
+        if not connect_id or not attempt_id:
+            raise PilotDataError(f"{entity}: identity must be non-empty")
+        owner = attempts_by_id.get(attempt_id)
+        if owner is None:
+            raise PilotDataError(f"{entity}: orphan attempt_id {attempt_id}")
+        if str(row["task_id"] or "") != owner["task_id"]:
+            raise PilotDataError(f"{entity}: task_id does not match task_attempt")
+        try:
+            seq = int(row["connect_seq"])
+        except (TypeError, ValueError) as exc:
+            raise PilotDataError(f"{entity}: connect_seq must be an integer") from exc
+        if seq < 1 or seq != row["connect_seq"]:
+            raise PilotDataError(f"{entity}: connect_seq must be a positive integer")
+        orbit_ids = _native_string_list(
+            row["orbit_ids"], field="orbit_ids", entity=entity, allow_empty=False
+        )
+        if len(set(orbit_ids)) != len(orbit_ids):
+            raise PilotDataError(f"{entity}: orbit_ids contains duplicates")
+        try:
+            raw_fences = json.loads(row["orbit_fences"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise PilotDataError(f"{entity}: invalid orbit_fences JSON") from exc
+        if not isinstance(raw_fences, dict) or set(raw_fences) != set(orbit_ids):
+            raise PilotDataError(
+                f"{entity}: orbit_fences keys must exactly match orbit_ids"
+            )
+        fences: list[tuple[str, int]] = []
+        for orbit_id in orbit_ids:
+            fence = raw_fences[orbit_id]
+            if not isinstance(fence, int) or isinstance(fence, bool):
+                raise PilotDataError(f"{entity}: orbit fence must be an integer")
+            fences.append((orbit_id, fence))
+        candidate_values = (
+            row["candidate_tree_sha"],
+            row["candidate_commit_sha"],
+            row["candidate_prepared_at"],
+        )
+        candidate_present = tuple(value is not None for value in candidate_values)
+        if any(candidate_present) and not all(candidate_present):
+            raise PilotDataError(
+                f"{entity}: connect candidate attestation must be complete"
+            )
+        candidate_tree_sha: str | None = None
+        candidate_commit_sha: str | None = None
+        candidate_prepared_at: float | None = None
+        if all(candidate_present):
+            candidate_tree_sha = str(row["candidate_tree_sha"] or "")
+            candidate_commit_sha = str(row["candidate_commit_sha"] or "")
+            if not candidate_tree_sha or not candidate_commit_sha:
+                raise PilotDataError(
+                    f"{entity}: connect candidate identities must be non-empty"
+                )
+            candidate_prepared_at = _finite_native_timestamp(
+                row["candidate_prepared_at"],
+                field="candidate_prepared_at",
+                entity=entity,
+            )
+        if owner["legacy_adapter"]:
+            legacy_adapter_connect_rows.append(row)
+            legacy_adapter_connect_snapshots.append(
+                (connect_id, owner, orbit_ids, raw_fences)
+            )
+            continue
+        started_at = _finite_native_timestamp(
+            row["started_at"], field="started_at", entity=entity
+        )
+        terminal_at = _optional_native_timestamp(
+            row["terminal_at"], field="terminal_at", entity=entity
+        )
+        outcome = str(row["outcome"] or "")
+        outcome_code = str(row["outcome_code"] or "")
+        if terminal_at is None or not outcome or not outcome_code:
+            raise PilotDataError(f"{entity}: native connect try is structurally incomplete")
+        if terminal_at < started_at:
+            raise PilotDataError(f"{entity}: terminal_at precedes started_at")
+        if candidate_prepared_at is not None:
+            if candidate_prepared_at < started_at:
+                raise PilotDataError(
+                    f"{entity}: candidate_prepared_at precedes started_at"
+                )
+            if candidate_prepared_at > terminal_at:
+                raise PilotDataError(
+                    f"{entity}: candidate_prepared_at follows terminal_at"
+                )
+        branch_tip_sha = str(row["branch_tip_sha"] or "")
+        integration_base_sha = str(row["integration_base_sha"] or "")
+        if not branch_tip_sha or not integration_base_sha:
+            raise PilotDataError(
+                f"{entity}: branch_tip_sha and integration_base_sha are required"
+            )
+        merge_sha = str(row["merge_sha"] or "") or None
+        merge_gen: int | None = None
+        if row["merge_gen"] is not None:
+            try:
+                merge_gen = int(row["merge_gen"])
+            except (TypeError, ValueError) as exc:
+                raise PilotDataError(f"{entity}: merge_gen must be an integer") from exc
+            if merge_gen < 1 or merge_gen != row["merge_gen"]:
+                raise PilotDataError(f"{entity}: merge_gen must be a positive integer")
+        if outcome == "MERGED":
+            if merge_sha is None or merge_gen is None:
+                raise PilotDataError(f"{entity}: MERGED requires merge_sha and merge_gen")
+            if candidate_commit_sha is None:
+                no_op_codes = {
+                    "ALREADY_INTEGRATED",
+                    "RECOVERED_ALREADY_INTEGRATED",
+                }
+                if (
+                    outcome_code not in no_op_codes
+                    or merge_sha != integration_base_sha
+                ):
+                    raise PilotDataError(
+                        f"{entity}: MERGED requires an exact candidate commit "
+                        "attestation unless it is an already-integrated no-op"
+                    )
+            elif candidate_commit_sha != merge_sha:
+                raise PilotDataError(
+                    f"{entity}: MERGED merge_sha does not match the attested "
+                    "candidate commit"
+                )
+            previous = merge_generations.setdefault(merge_gen, connect_id)
+            if previous != connect_id:
+                raise PilotDataError(f"duplicate global merge_gen {merge_gen}")
+        elif merge_gen is not None:
+            raise PilotDataError(f"{entity}: only MERGED may carry merge_gen")
+        resolution_source = str(row["resolution_source"] or "")
+        if not resolution_source:
+            raise PilotDataError(f"{entity}: resolution_source must be non-empty")
+        connect = ConnectAttempt(
+            connect_attempt_id=connect_id, connect_seq=seq,
+            token_id=str(row["token_id"] or ""), orbit_ids=orbit_ids,
+            orbit_fences=tuple(fences),
+            coordinator_epoch=(int(row["coordinator_epoch"])
+                               if row["coordinator_epoch"] is not None else None),
+            trigger_kind=str(row["trigger_kind"] or ""),
+            barrier_id=(str(row["barrier_id"])
+                        if row["barrier_id"] is not None else None),
+            barrier_generation=(int(row["barrier_generation"])
+                                if row["barrier_generation"] is not None else None),
+            started_at=started_at, branch_tip_sha=branch_tip_sha,
+            integration_base_sha=integration_base_sha,
+            candidate_tree_sha=candidate_tree_sha,
+            candidate_commit_sha=candidate_commit_sha,
+            candidate_prepared_at=candidate_prepared_at,
+            terminal_at=terminal_at,
+            outcome=outcome, outcome_code=outcome_code, merge_sha=merge_sha,
+            merge_gen=merge_gen, resolution_source=resolution_source,
+            detail=str(row["detail"]) if row["detail"] is not None else None,
+        )
+        owner["connects"].append(connect)
+
+    # Mutable task pointers are never measurement evidence, but a pointer is itself
+    # a native marker.  Refuse dangling markers instead of silently producing an
+    # empty/native-looking report or falling back to v2.
+    task_columns = _table_columns(db, "tasks")
+    if {"task_id", "attempt_id", "connect_attempt_id"} <= task_columns:
+        connect_ids = {
+            str(row["connect_attempt_id"]) for row in connect_rows
+        }
+        for row in db.execute(
+            "SELECT task_id,attempt_id,connect_attempt_id FROM tasks "
+            "WHERE attempt_id IS NOT NULL OR connect_attempt_id IS NOT NULL"
+        ):
+            if row["attempt_id"] is not None and str(row["attempt_id"]) not in attempts_by_id:
+                raise PilotDataError(
+                    f"task {row['task_id']}: dangling native attempt_id pointer"
+                )
+            if (
+                row["connect_attempt_id"] is not None
+                and str(row["connect_attempt_id"]) not in connect_ids
+            ):
+                raise PilotDataError(
+                    f"task {row['task_id']}: dangling native connect_attempt_id pointer"
+                )
+
+    legacy_workload_rows: list[sqlite3.Row] = []
+    legacy_adapter_orbit_rows: list[sqlite3.Row] = []
+    legacy_adapter_orbit_ids_by_owner: dict[tuple[str, str], set[str]] = {}
+    native_workload_rows = 0
+    unbound_native_rows = 0
+    non_granted_native_rows = 0
+    native_orbit_ids: set[str] = set()
+    for row in orbit_rows:
+        if str(row["kind"]) != "orbit":
+            continue
+        orbit_id = str(row["orbit_id"] or "")
+        entity = f"orbit {orbit_id or '<missing>'}"
+        if not orbit_id:
+            raise PilotDataError("workload orbit_id must be non-empty")
+        task_id = str(row["task_id"] or "")
+        agent_id = str(row["agent_id"] or "")
+        attempt_id = str(row["attempt_id"] or "")
+        adapter_owner_key = (task_id, agent_id)
+        adapter_bound_owner = (
+            attempts_by_id.get(attempt_id) if attempt_id else None
+        )
+        if adapter_bound_owner and adapter_bound_owner["legacy_adapter"]:
+            if (
+                task_id != adapter_bound_owner["task_id"]
+                or agent_id != adapter_bound_owner["agent_id"]
+            ):
+                raise PilotDataError(
+                    f"{entity}: task/agent identity mismatches legacy adapter"
+                )
+            legacy_adapter_orbit_rows.append(row)
+            legacy_adapter_orbit_ids_by_owner.setdefault(
+                adapter_owner_key, set()
+            ).add(orbit_id)
+            continue
+        legacy_transition_overlay = (
+            not attempt_id
+            and row["requested_at"] is None
+            and row["requested_ttl"] is None
+        )
+        if legacy_transition_overlay:
+            # A pre-R3 row remains attempt_id/requested_* = NULL by design.
+            # Post-migration promotion/release/reclaim may populate grant or
+            # terminal fields only; that overlay is still legacy evidence.
+            if adapter_owner_key in legacy_adapter_owner_keys:
+                legacy_adapter_orbit_rows.append(row)
+                legacy_adapter_orbit_ids_by_owner.setdefault(
+                    adapter_owner_key, set()
+                ).add(orbit_id)
+            else:
+                legacy_workload_rows.append(row)
+            continue
+        provenance_values = [row[column] for column in _NATIVE_ORBIT_COLUMNS]
+        if all(value is None for value in provenance_values):
+            if attempt_id:
+                raise PilotDataError(
+                    f"{entity}: attempt-bound workload orbit lacks native provenance"
+                )
+            legacy_workload_rows.append(row)
+            continue
+        native_workload_rows += 1
+        if orbit_id in native_orbit_ids:
+            raise PilotDataError(f"duplicate native orbit_id: {orbit_id}")
+        native_orbit_ids.add(orbit_id)
+        requested_at = _optional_native_timestamp(
+            row["requested_at"], field="requested_at", entity=entity
+        )
+        requested_ttl = _optional_native_timestamp(
+            row["requested_ttl"], field="requested_ttl", entity=entity
+        )
+        if requested_at is None or requested_ttl is None or requested_ttl <= 0:
+            raise PilotDataError(
+                f"{entity}: partial native provenance (requested_at/requested_ttl)"
+            )
+        granted_at = _optional_native_timestamp(
+            row["granted_at"], field="granted_at", entity=entity
+        )
+        terminal_at = _optional_native_timestamp(
+            row["terminal_at"], field="terminal_at", entity=entity
+        )
+        terminal_effective_at = _optional_native_timestamp(
+            row["terminal_effective_at"], field="terminal_effective_at", entity=entity
+        )
+        reclaimed_at = _optional_native_timestamp(
+            row["reclaimed_at"], field="reclaimed_at", entity=entity
+        )
+        if granted_at is not None and granted_at < requested_at:
+            raise PilotDataError(f"{entity}: granted_at precedes requested_at")
+        if terminal_at is not None and terminal_at < requested_at:
+            raise PilotDataError(f"{entity}: terminal_at precedes requested_at")
+        if reclaimed_at is not None and (terminal_at is None or reclaimed_at < terminal_at):
+            raise PilotDataError(f"{entity}: reclaimed_at precedes terminal_at")
+        mode = str(row["mode"])
+        if mode not in _WRITE_CAPABLE_MODES:
+            continue
+        if not task_id:
+            if attempt_id:
+                raise PilotDataError(f"{entity}: attempt_id without task_id")
+            unbound_native_rows += 1
+            continue
+        if not attempt_id:
+            raise PilotDataError(
+                f"{entity}: task-bound native write/shared orbit lacks attempt_id"
+            )
+        owner = attempts_by_id.get(attempt_id)
+        if owner is None:
+            raise PilotDataError(f"{entity}: orphan attempt_id {attempt_id}")
+        if task_id != owner["task_id"] or agent_id != owner["agent_id"]:
+            raise PilotDataError(f"{entity}: task/agent identity mismatches task_attempt")
+        state = str(row["state"])
+        if granted_at is None:
+            if (state != "DENIED" or terminal_at is None
+                    or terminal_effective_at is None or not row["terminal_reason"]):
+                raise PilotDataError(
+                    f"{entity}: non-granted native orbit is structurally incomplete"
+                )
+            non_granted_native_rows += 1
+            continue
+        if (state not in ("RELEASED", "EXPIRED") or terminal_at is None
+                or terminal_effective_at is None or not row["terminal_reason"]):
+            raise PilotDataError(f"{entity}: granted native orbit is structurally incomplete")
+        if terminal_effective_at < granted_at:
+            raise PilotDataError(f"{entity}: terminal_effective_at precedes granted_at")
+        if owner["started_at"] is None:
+            raise PilotDataError(f"{entity}: exposure requires task_attempt.started_at")
+        exposure_start = max(owner["started_at"], granted_at)
+        if terminal_effective_at < exposure_start:
+            raise PilotDataError(f"{entity}: terminal_effective_at precedes exposure start")
+        owner["orbits"].append(OrbitIntent(
+            orbit_id=orbit_id,
+            paths=_decode_paths(
+                row["pathspec"], orbit_id,
+                max_paths_per_orbit=max_paths_per_orbit,
+                max_pathspec_bytes=max_pathspec_bytes,
+            ),
+            started_at=exposure_start, ended_at=terminal_effective_at,
+            end_source="TERMINAL_EFFECTIVE_AT", mode=mode, state=state,
+            provenance_mode=NATIVE_V3,
+        ))
+
+    workload_rows_by_id = {
+        str(row["orbit_id"]): row
+        for row in orbit_rows if str(row["kind"]) == "orbit"
+    }
+    for connect_id, owner, orbit_ids, fences in legacy_adapter_connect_snapshots:
+        adapter_id = str(owner["row"]["attempt_id"])
+        for orbit_id in orbit_ids:
+            row = workload_rows_by_id.get(orbit_id)
+            if row is None:
+                raise PilotDataError(
+                    f"connect_attempt {connect_id}: legacy adapter orbit {orbit_id} "
+                    "does not exist as a workload orbit"
+                )
+            if (
+                orbit_id not in legacy_adapter_orbit_ids_by_owner.get(
+                    (owner["task_id"], owner["agent_id"]), set()
+                )
+                or str(row["task_id"] or "") != owner["task_id"]
+                or str(row["agent_id"] or "") != owner["agent_id"]
+                or str(row["attempt_id"] or "") not in ("", adapter_id)
+                or row["fence"] != fences[orbit_id]
+            ):
+                raise PilotDataError(
+                    f"connect_attempt {connect_id}: legacy adapter orbit "
+                    f"identity mismatch for {orbit_id}"
+                )
+
+    for attempt_id, owner in attempts_by_id.items():
+        if owner["legacy_adapter"]:
+            continue
+        connects = sorted(owner["connects"], key=lambda connect: connect.connect_seq)
+        if [connect.connect_seq for connect in connects] != list(range(1, len(connects) + 1)):
+            raise PilotDataError(
+                f"task_attempt {attempt_id}: connect_seq must be contiguous from 1"
+            )
+        merged = [connect for connect in connects if connect.outcome == "MERGED"]
+        if len(merged) > 1:
+            raise PilotDataError(f"task_attempt {attempt_id}: multiple MERGED connect tries")
+        if (owner["terminal_state"] == "MERGED") != bool(merged):
+            raise PilotDataError(
+                f"task_attempt {attempt_id}: terminal_state/MERGED connect mismatch"
+            )
+        owned_orbit_ids = {orbit.orbit_id for orbit in owner["orbits"]}
+        for connect in connects:
+            missing = set(connect.orbit_ids) - owned_orbit_ids
+            if missing:
+                raise PilotDataError(
+                    f"connect_attempt {connect.connect_attempt_id}: orbit_ids are not "
+                    f"native exposure orbits of attempt {attempt_id}: {sorted(missing)}"
+                )
+
+    excluded = set(exclude_task_ids)
+    attempts: list[TaskAttempt] = []
+    for attempt_id, owner in sorted(
+        attempts_by_id.items(),
+        key=lambda item: (item[1]["task_id"], item[1]["ordinal"], item[0]),
+    ):
+        if owner["legacy_adapter"]:
+            continue
+        if owner["task_id"] in excluded:
+            continue
+        if created_before is not None and owner["opened_at"] >= created_before:
+            continue
+        row = owner["row"]
+        orbits = tuple(sorted(
+            owner["orbits"], key=lambda orbit: (orbit.started_at, orbit.orbit_id)
+        ))
+        connects = tuple(sorted(
+            owner["connects"], key=lambda connect: connect.connect_seq
+        ))
+        first_connect = connects[0] if connects else None
+        attempts.append(TaskAttempt(
+            task_id=owner["task_id"], agent_id=owner["agent_id"], orbits=orbits,
+            acquisition_epochs=_acquisition_epoch_count(orbits),
+            branch_tip_sha=first_connect.branch_tip_sha if first_connect else None,
+            branch_tip_provenance=("NATIVE_FIRST_CONNECT_PHASE_A" if first_connect
+                                   else "MISSING_NO_CONNECT_ATTEMPT"),
+            merge_sha=first_connect.merge_sha if first_connect else None,
+            merged_at=(first_connect.terminal_at
+                       if first_connect and first_connect.outcome == "MERGED" else None),
+            attempt_id=attempt_id, attempt_ordinal=owner["ordinal"],
+            repo_id=str(row["repo_id"]) if row["repo_id"] is not None else None,
+            repo_root=str(row["repo_root"]) if row["repo_root"] is not None else None,
+            integration_branch=(str(row["integration_branch"])
+                                if row["integration_branch"] is not None else None),
+            declared_writes=owner["writes"], declared_shared=owner["shared"],
+            opened_at=owner["opened_at"], opened_by=owner["opened_by"],
+            attempt_started_at=owner["started_at"], finished_at=owner["finished_at"],
+            finish_source=(str(row["finish_source"])
+                           if row["finish_source"] is not None else None),
+            finished_by=(str(row["finished_by"])
+                         if row["finished_by"] is not None else None),
+            worktree_base_sha=(str(row["worktree_base_sha"])
+                               if row["worktree_base_sha"] is not None else None),
+            branch=str(row["branch"]) if row["branch"] is not None else None,
+            terminal_at=owner["terminal_at"], terminal_state=owner["terminal_state"],
+            terminal_reason=owner["terminal_reason"], actor_trust=owner["actor_trust"],
+            canonical_connect_outcome=first_connect.outcome if first_connect else None,
+            canonical_connect_outcome_code=(first_connect.outcome_code
+                                            if first_connect else None),
+            connect_attempts=connects, provenance_mode=NATIVE_V3,
+        ))
+
+    merge_order = [
+        {
+            "merge_gen": connect.merge_gen, "attempt_id": attempt_id,
+            "connect_attempt_id": connect.connect_attempt_id,
+            "task_id": attempts_by_id[attempt_id]["task_id"],
+            "branch_tip_sha": connect.branch_tip_sha,
+            "integration_base_sha": connect.integration_base_sha,
+            "merge_sha": connect.merge_sha,
+        }
+        for attempt_id, owner in attempts_by_id.items()
+        if not owner["legacy_adapter"]
+        for connect in owner["connects"] if connect.outcome == "MERGED"
+    ]
+    merge_order.sort(key=lambda item: (item["merge_gen"], item["connect_attempt_id"]))
+    legacy_write_rows = sum(
+        str(row["mode"]) in _WRITE_CAPABLE_MODES for row in legacy_workload_rows
+    )
+    adapter_attempt_rows = [
+        row for row in attempt_rows
+        if str(row["attempt_id"] or "") in legacy_adapter_attempt_ids
+    ]
+    native_attempt_rows = [
+        row for row in attempt_rows
+        if str(row["attempt_id"] or "") not in legacy_adapter_attempt_ids
+    ]
+    adapter_connect_ids = {
+        str(row["connect_attempt_id"]) for row in legacy_adapter_connect_rows
+    }
+    native_connect_rows = [
+        row for row in connect_rows
+        if str(row["connect_attempt_id"] or "") not in adapter_connect_ids
+    ]
+    adapter_orbit_ids = {
+        str(row["orbit_id"]) for row in legacy_adapter_orbit_rows
+    }
+    legacy_orbit_ids = {
+        str(row["orbit_id"]) for row in legacy_workload_rows
+    }
+    adapter_bound_orbit_rows = [
+        row for row in legacy_adapter_orbit_rows if row["attempt_id"] is not None
+    ]
+    adapter_null_orbit_rows = [
+        row for row in legacy_adapter_orbit_rows if row["attempt_id"] is None
+    ]
+    adapter_write_rows = sum(
+        str(row["mode"]) in _WRITE_CAPABLE_MODES
+        for row in legacy_adapter_orbit_rows
+    )
+    raw_payload = {
+        "provenance_mode": NATIVE_V3,
+        "task_attempts": [
+            _native_row_payload(row, attempt_order) for row in native_attempt_rows
+        ],
+        "native_workload_orbits": [
+            _native_row_payload(row, orbit_order) for row in orbit_rows
+            if str(row["kind"]) == "orbit"
+            and str(row["orbit_id"]) not in adapter_orbit_ids
+            and str(row["orbit_id"]) not in legacy_orbit_ids
+            and any(row[column] is not None for column in _NATIVE_ORBIT_COLUMNS)
+        ],
+        "connect_attempts": [
+            _native_row_payload(row, connect_order) for row in native_connect_rows
+        ],
+        "excluded_synthetic_legacy_task_attempts": [
+            _native_row_payload(row, attempt_order) for row in adapter_attempt_rows
+        ],
+        "excluded_synthetic_legacy_connect_attempts": [
+            _native_row_payload(row, connect_order)
+            for row in legacy_adapter_connect_rows
+        ],
+        "excluded_synthetic_legacy_orbits": [
+            _native_row_payload(row, orbit_order)
+            for row in legacy_adapter_orbit_rows
+        ],
+        "excluded_legacy_workload_orbits": [
+            _native_row_payload(row, orbit_order) for row in legacy_workload_rows
+        ],
+    }
+    source_metadata = {
+        "provenance_mode": NATIVE_V3,
+        "task_attempt_rows": len(attempt_rows),
+        "connect_attempt_rows": len(connect_rows),
+        "native_workload_orbit_rows": native_workload_rows,
+        "native_task_attempt_rows": len(native_attempt_rows),
+        "native_connect_attempt_rows": len(native_connect_rows),
+        "synthetic_legacy_attempt_rows_excluded": len(adapter_attempt_rows),
+        "synthetic_legacy_connect_attempt_rows_excluded": len(
+            legacy_adapter_connect_rows
+        ),
+        "synthetic_legacy_bound_orbit_rows_excluded": len(
+            adapter_bound_orbit_rows
+        ),
+        "synthetic_legacy_null_attempt_orbit_rows_excluded": len(
+            adapter_null_orbit_rows
+        ),
+        "synthetic_legacy_write_capable_orbit_rows_excluded": adapter_write_rows,
+        "legacy_workload_orbit_rows_excluded": len(legacy_workload_rows),
+        "legacy_write_capable_orbit_rows_excluded": legacy_write_rows,
+        "unbound_native_write_capable_orbit_rows_excluded": unbound_native_rows,
+        "non_granted_native_write_capable_orbit_rows_excluded": non_granted_native_rows,
+        "merge_order": merge_order,
+    }
+    return _LoadedPilotInput(
+        attempts=tuple(attempts), provenance_mode=NATIVE_V3,
+        canonical_input_sha256=_canonical_json_sha256(raw_payload),
+        source_metadata=source_metadata,
+    )
+
+
+def _load_pilot_input(
     path: str | Path,
     *,
     created_before: float | None = None,
     exclude_task_ids: Iterable[str] = (),
     max_paths_per_orbit: int = 1_000,
     max_pathspec_bytes: int = 1_000_000,
-) -> list[TaskAttempt]:
+) -> _LoadedPilotInput:
     """Load workload orbits from an invocation-time DB+WAL snapshot."""
 
     if created_before is not None and not math.isfinite(created_before):
@@ -296,6 +1155,15 @@ def load_attempts(
     if max_paths_per_orbit < 1 or max_pathspec_bytes < 1:
         raise ValueError("pathspec limits must be positive")
     with _snapshot_connection(Path(path)) as db:
+        provenance_mode = _detect_provenance_mode(db)
+        if provenance_mode == NATIVE_V3:
+            return _load_native_v3(
+                db,
+                created_before=created_before,
+                exclude_task_ids=exclude_task_ids,
+                max_paths_per_orbit=max_paths_per_orbit,
+                max_pathspec_bytes=max_pathspec_bytes,
+            )
         _require_columns(
             db,
             "orbits",
@@ -467,7 +1335,32 @@ def load_attempts(
                 merged_at=merged_at,
             )
         )
-    return attempts
+    return _LoadedPilotInput(
+        attempts=tuple(attempts),
+        provenance_mode=LEGACY_V2,
+        canonical_input_sha256=_input_digest(attempts),
+        source_metadata={},
+    )
+
+
+def load_attempts(
+    path: str | Path,
+    *,
+    created_before: float | None = None,
+    exclude_task_ids: Iterable[str] = (),
+    max_paths_per_orbit: int = 1_000,
+    max_pathspec_bytes: int = 1_000_000,
+) -> list[TaskAttempt]:
+    """Load legacy task/agent groups or authoritative native attempts."""
+
+    loaded = _load_pilot_input(
+        path,
+        created_before=created_before,
+        exclude_task_ids=exclude_task_ids,
+        max_paths_per_orbit=max_paths_per_orbit,
+        max_pathspec_bytes=max_pathspec_bytes,
+    )
+    return list(loaded.attempts)
 
 
 def _canonical_json_sha256(value: object) -> str:
@@ -486,6 +1379,7 @@ def _implementation_hashes() -> dict[str, str]:
 
 
 def _input_digest(attempts: Sequence[TaskAttempt]) -> str:
+    native = any(attempt.provenance_mode == NATIVE_V3 for attempt in attempts)
     canonical = [
         {
             "task_id": attempt.task_id,
@@ -496,6 +1390,63 @@ def _input_digest(attempts: Sequence[TaskAttempt]) -> str:
             "acquisition_epochs": attempt.acquisition_epochs,
             "merge_sha": attempt.merge_sha,
             "merged_at": attempt.merged_at,
+            **(
+                {
+                    "provenance_mode": attempt.provenance_mode,
+                    "attempt_id": attempt.attempt_id,
+                    "attempt_ordinal": attempt.attempt_ordinal,
+                    "repo_id": attempt.repo_id,
+                    "repo_root": attempt.repo_root,
+                    "integration_branch": attempt.integration_branch,
+                    "declared_writes": list(attempt.declared_writes),
+                    "declared_shared": list(attempt.declared_shared),
+                    "opened_at": attempt.opened_at,
+                    "opened_by": attempt.opened_by,
+                    "attempt_started_at": attempt.attempt_started_at,
+                    "finished_at": attempt.finished_at,
+                    "finish_source": attempt.finish_source,
+                    "finished_by": attempt.finished_by,
+                    "worktree_base_sha": attempt.worktree_base_sha,
+                    "branch": attempt.branch,
+                    "terminal_at": attempt.terminal_at,
+                    "terminal_state": attempt.terminal_state,
+                    "terminal_reason": attempt.terminal_reason,
+                    "actor_trust": attempt.actor_trust,
+                    "canonical_connect_outcome": attempt.canonical_connect_outcome,
+                    "canonical_connect_outcome_code": (
+                        attempt.canonical_connect_outcome_code
+                    ),
+                    "connect_attempts": [
+                        {
+                            "connect_attempt_id": connect.connect_attempt_id,
+                            "connect_seq": connect.connect_seq,
+                            "token_id": connect.token_id,
+                            "orbit_ids": list(connect.orbit_ids),
+                            "orbit_fences": [list(item) for item in connect.orbit_fences],
+                            "coordinator_epoch": connect.coordinator_epoch,
+                            "trigger_kind": connect.trigger_kind,
+                            "barrier_id": connect.barrier_id,
+                            "barrier_generation": connect.barrier_generation,
+                            "started_at": connect.started_at,
+                            "branch_tip_sha": connect.branch_tip_sha,
+                            "integration_base_sha": connect.integration_base_sha,
+                            "candidate_tree_sha": connect.candidate_tree_sha,
+                            "candidate_commit_sha": connect.candidate_commit_sha,
+                            "candidate_prepared_at": connect.candidate_prepared_at,
+                            "terminal_at": connect.terminal_at,
+                            "outcome": connect.outcome,
+                            "outcome_code": connect.outcome_code,
+                            "merge_sha": connect.merge_sha,
+                            "merge_gen": connect.merge_gen,
+                            "resolution_source": connect.resolution_source,
+                            "detail": connect.detail,
+                        }
+                        for connect in attempt.connect_attempts
+                    ],
+                }
+                if native
+                else {}
+            ),
             "orbits": [
                 {
                     "orbit_id": orbit.orbit_id,
@@ -505,6 +1456,11 @@ def _input_digest(attempts: Sequence[TaskAttempt]) -> str:
                     "end_source": orbit.end_source,
                     "mode": orbit.mode,
                     "state": orbit.state,
+                    **(
+                        {"provenance_mode": orbit.provenance_mode}
+                        if native
+                        else {}
+                    ),
                 }
                 for orbit in attempt.orbits
             ],
@@ -744,7 +1700,14 @@ def _uses_expiry_proxy(
     orbit_pairs: Sequence[tuple[OrbitIntent, OrbitIntent]],
 ) -> bool:
     return any(
-        left.end_source != "RELEASED_AT" or right.end_source != "RELEASED_AT"
+        (
+            left.provenance_mode == LEGACY_V2
+            and left.end_source != "RELEASED_AT"
+        )
+        or (
+            right.provenance_mode == LEGACY_V2
+            and right.end_source != "RELEASED_AT"
+        )
         for left, right in orbit_pairs
     )
 
@@ -752,6 +1715,12 @@ def _uses_expiry_proxy(
 def _window_basis(
     orbit_pairs: Sequence[tuple[OrbitIntent, OrbitIntent]],
 ) -> str:
+    if all(
+        orbit.provenance_mode == NATIVE_V3
+        for pair in orbit_pairs
+        for orbit in pair
+    ):
+        return "NATIVE_TERMINAL_EFFECTIVE_AT"
     released = [
         orbit.end_source == "RELEASED_AT" for pair in orbit_pairs for orbit in pair
     ]
@@ -765,10 +1734,10 @@ def _window_basis(
 def _graph_stats(
     edges: Sequence[tuple[TaskAttempt, TaskAttempt]],
 ) -> tuple[int, int]:
-    adjacency: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    adjacency: dict[object, set[object]] = {}
     for left, right in edges:
-        left_node = left.task_id, left.agent_id
-        right_node = right.task_id, right.agent_id
+        left_node = left.node_id
+        right_node = right.node_id
         adjacency.setdefault(left_node, set()).add(right_node)
         adjacency.setdefault(right_node, set()).add(left_node)
     remaining = set(adjacency)
@@ -795,6 +1764,7 @@ def _scope_payload(
     max_pair_comparisons: int,
     max_orbit_pair_comparisons: int,
     max_path_pair_comparisons: int,
+    provenance_mode: str,
 ) -> dict:
     candidates: list[
         tuple[
@@ -812,8 +1782,17 @@ def _scope_payload(
     orbit_pair_comparisons = 0
     path_pair_comparisons = 0
     structurally_ineligible_pairs_excluded = 0
+    cross_repository_pairs_excluded = 0
     for left, right in itertools.combinations(
-        sorted(attempts, key=lambda attempt: (attempt.task_id, attempt.agent_id)), 2
+        sorted(
+            attempts,
+            key=lambda attempt: (
+                attempt.task_id,
+                attempt.agent_id,
+                attempt.attempt_id or "",
+            ),
+        ),
+        2,
     ):
         orbit_pair_comparisons += left.orbit_rows * right.orbit_rows
         if orbit_pair_comparisons > max_orbit_pair_comparisons:
@@ -835,6 +1814,15 @@ def _scope_payload(
             )
         if left.task_id == right.task_id or left.agent_id == right.agent_id:
             structurally_ineligible_pairs_excluded += 1
+            continue
+        if provenance_mode == NATIVE_V3 and (
+            left.repo_id,
+            left.integration_branch,
+        ) != (
+            right.repo_id,
+            right.integration_branch,
+        ):
+            cross_repository_pairs_excluded += 1
             continue
         candidates.append(
             (
@@ -868,11 +1856,15 @@ def _scope_payload(
     declared_overlap_count = 0
     nominal_expiry_count = 0
     declared_expiry_count = 0
-    candidate_basis_counts = {
-        "RELEASED_ONLY": 0,
-        "EXPIRY_PROXY_ONLY": 0,
-        "MIXED_RELEASED_AND_EXPIRY_PROXY": 0,
-    }
+    candidate_basis_counts = (
+        {"NATIVE_TERMINAL_EFFECTIVE_AT": 0}
+        if provenance_mode == NATIVE_V3
+        else {
+            "RELEASED_ONLY": 0,
+            "EXPIRY_PROXY_ONLY": 0,
+            "MIXED_RELEASED_AND_EXPIRY_PROXY": 0,
+        }
+    )
     declared_basis_counts = dict.fromkeys(candidate_basis_counts, 0)
 
     for left, right, temporal_pairs, write_pairs in candidates:
@@ -983,6 +1975,24 @@ def _scope_payload(
                     "oracle_detail": oracle.detail,
                 }
             )
+            if provenance_mode == NATIVE_V3:
+                pair_evidence[-1].update(
+                    {
+                        "attempt_ids": [left.attempt_id, right.attempt_id],
+                        "attempt_ordinals": [
+                            left.attempt_ordinal,
+                            right.attempt_ordinal,
+                        ],
+                        "repository_identities": [
+                            [left.repo_id, left.integration_branch],
+                            [right.repo_id, right.integration_branch],
+                        ],
+                        "canonical_first_connect_outcomes": [
+                            left.canonical_connect_outcome,
+                            right.canonical_connect_outcome,
+                        ],
+                    }
+                )
 
     candidate_count = len(candidates)
     resolved_oracles = oracle_clean + oracle_conflict
@@ -1008,7 +2018,7 @@ def _scope_payload(
     else:
         declared_status = "NONZERO"
 
-    return {
+    payload = {
         "scope": name,
         "path_roots": list(path_roots),
         "task_agent_groups": len(attempts),
@@ -1065,6 +2075,39 @@ def _scope_payload(
         "pair_evidence": pair_evidence,
         "pair_evidence_truncated": len(pair_evidence) < candidate_count,
     }
+    if provenance_mode == NATIVE_V3:
+        merge_order = [
+            {
+                "merge_gen": connect.merge_gen,
+                "attempt_id": attempt.attempt_id,
+                "connect_attempt_id": connect.connect_attempt_id,
+                "task_id": attempt.task_id,
+                "merge_sha": connect.merge_sha,
+            }
+            for attempt in attempts
+            for connect in attempt.connect_attempts
+            if connect.outcome == "MERGED"
+        ]
+        merge_order.sort(
+            key=lambda item: (item["merge_gen"], item["connect_attempt_id"])
+        )
+        outcome_counts: dict[str, int] = {}
+        for attempt in attempts:
+            outcome = attempt.canonical_connect_outcome or "NO_CONNECT_ATTEMPT"
+            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+        payload.update(
+            {
+                "attempt_rows": len(attempts),
+                "cross_repository_nominal_pairs_excluded": (
+                    cross_repository_pairs_excluded
+                ),
+                "canonical_first_connect_outcome_counts": dict(
+                    sorted(outcome_counts.items())
+                ),
+                "merge_order": merge_order,
+            }
+        )
+    return payload
 
 
 def evaluate_attempts(
@@ -1075,6 +2118,9 @@ def evaluate_attempts(
     path_roots: Mapping[str, Sequence[str | Path]] | None = None,
     source_db: str | Path | None = None,
     source_filters: Mapping[str, object] | None = None,
+    provenance_mode: str | None = None,
+    canonical_input_sha256: str | None = None,
+    source_metadata: Mapping[str, object] | None = None,
     evidence_limit: int = 100,
     max_candidate_pairs: int = 10_000,
     max_oracle_pairs: int = 1_000,
@@ -1101,6 +2147,17 @@ def evaluate_attempts(
         raise ValueError("pair limits must be non-negative")
     if max_paths_per_orbit < 1 or max_pathspec_bytes < 1:
         raise ValueError("pathspec limits must be positive")
+    attempt_modes = {attempt.provenance_mode for attempt in attempts}
+    if provenance_mode is None:
+        if NATIVE_V3 in attempt_modes:
+            provenance_mode = NATIVE_V3
+        else:
+            provenance_mode = LEGACY_V2
+    if provenance_mode not in (LEGACY_V2, NATIVE_V3):
+        raise ValueError(f"unknown provenance mode: {provenance_mode}")
+    if attempt_modes - {provenance_mode}:
+        raise PilotDataError("legacy and native attempts cannot be mixed in one report")
+    schema = SCHEMA_V3 if provenance_mode == NATIVE_V3 else SCHEMA_V2
 
     raw_repo_map = dict(git_repos or {})
     unknown_repos = sorted(set(raw_repo_map) - scope_names)
@@ -1132,14 +2189,14 @@ def evaluate_attempts(
         if len(matched) == 1:
             assigned[matched[0]].append(attempt)
         elif matched:
-            ambiguous.append(f"{attempt.task_id}@{attempt.agent_id}")
+            ambiguous.append(attempt.display_id)
         else:
-            unclassified.append(f"{attempt.task_id}@{attempt.agent_id}")
+            unclassified.append(attempt.display_id)
 
-    canonical_input_sha = _input_digest(attempts)
+    canonical_input_sha = canonical_input_sha256 or _input_digest(attempts)
     filters = dict(source_filters or {})
     measurement_config = {
-        "schema": SCHEMA,
+        "schema": schema,
         "implementation_files_sha256": _implementation_hashes(),
         "measurement_hash_policy": "canonical-report-without-measurement-sha256/v1",
         "snapshot_policy": SNAPSHOT_POLICY,
@@ -1164,17 +2221,50 @@ def evaluate_attempts(
         "max_paths_per_orbit": max_paths_per_orbit,
         "max_pathspec_bytes": max_pathspec_bytes,
     }
-    payload = {
-        "schema": SCHEMA,
-        "measurement_config": measurement_config,
-        "source": {
-            "coord_db": measurement_config["source_db"],
-            "canonical_input_sha256": canonical_input_sha,
-            "task_agent_groups": len(attempts),
-            "orbit_rows": sum(attempt.orbit_rows for attempt in attempts),
-            "filters": filters,
-        },
-        "semantics": {
+    source_payload = {
+        "coord_db": measurement_config["source_db"],
+        "canonical_input_sha256": canonical_input_sha,
+        "task_agent_groups": len(attempts),
+        "orbit_rows": sum(attempt.orbit_rows for attempt in attempts),
+        "filters": filters,
+    }
+    if provenance_mode == NATIVE_V3:
+        source_payload.update(dict(source_metadata or {}))
+        source_payload["provenance_mode"] = NATIVE_V3
+        source_payload["attempt_rows"] = len(attempts)
+    if provenance_mode == NATIVE_V3:
+        semantics = {
+            "temporal_signal": (
+                "different task and agent attempts with intersecting half-open "
+                "authoritative execution exposure windows"
+            ),
+            "window_start": "max(task_attempts.started_at, orbits.granted_at)",
+            "window_end": "orbits.terminal_effective_at (exclusive)",
+            "attempt_identity": (
+                "task_attempts.attempt_id; task_id/agent_id reuse never coalesces requeues"
+            ),
+            "connect_authority": (
+                "connect_seq=1 supplies the canonical Phase-A tip/outcome; all retries "
+                "remain in the input digest; merge_gen supplies global successful order"
+            ),
+            "declared_overlap": (
+                "OMD conservative glob intersection between temporally intersecting "
+                "native write-capable workload orbit rows"
+            ),
+            "git_oracle": (
+                "counterfactual pairwise git merge-tree --write-tree over first-admitted "
+                "connect tips with neutral built-in text-merge attributes in a "
+                "config-isolated bare repository"
+            ),
+            "limitations": [
+                "lease exposure is not continuous agent execution",
+                "pairwise branch-tip merge is not historical integration-base/order replay",
+                "neutral built-in attributes can differ from repository-native custom merge semantics",
+                "candidate pairs share tasks and are not independent statistical samples",
+            ],
+        }
+    else:
+        semantics = {
             "temporal_signal": (
                 "different task and agent with intersecting half-open nominal "
                 "lease/request windows"
@@ -1202,7 +2292,12 @@ def evaluate_attempts(
                 "neutral built-in attributes can differ from repository-native custom merge semantics",
                 "candidate pairs share tasks and are not independent statistical samples",
             ],
-        },
+        }
+    payload = {
+        "schema": schema,
+        "measurement_config": measurement_config,
+        "source": source_payload,
+        "semantics": semantics,
         "metric_promotion": {
             "ready": False,
             "status": "NOT_ASSESSED_BY_EXPLORATORY_PILOT",
@@ -1225,6 +2320,7 @@ def evaluate_attempts(
                 max_pair_comparisons,
                 max_orbit_pair_comparisons,
                 max_path_pair_comparisons,
+                provenance_mode,
             )
             for scope in scopes
         ],
@@ -1251,7 +2347,7 @@ def run_pilot(
     max_pathspec_bytes: int = 1_000_000,
 ) -> PilotReport:
     excluded = tuple(sorted(set(exclude_task_ids)))
-    attempts = load_attempts(
+    loaded = _load_pilot_input(
         db_path,
         created_before=created_before,
         exclude_task_ids=excluded,
@@ -1259,7 +2355,7 @@ def run_pilot(
         max_pathspec_bytes=max_pathspec_bytes,
     )
     return evaluate_attempts(
-        attempts,
+        loaded.attempts,
         scopes,
         git_repos=git_repos,
         path_roots=path_roots,
@@ -1268,6 +2364,9 @@ def run_pilot(
             "created_before_exclusive": created_before,
             "excluded_task_ids": list(excluded),
         },
+        provenance_mode=loaded.provenance_mode,
+        canonical_input_sha256=loaded.canonical_input_sha256,
+        source_metadata=loaded.source_metadata,
         evidence_limit=evidence_limit,
         max_candidate_pairs=max_candidate_pairs,
         max_oracle_pairs=max_oracle_pairs,

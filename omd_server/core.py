@@ -34,7 +34,7 @@ import os
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 
 from . import bypass_audit, fsm, task_state
 from .disjoint import path_in_globs, sets_overlap
@@ -52,7 +52,12 @@ from .gitio import (
     GitTimeout,
 )
 from ._barriers import BarrierMixin
-from ._const import LATCH_RANK, MERGE_PIN_GRACE_S, WRITE_MODES
+from ._const import (
+    LATCH_RANK,
+    LEGACY_ATTEMPT_OPENERS,
+    MERGE_PIN_GRACE_S,
+    WRITE_MODES,
+)
 from ._flags import FlagMixin
 from ._sems import SemMixin
 from .store import Store
@@ -102,7 +107,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                  integration_check=None,
                  integration_check_timeout: float = 300.0,
                  integration_check_output_limit: int = 16_384,
-                 require_integration_check: bool = False):
+                 require_integration_check: bool = False,
+                 repo_id: str | None = None):
         # Q11: 검사 명령은 MCP caller가 connect 때 보내는 원격 명령이 아니라, 신뢰된 operator가
         # 기동 시 고정하는 argv다. shell 문자열은 받지 않는다.
         if integration_check is not None:
@@ -178,6 +184,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             (os.environ.get("OMD_STRICT_WRITESET") or "").strip().lower() in ("1", "true", "yes", "on"))
         self.integration_branch = integration_branch
         self.integration_worktree = None
+        self.repo_id = repo_id
+        self.repo_root = self.git.root if self.git else None
         self.merge_resource = "cloud:default"   # repo-wide merge_token 키(§D11)
         if self.git:
             self.worktrees_dir = worktrees_dir or (self.git.root.rstrip("/") + "-omd-worktrees")
@@ -186,6 +194,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             # 전용 worktree에서만 변이된다(§D11).
             if self.integration_branch is None:
                 self.integration_branch = self.git.current_branch()
+            if self.repo_id is None:
+                self.repo_id = self.git.repository_identity()
             self.integration_worktree = self.git.root.rstrip("/") + "-omd-integration"
             # P3 증분13(O2): rerere 레인 — 물방울 rebase 해소가 기록되고 동일충돌 재발 시
             # 자동 재적용(rr-cache 는 worktree 공유). fail-soft(rerere 불가여도 OMD 는 동작).
@@ -340,8 +350,226 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 out.append(o["orbit_id"])
         return out
 
+    @staticmethod
+    def _valid_ttl(ttl) -> tuple[float | None, dict | None]:
+        try:
+            value = float(ttl)
+        except (TypeError, ValueError):
+            return None, {"ok": False, "reason": "invalid_ttl", "ttl": ttl}
+        if not math.isfinite(value) or value <= 0:
+            return None, {"ok": False, "reason": "invalid_ttl", "ttl": ttl}
+        return value, None
+
+    def _ensure_attempt(self, task_id, agent_id, opened_by):
+        """Lazy-open one task execution generation for claim→start/start→claim parity."""
+        if task_id is None:
+            return None
+        # The task-wide partial UNIQUE index is the final storage guard, not a
+        # public API error surface.  In particular, claim may have opened an
+        # attempt before start projects its id onto ``tasks.attempt_id``.  A
+        # different actor must not mistake that NULL projection for legacy
+        # provenance and attempt to INSERT a competing adapter generation.
+        existing = self.store.active_attempt(task_id)
+        if existing is not None:
+            return existing if existing["agent_id"] == agent_id else None
+        task = self.store.get_task(task_id)
+        if task is None:
+            return None
+        attempt_id = self.store.add_attempt(
+            task_id=task_id,
+            agent_id=agent_id,
+            writes=json.loads(task["writes"] or "[]"),
+            shared=json.loads(task["shared"] or "[]"),
+            opened_by=opened_by,
+            repo_id=self.repo_id,
+            repo_root=self.repo_root,
+            integration_branch=self.integration_branch,
+        )
+        return self.store.get_attempt(attempt_id)
+
+    def _attempt_owner_mismatch(self, task_id, agent_id) -> dict | None:
+        """Fail-closed result when an unprojected active generation has an owner.
+
+        ``tasks.attempt_id`` is only a mutable runtime projection, so callers
+        that synthesize rolling-upgrade adapters must consult immutable
+        ``task_attempts`` before interpreting a NULL projection as pre-R3.
+        """
+        if task_id is None or agent_id is None:
+            return None
+        active = self.store.active_attempt(task_id)
+        if active is None or active["agent_id"] == agent_id:
+            return None
+        return {
+            "ok": False,
+            "fenced_out": True,
+            "reason": "attempt_owner_mismatch",
+            "owner": active["agent_id"],
+            "attempt_id": active["attempt_id"],
+        }
+
+    def _current_attempt_orbits(self, task) -> list[dict]:
+        """Return the authoritative orbit generation for a task.
+
+        A task with any native attempt history may never fall back to the old
+        task-wide join: doing so would mix requeues.  The sole exception is an
+        explicit rolling-upgrade adapter generation, which combines its bound
+        R3 rows with that agent's still-live pre-R3 rows.  Only a genuinely
+        legacy task (no attempt rows at all) may otherwise use task-bound rows.
+        """
+        if task is None:
+            return []
+        attempt_id = task["attempt_id"]
+        if attempt_id:
+            rows = self.store.orbits_for_attempt(attempt_id)
+            attempt = self.store.get_attempt(attempt_id)
+            if attempt and attempt["opened_by"] in LEGACY_ATTEMPT_OPENERS:
+                legacy_rows = self._legacy_unbound_orbits(
+                    task["task_id"], attempt["agent_id"]
+                )
+                combined = {
+                    orbit["orbit_id"]: orbit for orbit in (*rows, *legacy_rows)
+                }
+                return sorted(
+                    combined.values(),
+                    key=lambda orbit: (orbit["created_at"], orbit["orbit_id"]),
+                )
+            return rows
+        if not self.store.attempts_for_task(task["task_id"]):
+            return self.store.orbits_for_task(task["task_id"])
+        return []
+
+    def _legacy_unbound_orbits(self, task_id, agent_id) -> list[dict]:
+        """Operational bridge for live pre-R3 rows; never historical authority."""
+        return [
+            orbit for orbit in self.store.orbits_for_task(task_id)
+            if orbit["attempt_id"] is None
+            and orbit["agent_id"] == agent_id
+            and orbit["state"] in ("HELD", "PENDING")
+        ]
+
+    def _attempt_id_for_orbit(self, orbit) -> str | None:
+        """Resolve the explicit adapter generation for one live pre-R3 row."""
+        attempt_id = orbit.get("attempt_id") if orbit else None
+        if attempt_id or orbit is None or orbit.get("kind") != "orbit":
+            return attempt_id
+        if (
+            orbit.get("task_id") is None
+            or orbit.get("requested_at") is not None
+            or orbit.get("requested_ttl") is not None
+        ):
+            return None
+        attempt = self.store.active_attempt(
+            orbit["task_id"], orbit.get("agent_id")
+        )
+        if attempt is not None and attempt["opened_by"] in LEGACY_ATTEMPT_OPENERS:
+            return attempt["attempt_id"]
+        return None
+
+    def _live_orbits_for_attempt_generation(self, attempt) -> list[dict]:
+        """Return bound live rows plus an adapter's associated NULL rows."""
+        if attempt is None:
+            return []
+        rows = self.store.live_orbits_for_attempt(attempt["attempt_id"])
+        if attempt["opened_by"] in LEGACY_ATTEMPT_OPENERS:
+            rows.extend(self._legacy_unbound_orbits(
+                attempt["task_id"], attempt["agent_id"]
+            ))
+        combined = {orbit["orbit_id"]: orbit for orbit in rows}
+        return sorted(
+            combined.values(),
+            key=lambda orbit: (orbit["created_at"], orbit["orbit_id"]),
+        )
+
+    def _close_attempt(self, attempt_id, state, reason, *, clear_task=False):
+        if not attempt_id:
+            return False
+        closed = self.store.close_attempt(attempt_id, state, reason)
+        if clear_task:
+            attempt = self.store.get_attempt(attempt_id)
+            task = self.store.get_task(attempt["task_id"]) if attempt else None
+            if task is not None and task["attempt_id"] == attempt_id:
+                self.store.set_task(task["task_id"], attempt_id=None,
+                                    connect_attempt_id=None)
+        return closed
+
+    def _invalidate_attempt_lease(self, attempt_id, state, reason,
+                                  *, triggering_orbit_id=None):
+        """Fail closed when an execution-generation loses write authority.
+
+        The worktree is preserved for operator salvage, but the task becomes
+        ABORTED and cannot silently continue under a terminal attempt.  A later
+        bail/reclaim performs the explicit cleanup+requeue policy.
+        """
+        attempt = self.store.get_attempt(attempt_id) if attempt_id else None
+        if attempt is None or attempt["terminal_at"] is not None:
+            return
+        if self.store.active_connect_attempts_for_attempt(attempt_id):
+            raise RuntimeError("cannot invalidate a pinned connect attempt")
+        now = time.time()
+        for orbit in self._live_orbits_for_attempt_generation(attempt):
+            if orbit["orbit_id"] == triggering_orbit_id:
+                continue
+            terminal = "DENIED" if orbit["state"] == "PENDING" else "RELEASED"
+            self.store.set_orbit(
+                orbit["orbit_id"], state=terminal, released_at=now,
+                merging=0, merge_deadline=None,
+                terminal_reason=f"attempt_invalidated:{reason}", reclaimed=True,
+                transition_at=now,
+            )
+        self.store.close_attempt(attempt_id, state, reason, terminal_at=now)
+        task = self.store.get_task(attempt["task_id"])
+        if task is not None and task["attempt_id"] == attempt_id:
+            task_state = task["state"]
+            if task_state == "CONNECTING":
+                raise RuntimeError("cannot invalidate CONNECTING task projection")
+            if task_state in ("IN_ORBIT", "DONE"):
+                task_state = fsm.advance("task", task_state, "abort")
+                if not task.get("worktree"):
+                    task_state = fsm.advance("task", task_state, "requeue")
+            self.store.set_task(
+                task["task_id"], state=task_state, attempt_id=None,
+                connect_attempt_id=None,
+                agent_id=task["agent_id"] if task.get("worktree") else None,
+            )
+        self._emit("task_attempt_invalidated", attempt["task_id"],
+                   attempt_id=attempt_id, state=state, reason=reason)
+
+    def _pending_attempt_is_eligible(self, orbit) -> bool:
+        attempt_id = orbit.get("attempt_id")
+        if attempt_id is None:
+            return True  # legacy/unbound demand retains old behavior
+        attempt = self.store.get_attempt(attempt_id)
+        if attempt is None or attempt["terminal_at"] is not None:
+            return False
+        agent = self.store.get_agent(orbit["agent_id"])
+        if agent is not None and agent["state"] in ("RETIRED", "ZOMBIE", "BAILING"):
+            return False
+        task = self.store.get_task(orbit["task_id"])
+        if task is None:
+            return False
+        if task["state"] in ("ABORTED", "MERGED"):
+            return False
+        return task["attempt_id"] in (None, attempt_id) and task["agent_id"] in (
+            None,
+            orbit["agent_id"],
+        )
+
     def _promote_pending(self):
         for o in self.store.pending_orbits():  # 우선순위 DESC → FIFO
+            if not self._pending_attempt_is_eligible(o):
+                self.store.set_orbit(
+                    o["orbit_id"], state=fsm.advance("orbit", "PENDING", "deny"),
+                    terminal_reason="attempt_superseded",
+                )
+                self._emit("orbit_denied", o["agent_id"], orbit_id=o["orbit_id"],
+                           reason="attempt_superseded")
+                if o.get("attempt_id") and not self.store.live_orbits_for_attempt(
+                    o["attempt_id"]
+                ):
+                    self._close_attempt(
+                        o["attempt_id"], "SUPERSEDED", "attempt_superseded"
+                    )
+                continue
             if not self._conflicts(json.loads(o["pathspec"]), o["mode"]):
                 fence = self.store.next_fence()
                 # §D12: PENDING read-궤도가 뒤늦게 grant 될 때도 현 통합 gen 을 박는다.
@@ -349,7 +577,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 self.store.set_orbit(
                     o["orbit_id"],
                     state=fsm.advance("orbit", "PENDING", "grant"),
-                    expires_at=time.time() + 600, fence=fence, read_gen=rg)
+                    expires_at=time.time() + (o["requested_ttl"] or 600.0),
+                    fence=fence, read_gen=rg)
                 self._emit("orbit_granted", o["agent_id"], orbit_id=o["orbit_id"],
                            fence=fence, mode=o["mode"], promoted=True)
 
@@ -439,8 +668,27 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             self._reclaim_zombies_inline()
         now = time.time()
         for o in self.store.due_orbits(now):
-            self.store.set_orbit(o["orbit_id"],
-                                 state=fsm.advance("orbit", "HELD", "expire"))
+            current = self.store.get_orbit(o["orbit_id"])
+            if current is None or current["state"] != "HELD":
+                continue
+            attempt_id = self._attempt_id_for_orbit(current)
+            self.store.set_orbit(
+                o["orbit_id"],
+                state=fsm.advance("orbit", "HELD", "expire"),
+                transition_at=now,
+                terminal_effective_at=o["expires_at"],
+                terminal_reason="lease_expired",
+                reclaimed=True,
+            )
+            attempt = self.store.get_attempt(attempt_id) if attempt_id else None
+            if attempt_id and (
+                o["mode"] in WRITE_MODES
+                or not self._live_orbits_for_attempt_generation(attempt)
+            ):
+                self._invalidate_attempt_lease(
+                    attempt_id, "EXPIRED", "lease_expired",
+                    triggering_orbit_id=o["orbit_id"],
+                )
             self._emit("orbit_expired", o["agent_id"], orbit_id=o["orbit_id"])
         # D3(§1.2): TTL 만료된 flag_ephemeral lease — 보유자가 renew 안 함(GC-pause/사망) →
         # 받쳐주던 EPHEMERAL 플래그를 BROKEN(자동 clear) + 대기자 PRODUCER_DEAD 기상. 영구 hang 0.
@@ -485,10 +733,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             # 박는다. 그 한가운데서 heartbeat만 보고 회수하면 checker와 abort가 동시에 달린다.
             active_connect_pin = any(
                 t["state"] == "CONNECTING" and any(
-                    o["merging"] and (
-                        o["merge_deadline"] is None or o["merge_deadline"] > now
-                    )
-                    for o in self.store.pinned_orbits_for_task(t["task_id"])
+                    o["merging"] for o in self._current_attempt_orbits(t)
                 )
                 for t in self.store.tasks_for_agent(a["agent_id"])
             )
@@ -506,6 +751,16 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         ag = self.store.get_agent(agent_id)
         if ag is None or ag["state"] == "RETIRED":
             return {"agent": agent_id, "noop": True}
+        if voluntary:
+            now = time.time()
+            active_connect = any(
+                task["state"] == "CONNECTING" and any(
+                    orbit["merging"] for orbit in self._current_attempt_orbits(task)
+                )
+                for task in self.store.tasks_for_agent(agent_id)
+            )
+            if active_connect:
+                return {"ok": False, "reason": "connect_in_progress", "retry": True}
         self.store.set_agent_state(agent_id, "BAILING" if voluntary else "ZOMBIE")
         # §D6: bail_epoch bump — 회수 전 epoch를 든 GC-pause 좀비가 살아나도 모든 변이가
         # stale bail_epoch로 FENCED_OUT (부활 방지). state 리셋(heartbeat)으로 못 우회.
@@ -544,8 +799,11 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         for o in self.store.orbits_owned_by_agent(agent_id, ("HELD", "PENDING")):
             trig = "expire" if o["state"] == "HELD" else "deny"  # HELD→EXPIRED, PENDING→DENIED
             # merging pin은 회수와 함께 해제(§E pin은 유계 — 보유자 사망도 한 경계).
-            self.store.set_orbit(o["orbit_id"], state=fsm.advance("orbit", o["state"], trig),
-                                 merging=0)
+            reclaim_reason = "agent_bail" if voluntary else "zombie_reclaim"
+            self.store.set_orbit(
+                o["orbit_id"], state=fsm.advance("orbit", o["state"], trig),
+                merging=0, terminal_reason=reclaim_reason, reclaimed=True,
+            )
             # §D12: 회수되는 read-궤도의 stale 신호 플래그도 청산(LIVE 누수 방지). 보유자가
             # 죽었으므로 connect 차단은 어차피 부활차단(bail_epoch)이 맡는다.
             if o["mode"] == "read":
@@ -560,19 +818,31 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         for t in self.store.tasks_for_agent(agent_id):
             for b in self.store.barriers_with_task(t["task_id"]):
                 affected_barriers.add(b["barrier_id"])
-            if t["state"] in ("CLAIMED", "IN_ORBIT", "CONNECTING"):  # CONNECTING 포함(P0-9)
-                s = fsm.advance("task", t["state"], "abort")
+            if t["state"] in ("CLAIMED", "IN_ORBIT", "DONE", "CONNECTING", "ABORTED"):
+                s = t["state"]
+                if s != "ABORTED":
+                    s = fsm.advance("task", s, "abort")
                 s = fsm.advance("task", s, "requeue")  # ABORTED→PENDING
-                self.store.set_task(t["task_id"], state=s, agent_id=None)
+                self.store.set_task(t["task_id"], state=s, agent_id=None,
+                                    attempt_id=None, connect_attempt_id=None)
                 requeued.append(t["task_id"])
                 if self.git and t["worktree"]:
-                    self.git.remove_worktree(t["worktree"])
+                    self.git.remove_worktree(
+                        t["worktree"], force=True, ignore_errors=True
+                    )
                     if t["branch"]:
                         self.git.delete_branch(t["branch"])  # P0-8: 안 지우면 다음 start() 막힘
+        terminal_reason = "agent_bail" if voluntary else "zombie_reclaim"
+        for attempt in self.store.active_attempts_for_agent(agent_id):
+            self.store.close_attempt(attempt["attempt_id"], "RECLAIMED", terminal_reason)
         # 죽은 참가자가 든 배리어 재평가(can_trip=False — reclaim 중엔 merge 안 함; 이 경로는
         # 사망이라 절대 fill 되지 않고 break/shrink 만 일어난다). 영구 hang 0(전원 BROKEN 기상).
         for bid in affected_barriers:
-            self._barrier_eval(bid)
+            barrier = self.store.get_barrier(bid)
+            if barrier and barrier["state"] == "TRIPPING":
+                self._break_barrier(barrier, reason="participant_dead_during_trip")
+            else:
+                self._barrier_eval(bid)
         self.store.set_agent_state(agent_id, "RETIRED")
         self._emit("agent_reclaimed", agent_id, voluntary=voluntary,
                    orbits=len(freed), tasks=len(requeued))
@@ -596,16 +866,34 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         write/shared orbit의 task_fence는 배리어와 동일하게 max(individual fences). 통과면 None,
         아니면 fenced_out 거부 dict. 작업 중 lease가 만료/재부여(ABA)됐으면 여기서 잡힌다.
         (agent/fence 둘 다 None이면 검사 skip — 증분2까지의 무인자 호출 하위호환.)"""
-        if agent_id is None and fence is None:
-            return None
         t = self.store.get_task(task_id)
         if t is None:
             return {"ok": False, "reason": "no such task"}
+        if t["attempt_id"]:
+            attempt = self.store.get_attempt(t["attempt_id"])
+            if attempt is None:
+                return {"ok": False, "reason": "missing_current_attempt",
+                        "fenced_out": True}
+            if attempt["terminal_at"] is not None and t["state"] != "MERGED":
+                return {"ok": False, "reason": "attempt_terminal",
+                        "attempt_id": attempt["attempt_id"], "fenced_out": True}
+        elif self.store.attempts_for_task(task_id):
+            return {"ok": False, "reason": "missing_current_attempt",
+                    "fenced_out": True}
         if agent_id is not None and t["agent_id"] not in (agent_id, None):
             return {"ok": False, "reason": "not owner", "owner": t["agent_id"],
                     "fenced_out": True}
-        writes = [o for o in self.store.orbits_for_task(task_id)
+        attempt_orbits = self._current_attempt_orbits(t)
+        writes = [o for o in attempt_orbits
                   if o["mode"] in WRITE_MODES]
+        if not writes:
+            return {
+                "ok": False,
+                "reason": "missing_current_write_orbit",
+                "fenced_out": True,
+            }
+        if agent_id is None and fence is None:
+            return None
         stale = [o["orbit_id"] for o in writes if o["state"] != "HELD"]
         if not stale:
             for o in writes:
@@ -675,14 +963,28 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         if request_id is None:
             yield cache
             return
+        arg_hash = self._arg_hash(verb, args)
         prior = self.store.get_idem(request_id)
+        if prior is not None and (
+            prior["agent_id"] != agent_id
+            or prior["verb"] != verb
+            or prior["arg_hash"] != arg_hash
+        ):
+            cache.hit = True
+            cache.value = {
+                "ok": False,
+                "reason": "idempotency_key_reused",
+                "request_id": request_id,
+            }
+            yield cache
+            return
         if prior is not None and prior["status"] == "DONE":
             cache.hit = True
             cache.value = json.loads(prior["response"])
             cache.value = dict(cache.value, replayed=True) if isinstance(cache.value, dict) else cache.value
             yield cache
             return
-        self.store.begin_idem(request_id, agent_id, verb, self._arg_hash(verb, args))
+        self.store.begin_idem(request_id, agent_id, verb, arg_hash)
         yield cache
         if cache.value is not None and self._is_success(cache.value):
             self.store.finish_idem(request_id, cache.value)
@@ -690,9 +992,43 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             self.store.clear_idem(request_id)
 
     # ---- merge_token / 통합 worktree (§D11) ----
-    def _trailer(self, task_id) -> str:
+    def _trailer(self, task_id, attempt_id=None, connect_attempt_id=None) -> str:
         """응결 머지 커밋에 박는 고유 trailer — git=병합의 진실(§D8) trailer-probe 키."""
-        return f"OMD-Connect: {task_id}"
+        lines = [f"OMD-Connect: {task_id}"]
+        if attempt_id:
+            lines.append(f"OMD-Attempt: {attempt_id}")
+        if connect_attempt_id:
+            lines.append(f"OMD-Connect-Try: {connect_attempt_id}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _validated_candidate_attestation(connect_row):
+        """Return a complete candidate triple, ``None`` for the no-op shape.
+
+        Partial/malformed migrated rows are never interpreted as authority.
+        """
+        values = (
+            connect_row["candidate_tree_sha"],
+            connect_row["candidate_commit_sha"],
+            connect_row["candidate_prepared_at"],
+        )
+        if all(value is None for value in values):
+            return None
+        if (
+            any(value is None for value in values)
+            or not isinstance(values[0], str)
+            or not values[0].strip()
+            or values[0] != values[0].strip()
+            or not isinstance(values[1], str)
+            or not values[1].strip()
+            or values[1] != values[1].strip()
+            or isinstance(values[2], bool)
+            or not isinstance(values[2], (int, float))
+            or not math.isfinite(values[2])
+            or values[2] < connect_row["started_at"]
+        ):
+            raise RuntimeError("invalid durable connect candidate attestation")
+        return values
 
     def _ensure_integration_wt(self):
         """전용 통합 worktree를 보장(멱등). 사용자 HEAD(root)는 절대 안 건드림(§D11). 락 밖 호출 OK."""
@@ -706,7 +1042,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         if not self.git or not self.integration_worktree:
             return
         if os.path.isdir(self.integration_worktree):
-            self.git.abort_merge(self.integration_worktree)
+            self.git.abort_merge_preserving_ref(
+                self.integration_worktree, self.integration_branch
+            )
 
     def _acquire_merge_token_locked(self, agent_id):
         """repo-wide merge_token(Semaphore max=1, §D11) 획득. 가용(다른 HELD 토큰 없음)이면 부여,
@@ -730,56 +1068,363 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
 
     # ---- 재기동 복구 (§D8, P0-6) ----
     def _recover(self):
+        """Serialize Git/DB recovery against every live OMD connect process."""
+        with self._integration_operation_guard():
+            self._recover_serialized()
+
+    def _recover_serialized(self):
         """재기동 시 git↔DB 조정(멱등). CONNECTING(또는 connect_intent 있는) task를 git 진실과
         맞춘다: 통합 브랜치에 trailer가 있으면 전진수정(→MERGED+해제+worktree 제거), 없으면
         rollback(→DONE, connect 재호출 가능). dangling merge_token은 abort 후 반납."""
-        with self._cs():
-            wt = None
+        wt = None
+        if self.git:
+            try:
+                wt = self._ensure_integration_wt()
+            except GitError as exc:
+                # Git unavailability is not evidence that an admitted candidate
+                # failed to land.  Stop before mutating immutable attempt/connect
+                # outcomes or releasing its token; a later restart can retry from
+                # the unchanged durable projection.
+                raise RuntimeError(
+                    "cannot prepare integration worktree for recovery"
+                ) from exc
+        # Prefetch only enough identity to acquire task ref seals.  Do not hold a
+        # SQLite writer transaction while waiting for Git locks: Phase C uses
+        # task-ref -> integration-ref -> DB, and recovery must not invert that at
+        # its first edge.
+        with self._lock:
+            recovery_snapshot = self.store.tasks_by_state(["CONNECTING"])
+            dangling_token_snapshot = self.store.all_held_merge_tokens()
+            recovery_branches = []
+            for candidate in recovery_snapshot:
+                candidate_attempt = (
+                    self.store.get_attempt(candidate["attempt_id"])
+                    if candidate.get("attempt_id") else None
+                )
+                recovery_branches.append(
+                    (candidate_attempt.get("branch") if candidate_attempt else None)
+                    or candidate.get("branch")
+                )
+        if self.git and len(recovery_snapshot) > 1:
+            raise RuntimeError(
+                "multiple CONNECTING tasks violate the merge-token invariant"
+            )
+        expected_projection = sorted(
+            (row["task_id"], row["attempt_id"], row["connect_attempt_id"])
+            for row in recovery_snapshot
+        )
+        with ExitStack() as recovery_locks, ExitStack() as recovery_tx:
             if self.git:
-                try:
-                    wt = self._ensure_integration_wt()
-                except GitError:
-                    wt = None
-            for t in self.store.tasks_by_state(["CONNECTING"]):
+                for branch in recovery_branches:
+                    if branch:
+                        recovery_locks.enter_context(self.git.branch_ref_lock(branch))
+                if recovery_snapshot or dangling_token_snapshot:
+                    # All recovery-side merge cleanup is ref-preserving.  Seal
+                    # the integration ref first so a raw update-ref cannot land
+                    # between worktree realignment and token reclamation.
+                    recovery_locks.enter_context(
+                        self.git.branch_ref_lock(self.integration_branch)
+                    )
+            prepared_git = {}
+            if recovery_snapshot:
+                candidate = recovery_snapshot[0]
+                attempt_id = candidate.get("attempt_id")
+                connect_attempt_id = candidate.get("connect_attempt_id")
+                with self._lock:
+                    candidate_attempt = (
+                        self.store.get_attempt(attempt_id) if attempt_id else None
+                    )
+                    candidate_connect = (
+                        self.store.get_connect_attempt(connect_attempt_id)
+                        if connect_attempt_id else None
+                    )
+                    candidate_history = self.store.attempts_for_task(
+                        candidate["task_id"]
+                    )
+                native = bool(candidate_history) or attempt_id is not None \
+                    or connect_attempt_id is not None
+                if native and (
+                    candidate_attempt is None
+                    or candidate_attempt["terminal_at"] is not None
+                    or candidate_connect is None
+                    or candidate_connect["terminal_at"] is not None
+                    or candidate_connect["attempt_id"] != attempt_id
+                    or candidate_connect["task_id"] != candidate["task_id"]
+                ):
+                    raise RuntimeError(
+                        f"incomplete connect provenance for task {candidate['task_id']}"
+                    )
                 merged_sha = None
+                recovered_code = "RECOVERED_MERGED"
+                candidate_attestation = (
+                    self._validated_candidate_attestation(candidate_connect)
+                    if candidate_connect is not None else None
+                )
                 if self.git and wt:
-                    merged_sha = self.git.branch_in_integration(
-                        wt, self.integration_branch, self._trailer(t["task_id"]))
+                    if connect_attempt_id:
+                        merged_sha = self.git.branch_in_integration(
+                            wt, self.integration_branch,
+                            f"OMD-Connect-Try: {connect_attempt_id}",
+                        )
+                        if merged_sha:
+                            if candidate_attestation is None:
+                                raise RuntimeError(
+                                    "recovered commit lacks durable candidate attestation "
+                                    f"for task {candidate['task_id']}"
+                                )
+                            candidate_tree, candidate_commit, _prepared_at = (
+                                candidate_attestation
+                            )
+                            if merged_sha != candidate_commit:
+                                raise RuntimeError(
+                                    "recovered commit does not match durable candidate "
+                                    f"for task {candidate['task_id']}"
+                                )
+                            expected_parents = (
+                                candidate_connect["integration_base_sha"],
+                                candidate_connect["branch_tip_sha"],
+                            )
+                            if (
+                                None in expected_parents
+                                or self.git.commit_parents(wt, merged_sha)
+                                != expected_parents
+                            ):
+                                raise RuntimeError(
+                                    "recovered commit parent mismatch for task "
+                                    f"{candidate['task_id']}"
+                                )
+                            if not self.git.commit_has_trailers(
+                                wt, merged_sha,
+                                self._trailer(
+                                    candidate["task_id"], attempt_id,
+                                    connect_attempt_id,
+                                ).splitlines(),
+                            ):
+                                raise RuntimeError(
+                                    "recovered commit trailer mismatch for task "
+                                    f"{candidate['task_id']}"
+                                )
+                            if self.git.commit_tree(wt, merged_sha) != candidate_tree:
+                                raise RuntimeError(
+                                    "recovered commit tree does not match durable candidate "
+                                    f"for task {candidate['task_id']}"
+                                )
+                        if not merged_sha and candidate_attestation is None \
+                                and candidate_connect["branch_tip_sha"] \
+                                and candidate_connect["integration_base_sha"] \
+                                and self.git.is_ancestor(
+                                    candidate_connect["branch_tip_sha"],
+                                    candidate_connect["integration_base_sha"], cwd=wt,
+                                ):
+                            merged_sha = candidate_connect["integration_base_sha"]
+                            recovered_code = "RECOVERED_ALREADY_INTEGRATED"
+                    else:
+                        merged_sha = self.git.branch_in_integration(
+                            wt, self.integration_branch,
+                            self._trailer(candidate["task_id"]),
+                        )
+                integration_base = (
+                    candidate_connect["integration_base_sha"]
+                    if candidate_connect is not None
+                    else candidate.get("integration_base_sha")
+                )
+                if not merged_sha:
+                    if self.git and wt and integration_base:
+                        self.git.abort_merge_verified(wt, integration_base)
+                    elif self.git and wt and candidate_connect is not None:
+                        raise RuntimeError(
+                            "missing durable integration base for task "
+                            f"{candidate['task_id']}"
+                        )
+                    elif self.git and wt and self.git.has_merge_in_progress(wt):
+                        self.git.abort_merge(wt)
+                prepared_git[candidate["task_id"]] = {
+                    "merged_sha": merged_sha,
+                    "recovered_code": recovered_code,
+                    "integration_base": integration_base,
+                    "candidate_attestation": candidate_attestation,
+                }
+            # A crashed Phase B may leave MERGE_HEAD even if its task projection
+            # is already absent.  The preserving abort runs under the integration
+            # ref seal acquired above and never rewrites that ref.
+            if self.git:
+                for token in dangling_token_snapshot:
+                    self._abort_dangling_merge(token)
+                if recovery_snapshot:
+                    candidate = recovery_snapshot[0]
+                    prepared = prepared_git[candidate["task_id"]]
+                    expected_tip = (
+                        prepared["merged_sha"] or prepared["integration_base"]
+                    )
+                    if expected_tip and self.git.branch_tip(
+                        self.integration_branch
+                    ) != expected_tip:
+                        raise RuntimeError(
+                            "integration tip changed during recovery for "
+                            f"{candidate['task_id']}"
+                        )
+            cleanup_worktrees = recovery_tx.enter_context(
+                self._post_commit_worktree_cleanup()
+            )
+            recovery_tx.enter_context(self._cs())
+            recovering_tasks = self.store.tasks_by_state(["CONNECTING"])
+            current_projection = sorted(
+                (row["task_id"], row["attempt_id"], row["connect_attempt_id"])
+                for row in recovering_tasks
+            )
+            if current_projection != expected_projection:
+                raise RuntimeError(
+                    "connect recovery projection changed while sealing Git refs"
+                )
+            for t in recovering_tasks:
+                attempt_id = t.get("attempt_id")
+                connect_attempt_id = t.get("connect_attempt_id")
+                attempt = self.store.get_attempt(attempt_id) if attempt_id else None
+                connect_row = (
+                    self.store.get_connect_attempt(connect_attempt_id)
+                    if connect_attempt_id else None
+                )
+                attempt_history = self.store.attempts_for_task(t["task_id"])
+                native = bool(attempt_history) or attempt_id is not None \
+                    or connect_attempt_id is not None
+                if native and (
+                    attempt is None
+                    or attempt["terminal_at"] is not None
+                    or connect_row is None
+                    or connect_row["terminal_at"] is not None
+                    or connect_row["attempt_id"] != attempt_id
+                    or connect_row["task_id"] != t["task_id"]
+                ):
+                    raise RuntimeError(
+                        f"incomplete connect provenance for task {t['task_id']}"
+                    )
+                recovered_orbits = []
+                if connect_row is not None:
+                    try:
+                        recovered_ids = json.loads(connect_row["orbit_ids"])
+                        recovered_fences = json.loads(connect_row["orbit_fences"])
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise RuntimeError(
+                            f"invalid connect provenance for task {t['task_id']}"
+                        ) from exc
+                    recovered_orbits = self.store.orbits_by_ids(recovered_ids)
+                    legacy_connect = attempt["opened_by"] in LEGACY_ATTEMPT_OPENERS
+                    if (
+                        len(recovered_orbits) != len(recovered_ids)
+                        or set(recovered_fences) != set(recovered_ids)
+                        or any(
+                            orbit["fence"] != recovered_fences.get(orbit["orbit_id"])
+                            or (not legacy_connect and orbit["attempt_id"] != attempt_id)
+                            for orbit in recovered_orbits
+                        )
+                    ):
+                        raise RuntimeError(
+                            f"connect orbit provenance mismatch for task {t['task_id']}"
+                        )
+                prepared = prepared_git.get(t["task_id"], {})
+                merged_sha = prepared.get("merged_sha")
+                recovered_code = prepared.get(
+                    "recovered_code", "RECOVERED_MERGED"
+                )
+                current_candidate_attestation = (
+                    self._validated_candidate_attestation(connect_row)
+                    if connect_row is not None else None
+                )
+                if current_candidate_attestation != prepared.get(
+                    "candidate_attestation"
+                ):
+                    raise RuntimeError(
+                        f"connect candidate changed during recovery for {t['task_id']}"
+                    )
                 if merged_sha:
+                    if connect_row is not None:
+                        if recovered_code == "RECOVERED_ALREADY_INTEGRATED":
+                            if (
+                                current_candidate_attestation is not None
+                                or merged_sha != connect_row["integration_base_sha"]
+                            ):
+                                raise RuntimeError(
+                                    "invalid no-op candidate recovery for task "
+                                    f"{t['task_id']}"
+                                )
+                        elif (
+                            current_candidate_attestation is None
+                            or merged_sha != current_candidate_attestation[1]
+                        ):
+                            raise RuntimeError(
+                                "recovered merge differs from durable candidate for task "
+                                f"{t['task_id']}"
+                            )
+                        pinned_tip = connect_row["branch_tip_sha"]
+                        if not pinned_tip or not self.git.is_ancestor(
+                            pinned_tip, merged_sha, cwd=wt
+                        ):
+                            raise RuntimeError(
+                                "recovered commit does not contain captured tip for "
+                                f"task {t['task_id']}"
+                            )
+                        try:
+                            current_tip = self.git.branch_tip(t["branch"])
+                        except GitError as exc:
+                            raise RuntimeError(
+                                f"cannot verify recovered task tip for {t['task_id']}"
+                            ) from exc
+                        if current_tip != pinned_tip or self._task_worktree_changes(t):
+                            raise RuntimeError(
+                                "task worktree changed after connect admission for "
+                                f"{t['task_id']}"
+                            )
                     # git 진실: 이미 응결됨 → 전진수정(P0-6: merge_sha 기록 후 해제).
+                    merged_globs = self._merged_write_globs(t["task_id"])
                     self.store.set_task(t["task_id"], merge_sha=merged_sha,
                                         merged_at=time.time())
-                    self._release_task_write_orbits(t["task_id"])
                     self.store.set_task(t["task_id"],
                                         state=fsm.advance("task", "CONNECTING", "merged"),
-                                        connect_intent_at=None, integration_base_sha=None)
+                                        connect_intent_at=None, integration_base_sha=None,
+                                        connect_attempt_id=None)
+                    new_gen = self.store.bump_integration_gen()
+                    self.store.append_merge_log(new_gen, t["task_id"], merged_globs)
+                    if connect_attempt_id:
+                        self.store.finish_connect_attempt(
+                            connect_attempt_id, outcome="MERGED",
+                            outcome_code=recovered_code, merge_sha=merged_sha,
+                            merge_gen=new_gen, resolution_source="RECOVERY",
+                        )
+                        self.store.close_attempt(
+                            attempt_id, "MERGED", "connect_recovered_merged"
+                        )
+                    self._mark_stale_reads(t["task_id"], new_gen, merged_globs)
+                    self._release_task_write_orbits(t["task_id"])
                     self.store.set_flag(t["task_id"], "merged")
                     if self.git and t["worktree"]:
-                        self.git.remove_worktree(t["worktree"])
+                        cleanup_worktrees.append(t["worktree"])
                     self._emit("connect_recovered", t["task_id"], merge_sha=merged_sha,
                                outcome="merged")
                 else:
-                    # checked merge는 영속한 pre-merge HEAD로 abort+검증한다. 실패하면
-                    # Coordinator 기동을 fail-stop해 DB/token/pin과 증거를 보존한다.
-                    integration_base = t.get("integration_base_sha")
-                    if self.git and wt and integration_base:
-                        self.git.abort_merge_verified(wt, integration_base)
-                    elif self.git and wt and self.git.has_merge_in_progress(wt):
-                        # Q11 이전 legacy intent에는 base SHA가 없어 기존 복구를 보존한다.
-                        self.git.abort_merge(wt)
+                    # Git rollback and integration-ref verification completed
+                    # before this DB transaction was opened.
                     # 검증된 미머지 → rollback(재시도가능). 궤도 unpin(merging=0).
-                    for o in self.store.pinned_orbits_for_task(t["task_id"]):
+                    for o in (recovered_orbits or self._current_attempt_orbits(t)):
                         self.store.set_orbit(o["orbit_id"], merging=0, merge_deadline=None)
                     self.store.set_task(t["task_id"],
                                         state=fsm.advance("task", "CONNECTING", "rollback"),
-                                        connect_intent_at=None, integration_base_sha=None)
+                                        connect_intent_at=None, integration_base_sha=None,
+                                        connect_attempt_id=None)
+                    if connect_attempt_id:
+                        self.store.finish_connect_attempt(
+                            connect_attempt_id, outcome="ROLLED_BACK",
+                            outcome_code="RECOVERED_ROLLBACK",
+                            resolution_source="RECOVERY",
+                        )
                     self._emit("connect_recovered", t["task_id"], outcome="rollback")
             # dangling merge_token: 재기동 시점에 HELD인 토큰은 정의상 dangling이다 —
             # merge_token은 connect Phase B 동안만 잠깐 보유되고, 그 Phase는 프로세스에 묶여
             # 재기동을 가로질러 살아있을 수 없다(§D11). 위에서 모든 CONNECTING task를 이미
             # git 진실과 조정했으므로(MERGED/DONE), 남은 토큰은 전부 abort+반납해 누수를 막는다.
-            for mt in self.store.all_held_merge_tokens():
-                self._abort_dangling_merge(mt)
+            for snapshot_token in dangling_token_snapshot:
+                mt = self.store.get_orbit(snapshot_token["orbit_id"])
+                if mt is None or mt["state"] != "HELD":
+                    continue
                 self.store.set_orbit(mt["orbit_id"],
                                      state=fsm.advance("orbit", "HELD", "expire"),
                                      released_at=time.time())
@@ -800,7 +1445,29 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         for b in self.store.all_barriers(states=["TRIPPING"]):
             parts = self.store.barrier_parties(b["barrier_id"], b["generation"])
             tasks = [self.store.get_task(p["task_id"]) for p in parts]
-            if parts and all(t is not None and t["state"] == "MERGED" for t in tasks):
+            native = any(p.get("arrive_attempt_id") for p in parts)
+            native_complete = not native or all(p.get("arrive_attempt_id") for p in parts)
+            barrier_merges = []
+            for party, task in zip(parts, tasks):
+                rows = (
+                    self.store.connect_attempts_for_attempt(party["arrive_attempt_id"])
+                    if party.get("arrive_attempt_id") else []
+                )
+                barrier_merges.append(
+                    task is not None
+                    and task["state"] == "MERGED"
+                    and (not native or (
+                        task["attempt_id"] == party["arrive_attempt_id"]
+                        and any(
+                            row["outcome"] == "MERGED"
+                            and row["trigger_kind"] == "BARRIER"
+                            and row["barrier_id"] == b["barrier_id"]
+                            and row["barrier_generation"] == b["generation"]
+                            for row in rows
+                        )
+                    ))
+                )
+            if parts and native_complete and all(barrier_merges):
                 self.store.set_barrier(b["barrier_id"],
                                        state=fsm.advance("barrier", "TRIPPING", "trip"))
                 self._emit("barrier_recovered", b["name"], barrier=b["name"],
@@ -834,13 +1501,83 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # path_in_globs = 정확매칭(soundness: 덮인다를 절대 거짓-양성으로 안 냄). 안 덮이면 위반.
         return [p for p in changed if not path_in_globs(p, write_globs)]
 
+    def _task_worktree_changes(self, task) -> list[str]:
+        """Changes not represented by the task's immutable branch tip."""
+        if not self.git or task is None or not task.get("worktree"):
+            return []
+        try:
+            return self.git.worktree_changes(task["worktree"])
+        except (GitError, OSError):
+            # Missing/unreadable cannot be proven clean; connect must fail closed.
+            return ["<worktree-unavailable>"]
+
+    def _task_branch_identity(self, task) -> str | None:
+        """Resolve the branch that must be sealed for one task projection."""
+        if task is None:
+            return None
+        attempt = (
+            self.store.get_attempt(task["attempt_id"])
+            if task.get("attempt_id") else None
+        )
+        return (attempt.get("branch") if attempt else None) or task.get("branch")
+
+    def _task_ref_seal(self, task_id):
+        """Prefetch a task branch without holding a DB transaction, then seal it.
+
+        The caller re-reads the task under ``_cs`` and compares its branch with
+        the returned value. A raw Git writer that wins before the seal is audited;
+        one that arrives after it is blocked by Git's own ref lock.
+        """
+        if not self.git:
+            return None, nullcontext()
+        with self._lock:
+            branch = self._task_branch_identity(self.store.get_task(task_id))
+        return branch, (
+            self.git.branch_ref_lock(branch) if branch else nullcontext()
+        )
+
+    def _integration_operation_guard(self):
+        if not self.git:
+            return nullcontext()
+        check_budget = self.integration_check_timeout if self.integration_check else 0.0
+        timeout = max(30.0, self.merge_timeout + check_budget + MERGE_PIN_GRACE_S)
+        return self.git.integration_operation_lock(
+            self.integration_branch, timeout=timeout
+        )
+
+    @contextmanager
+    def _post_commit_worktree_cleanup(self):
+        """Run non-transactional worktree retirement only after SQLite commits.
+
+        Paths may be appended while the inner transaction is active.  An inner
+        exception/COMMIT failure skips cleanup, preserving the worktree needed by
+        restart recovery.  A cleanup failure is fail-soft because the durable
+        MERGED record is already committed and the retained worktree is safer.
+        """
+        paths: list[str] = []
+        try:
+            yield paths
+        except BaseException:
+            raise
+        else:
+            if not self.git:
+                return
+            for path in dict.fromkeys(p for p in paths if p):
+                try:
+                    self.git.remove_worktree(path)
+                except (GitError, OSError) as exc:
+                    self._emit("worktree_cleanup_retained", path, error=str(exc))
+
     def _release_task_write_orbits(self, task_id):
         """task의 HELD write-orbit 전부 해제 + unpin(merge_sha 기록 *후* 호출 — P0-6 순서)."""
-        for o in self.store.orbits_for_task(task_id):
+        task = self.store.get_task(task_id)
+        orbits = self._current_attempt_orbits(task)
+        for o in orbits:
             if o["mode"] in WRITE_MODES and o["state"] == "HELD":
                 self.store.set_orbit(o["orbit_id"],
                                      state=fsm.advance("orbit", "HELD", "release"),
-                                     released_at=time.time(), merging=0, merge_deadline=None)
+                                     released_at=time.time(), merging=0, merge_deadline=None,
+                                     terminal_reason="merged_release")
 
     # ---- D12 read-set 코히런스 (§D12, 유령 읽기) ----
     def _merged_write_globs(self, task_id) -> list[str]:
@@ -856,7 +1593,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             except (TypeError, ValueError):
                 pass
         # write-orbit pathspec(해제 직전에 부르므로 아직 잡을 수 있을 때 합집합) 도 포함.
-        for o in self.store.orbits_for_task(task_id):
+        attempt_orbits = self._current_attempt_orbits(t)
+        for o in attempt_orbits:
             if o["mode"] in WRITE_MODES:
                 globs.extend(json.loads(o["pathspec"]))
         return list(dict.fromkeys(globs))  # 중복 제거(순서 보존)
@@ -961,7 +1699,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 if t is None:
                     return cache.set({"ok": False, "reason": "no such task"})
                 # 소유+fence: caller 가 이 task 의 HELD write-orbit 을 (agent,fence)로 쥐어야.
-                writes = [o for o in self.store.orbits_for_task(task_id)
+                current_orbits = self._current_attempt_orbits(t)
+                writes = [o for o in current_orbits
                           if o["mode"] in WRITE_MODES]
                 live = [o for o in writes if o["state"] == "HELD"]
                 if not live:
@@ -976,7 +1715,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 gen = self.store.integration_gen()
                 self.store.set_task(task_id, read_synced_gen=gen)
                 # 살아있는 read-궤도가 있으면(release_read=False 경로) 그것도 재앵커+stale 해제.
-                for o in self.store.orbits_for_task(task_id):
+                for o in current_orbits:
                     if o["mode"] == "read" and o["state"] == "HELD":
                         self.store.set_orbit(o["orbit_id"], read_gen=gen, stale=0)
                         self._clear_read_stale_signal(o["orbit_id"])
@@ -997,6 +1736,23 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         deps = list(deps or [])
         shared = list(shared or [])
         with self._cs():
+            current = self.store.get_task(task_id)
+            if current is not None and current["state"] not in (
+                "PENDING", "READY", "BLOCKED", "ABORTED"
+            ):
+                same_spec = (
+                    json.loads(current["writes"] or "[]") == writes
+                    and json.loads(current["reads"] or "[]") == reads
+                    and json.loads(current["deps"] or "[]") == deps
+                    and json.loads(current["shared"] or "[]") == shared
+                )
+                if same_spec:
+                    return {"ok": True, "task_id": task_id,
+                            "state": current["state"], "noop": True}
+                self._emit("declare_rejected", task_id, reason="task_active",
+                           state=current["state"])
+                return {"ok": False, "reason": "task_active", "task_id": task_id,
+                        "state": current["state"]}
             overlaps = [
                 {"write": write_glob, "shared": shared_glob}
                 for write_glob in writes
@@ -1057,6 +1813,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
 
     def claim(self, agent_id, pathspec, mode="write", *, ttl=600.0, task_id=None,
               reason="", priority=0, request_id=None, bail_epoch=None):
+        ttl, invalid_ttl = self._valid_ttl(ttl)
+        if invalid_ttl:
+            return invalid_ttl
         if isinstance(pathspec, str):
             pathspec = [pathspec]
         with self._cs():
@@ -1070,32 +1829,109 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 if dead:
                     return cache.set(dead)
                 self.store.upsert_agent(agent_id)
+                if task_id is not None:
+                    task = self.store.get_task(task_id)
+                    mismatch = (
+                        self._attempt_owner_mismatch(task_id, agent_id)
+                        if task is not None else None
+                    )
+                    if mismatch is not None:
+                        return cache.set(mismatch)
+                    if task is not None and task["state"] == "CONNECTING":
+                        return cache.set({"ok": False, "reason": "connect_in_progress",
+                                          "task_id": task_id})
+                    if task is not None and task["state"] in ("ABORTED", "MERGED"):
+                        return cache.set({"ok": False, "reason": "task_terminal",
+                                          "task_id": task_id, "state": task["state"]})
                 self._emit("orbit_requested", agent_id, mode=mode, paths=pathspec, task=task_id)
-                # §D9 의미적 멱등: dedup 우회돼도(다른 request_id·없음) 같은 의도면 기존 궤도 반환.
-                # §3.C 교차: 단 **현재 caller가 그 궤도의 소유자**여야 살아있는 HELD를 돌려준다 —
-                # 회수돼 타인에게 재부여된 lease를 우회로 넘기지 않음(fencing 무장 방지).
                 ikey = self._intent_key(agent_id, pathspec, mode, task_id)
+                # §D9 semantic dedup must precede native-attempt creation.  A live
+                # pre-R3 row has attempt_id=NULL; opening a normal CLAIM first would
+                # strand it outside the new generation and wedge finish/connect.
                 dup = self.store.orbit_by_intent(ikey)
                 if dup is not None and dup["agent_id"] == agent_id:
+                    attempt_id = dup.get("attempt_id")
+                    if attempt_id is not None:
+                        dup_attempt = self.store.get_attempt(attempt_id)
+                        if dup_attempt is None or dup_attempt["terminal_at"] is not None:
+                            return cache.set({
+                                "ok": False,
+                                "reason": "invalid_dedup_attempt_provenance",
+                                "orbit_id": dup["orbit_id"],
+                            })
+                    elif task_id is not None and self.store.get_task(task_id) is not None:
+                        active = self.store.active_attempt(task_id, agent_id)
+                        if active is not None \
+                                and active["opened_by"] not in LEGACY_ATTEMPT_OPENERS:
+                            return cache.set({
+                                "ok": False,
+                                "reason": "legacy_orbit_conflicts_with_native_attempt",
+                                "orbit_id": dup["orbit_id"],
+                                "attempt_id": active["attempt_id"],
+                            })
+                        adapter = active or self._ensure_attempt(
+                            task_id, agent_id, "CLAIM_LEGACY"
+                        )
+                        attempt_id = adapter["attempt_id"] if adapter else None
+                        current_task = self.store.get_task(task_id)
+                        if (
+                            adapter is not None
+                            and current_task is not None
+                            and current_task["attempt_id"] is None
+                            and current_task["agent_id"] == agent_id
+                            and current_task["state"] in ("IN_ORBIT", "DONE")
+                        ):
+                            # An upgraded coordinator may first see this task
+                            # after its pre-R3 start.  Bind the explicit adapter
+                            # projection now; the old orbit itself remains NULL.
+                            self.store.set_task(task_id, attempt_id=attempt_id)
+                            if adapter["started_at"] is None:
+                                self.store.start_attempt(
+                                    attempt_id, branch=current_task["branch"],
+                                    worktree_base_sha=None,
+                                )
                     self._emit("orbit_dedup", agent_id, orbit_id=dup["orbit_id"],
                                state=dup["state"])
                     out = {"orbit_id": dup["orbit_id"], "state": dup["state"],
-                           "fence": dup["fence"], "conflicts": [], "dedup": True}
+                           "fence": dup["fence"], "conflicts": [], "dedup": True,
+                           "attempt_id": attempt_id}
                     return cache.set(out)
+                if mode in WRITE_MODES or (
+                    mode == "read" and task_id is not None
+                    and self.store.get_task(task_id) is not None
+                ):
+                    attempt = self._ensure_attempt(task_id, agent_id, "CLAIM")
+                else:
+                    # Read coherence belongs to the execution generation when one
+                    # already exists, but a read-only request does not open a new
+                    # write attempt by itself.
+                    attempt = (
+                        self.store.active_attempt(task_id, agent_id)
+                        if task_id is not None else None
+                )
+                attempt_id = attempt["attempt_id"] if attempt else None
                 conf = self._conflicts(pathspec, mode)
                 if conf:
                     oid = self.store.add_orbit(task_id=task_id, agent_id=agent_id,
                                                pathspec=pathspec, mode=mode, state="PENDING",
                                                reason=reason, priority=priority,
-                                               intent_key=ikey)
+                                               intent_key=ikey, attempt_id=attempt_id,
+                                               requested_ttl=ttl)
                     if self._cycle_with(agent_id):  # 대기 시 데드락 사이클이면 거부
-                        self.store.set_orbit(oid, state=fsm.advance("orbit", "PENDING", "deny"))
+                        self.store.set_orbit(
+                            oid, state=fsm.advance("orbit", "PENDING", "deny"),
+                            terminal_reason="deadlock_denied",
+                        )
+                        if attempt_id and not self.store.live_orbits_for_attempt(attempt_id):
+                            self._close_attempt(attempt_id, "DENIED", "deadlock_denied")
                         self._emit("orbit_denied", agent_id, orbit_id=oid, deadlock=True)
                         # DENIED는 캐시 금지(§3.C) — 세상이 바뀌면 재시도가 성공할 수 있어야.
                         return cache.set({"orbit_id": oid, "state": "DENIED",
-                                          "deadlock": True, "conflicts": conf})
+                                          "deadlock": True, "conflicts": conf,
+                                          "attempt_id": attempt_id})
                     self._emit("orbit_pending", agent_id, orbit_id=oid, conflicts=len(conf))
-                    return cache.set({"orbit_id": oid, "state": "PENDING", "conflicts": conf})
+                    return cache.set({"orbit_id": oid, "state": "PENDING", "conflicts": conf,
+                                      "attempt_id": attempt_id})
                 fence = self.store.next_fence()
                 # §D12: read-궤도는 분기한 통합 generation 을 박는다 — 이후 겹치는 응결이
                 # 이보다 새 gen 을 만들면 stale 로 표시돼 consumer 가 옛 base 위에 빌드하는 것을 막는다.
@@ -1104,7 +1940,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                                            mode=mode, state="HELD", fence=fence,
                                            expires_at=time.time() + ttl, reason=reason,
                                            priority=priority, intent_key=ikey,
-                                           read_gen=read_gen)
+                                           read_gen=read_gen, attempt_id=attempt_id,
+                                           requested_ttl=ttl)
                 # §D12: read claim 은 그 task 의 read-set 동기화 gen 을 박는다(궤도 생명과 분리 —
                 # 궤도를 release 한 뒤에도 consumer 의 connect 가 코히런스를 검사하도록). 여러 read
                 # 를 claim 하면 가장 옛 gen(보수적)로 고정한다.
@@ -1118,11 +1955,15 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 be = self.store.get_agent(agent_id)
                 return cache.set({"orbit_id": oid, "state": "HELD", "fence": fence,
                                   "conflicts": [],
+                                  "attempt_id": attempt_id,
                                   "bail_epoch": be["bail_epoch"] if be else 0})
 
     def renew(self, orbit_id, agent_id, fence, ttl=600.0, *, request_id=None,
               bail_epoch=None):
         """궤도 lease 갱신(keepalive). 소유+fence 일치해야 — 오추방된 좀비는 FENCED_OUT."""
+        ttl, invalid_ttl = self._valid_ttl(ttl)
+        if invalid_ttl:
+            return invalid_ttl
         with self._cs():
             with self._idem(request_id, agent_id, "renew",
                             [orbit_id, fence, ttl]) as cache:
@@ -1140,8 +1981,36 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 bad = self._check_owner(o, agent_id, fence)
                 if bad:
                     return cache.set(bad)
+                now = time.time()
+                if o["expires_at"] is not None and o["expires_at"] <= now:
+                    attempt_id = self._attempt_id_for_orbit(o)
+                    self.store.set_orbit(
+                        orbit_id,
+                        state=fsm.advance("orbit", "HELD", "expire"),
+                        transition_at=now,
+                        terminal_effective_at=o["expires_at"],
+                        terminal_reason="lease_expired_before_renew",
+                        reclaimed=True,
+                    )
+                    attempt = self.store.get_attempt(attempt_id) if attempt_id else None
+                    if attempt_id and (
+                        o["mode"] in WRITE_MODES
+                        or not self._live_orbits_for_attempt_generation(attempt)
+                    ):
+                        self._invalidate_attempt_lease(
+                            attempt_id, "EXPIRED", "lease_expired_before_renew",
+                            triggering_orbit_id=orbit_id,
+                        )
+                    self._emit("orbit_expired", agent_id, orbit_id=orbit_id,
+                               reason="lease_expired_before_renew")
+                    self._promote_pending()
+                    return cache.set({
+                        "ok": False,
+                        "reason": "lease expired",
+                        "fenced_out": True,
+                    })
                 self.store.set_orbit(orbit_id, state=fsm.advance("orbit", "HELD", "renew"),
-                                     expires_at=time.time() + ttl)
+                                     expires_at=now + ttl)
                 self._emit("orbit_renewed", agent_id, orbit_id=orbit_id)
                 return cache.set({"ok": True, "expires_in": ttl})
 
@@ -1168,8 +2037,27 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 bad = self._check_owner(o, agent_id, fence)
                 if bad:
                     return cache.set(bad)
-                self.store.set_orbit(orbit_id, state=fsm.advance("orbit", "HELD", "release"),
-                                     released_at=time.time())
+                if o["merging"]:
+                    return cache.set({"ok": False, "reason": "connect_in_progress",
+                                      "retry": True})
+                now = time.time()
+                attempt_id = self._attempt_id_for_orbit(o)
+                self.store.set_orbit(
+                    orbit_id,
+                    state=fsm.advance("orbit", "HELD", "release"),
+                    released_at=now,
+                    transition_at=now,
+                    terminal_reason="explicit_release",
+                )
+                attempt = self.store.get_attempt(attempt_id) if attempt_id else None
+                if attempt_id and (
+                    o["mode"] in WRITE_MODES
+                    or not self._live_orbits_for_attempt_generation(attempt)
+                ):
+                    self._invalidate_attempt_lease(
+                        attempt_id, "RELEASED", "explicit_release",
+                        triggering_orbit_id=orbit_id,
+                    )
                 self._emit("orbit_released", agent_id, orbit_id=orbit_id)
                 self._promote_pending()
                 return cache.set({"ok": True})
@@ -1298,29 +2186,113 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 if dead:
                     return cache.set(dead)
                 t = self.store.get_task(task_id)
+                if t is None:
+                    return cache.set({"ok": False, "reason": "no such task"})
                 # 이미 시작됨(같은 agent) — worktree 재생성 금지(자연 멱등).
                 if t["state"] in ("IN_ORBIT", "DONE", "CONNECTING", "MERGED") \
                         and t["agent_id"] == agent_id:
+                    current_attempt = (
+                        self.store.get_attempt(t["attempt_id"])
+                        if t["attempt_id"] else None
+                    )
+                    if current_attempt is None and t["attempt_id"] is None:
+                        adapter = self.store.active_attempt(task_id, agent_id)
+                        if adapter is not None \
+                                and adapter["opened_by"] in LEGACY_ATTEMPT_OPENERS:
+                            self.store.set_task(
+                                task_id, attempt_id=adapter["attempt_id"]
+                            )
+                            if adapter["started_at"] is None:
+                                self.store.start_attempt(
+                                    adapter["attempt_id"], branch=t["branch"],
+                                    worktree_base_sha=None,
+                                )
+                            t = self.store.get_task(task_id)
+                            current_attempt = self.store.get_attempt(
+                                adapter["attempt_id"]
+                            )
+                    if current_attempt is not None and current_attempt["terminal_at"] is not None:
+                        return cache.set({
+                            "ok": False,
+                            "reason": "attempt_terminal",
+                            "fenced_out": True,
+                            "attempt_id": current_attempt["attempt_id"],
+                        })
                     self._emit("task_start_dedup", agent_id, task=task_id)
                     return cache.set({"task_id": task_id, "state": t["state"],
                                       "worktree": t["worktree"], "branch": t["branch"],
+                                      "attempt_id": t["attempt_id"],
                                       "dedup": True})
+                active = self.store.active_attempts_for_task(task_id)
+                attempt = next((a for a in active if a["agent_id"] == agent_id), None)
+                if attempt is None and active:
+                    return cache.set({
+                        "ok": False,
+                        "reason": "attempt_owner_mismatch",
+                        "owners": sorted({a["agent_id"] for a in active}),
+                    })
+                if t["state"] not in ("READY", "CLAIMED"):
+                    return cache.set({"ok": False, "reason": "task_not_ready",
+                                      "state": t["state"]})
+                if attempt is None:
+                    legacy_live = self._legacy_unbound_orbits(task_id, agent_id)
+                    opener = (
+                        "START_LEGACY"
+                        if any(o["state"] == "HELD" and o["mode"] in WRITE_MODES
+                               for o in legacy_live)
+                        else "START"
+                    )
+                    attempt = self._ensure_attempt(task_id, agent_id, opener)
+                attempt_id = attempt["attempt_id"]
+                # Once ownership starts, competing demand attempts for the same task
+                # cannot later promote underneath this execution generation.
+                for other in active:
+                    if other["attempt_id"] == attempt_id:
+                        continue
+                    for orbit in self.store.live_orbits_for_attempt(other["attempt_id"]):
+                        if orbit["state"] == "PENDING":
+                            self.store.set_orbit(
+                                orbit["orbit_id"], state="DENIED",
+                                terminal_reason="task_started_by_other_agent",
+                            )
+                        elif orbit["state"] == "HELD":
+                            self.store.set_orbit(
+                                orbit["orbit_id"], state="RELEASED",
+                                released_at=time.time(), merging=0,
+                                merge_deadline=None,
+                                terminal_reason="task_started_by_other_agent",
+                            )
+                    self.store.close_attempt(
+                        other["attempt_id"], "SUPERSEDED", "task_started_by_other_agent"
+                    )
                 s = t["state"]
                 if s == "READY":
                     s = fsm.advance("task", s, "claim")
+                if s != "CLAIMED":
+                    return cache.set({"ok": False, "reason": "task_not_ready", "state": s})
                 s = fsm.advance("task", s, "start")  # CLAIMED→IN_ORBIT
                 self.store.upsert_agent(agent_id)
                 worktree = branch = None
+                worktree_base_sha = None
                 if self.git:
                     branch = f"omd/{task_id}"
                     worktree = os.path.join(self.worktrees_dir, task_id)
-                    self.git.add_worktree(branch, worktree)
+                    worktree_base_sha = self.git.revision_tip("HEAD")
+                    # Pin the same immutable OID stored in attempt provenance.
+                    # A raw writer may move symbolic HEAD between these calls.
+                    self.git.add_worktree(
+                        branch, worktree, base=worktree_base_sha
+                    )
                 self.store.set_task(task_id, state=s, agent_id=agent_id,
                                     worktree=worktree if self.git else ...,
-                                    branch=branch if self.git else ...)
+                                    branch=branch if self.git else ...,
+                                    attempt_id=attempt_id)
+                self.store.start_attempt(
+                    attempt_id, branch=branch, worktree_base_sha=worktree_base_sha
+                )
                 self._emit("task_started", agent_id, task=task_id, worktree=worktree)
                 return cache.set({"task_id": task_id, "state": s, "worktree": worktree,
-                                  "branch": branch})
+                                  "branch": branch, "attempt_id": attempt_id})
 
     def commit(self, task_id, msg, agent_id=None, fence=None, *, request_id=None,
                bail_epoch=None):
@@ -1346,7 +2318,14 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     self._emit("commit_rejected", task_id, reason=bad["reason"])
                     return cache.set(bad)
                 t = self.store.get_task(task_id)
-                writes = [o for o in self.store.orbits_for_task(task_id)
+                if t["state"] in ("CONNECTING", "MERGED", "ABORTED"):
+                    return cache.set({
+                        "ok": False,
+                        "reason": "connect_in_progress" if t["state"] == "CONNECTING"
+                        else "task_terminal",
+                        "state": t["state"],
+                    })
+                writes = [o for o in self._current_attempt_orbits(t)
                           if o["mode"] in WRITE_MODES and o["state"] == "HELD"]
                 write_globs = self._claimed_write_globs(task_id, writes)
                 if self.strict_writeset:
@@ -1406,6 +2385,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 if t["state"] in ("DONE", "CONNECTING", "MERGED"):
                     return cache.set({"task_id": task_id, "state": t["state"], "noop": True})
                 self.store.set_task(task_id, state=fsm.advance("task", t["state"], "finish"))
+                if t["attempt_id"]:
+                    self.store.finish_attempt(
+                        t["attempt_id"], source="EXPLICIT", finished_by=agent_id or t["agent_id"]
+                    )
                 self.store.set_flag(task_id, "done", set_by=t["agent_id"])
                 self._emit("task_finished", t["agent_id"], task=task_id)
                 return cache.set({"task_id": task_id, "state": "DONE"})
@@ -1423,16 +2406,41 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 t = self.store.get_task(task_id)
                 if t is None:
                     return {"ok": False, "reason": "no such task"}       # 캐시 금지 — 이후 declare 가능
-                if t["state"] == "ABORTED":
-                    return cache.set({"ok": True, "already": True, "state": "ABORTED"})
-                if t["state"] not in ("PENDING", "READY", "BLOCKED"):
+                already = t["state"] == "ABORTED"
+                if not already and t["state"] not in ("PENDING", "READY", "BLOCKED"):
                     return {"ok": False,                                  # 캐시 금지 — finish 후 재시도 무해
                             "reason": f"cancel 은 미시작 태스크 전용(state={t['state']}) — "
                                       f"시작된 작업은 finish/bail 경유"}
-                s = fsm.advance("task", t["state"], "abort")
-                self.store.set_task(task_id, state=s)
+                for attempt in self.store.active_attempts_for_task(task_id):
+                    for orbit in self._live_orbits_for_attempt_generation(attempt):
+                        if orbit["state"] == "PENDING":
+                            self.store.set_orbit(
+                                orbit["orbit_id"], state="DENIED",
+                                terminal_reason="task_cancelled",
+                            )
+                        else:
+                            self.store.set_orbit(
+                                orbit["orbit_id"], state="RELEASED",
+                                released_at=time.time(), merging=0,
+                                merge_deadline=None, terminal_reason="task_cancelled",
+                            )
+                    for connect_try in self.store.active_connect_attempts_for_attempt(
+                        attempt["attempt_id"]
+                    ):
+                        self.store.finish_connect_attempt(
+                            connect_try["connect_attempt_id"], outcome="CANCELLED",
+                            outcome_code="TASK_CANCELLED", resolution_source="LIVE",
+                        )
+                    self.store.close_attempt(
+                        attempt["attempt_id"], "CANCELLED", reason or "task_cancelled"
+                    )
+                s = "ABORTED" if already else fsm.advance("task", t["state"], "abort")
+                self.store.set_task(task_id, state=s, agent_id=None,
+                                    attempt_id=None, connect_attempt_id=None)
                 self._emit("task_cancelled", task_id, task=task_id, reason=reason)
-                return cache.set({"ok": True, "state": s, "reason": reason})
+                self._promote_pending()
+                return cache.set({"ok": True, "state": s, "reason": reason,
+                                  "already": already})
 
     # ---- CLOUD CONNECT — split-phase A–B–C (§3.B/§D8/§D11) ----
     def connect(self, task_id, agent_id=None, fence=None, push=None, *, request_id=None,
@@ -1451,10 +2459,26 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         if request_id is not None:
             with self._cs():
                 prior = self.store.get_idem(request_id)
+                expected_hash = self._arg_hash("connect", [task_id, fence])
+                if prior is not None and (
+                    prior["agent_id"] != agent_id
+                    or prior["verb"] != "connect"
+                    or prior["arg_hash"] != expected_hash
+                ):
+                    return {"ok": False, "reason": "idempotency_key_reused",
+                            "request_id": request_id}
                 if prior is not None and prior["status"] == "DONE":
                     out = json.loads(prior["response"])
                     return dict(out, replayed=True) if isinstance(out, dict) else out
 
+        with self._integration_operation_guard():
+            return self._connect_serialized(
+                task_id, agent_id, fence, push, request_id, bail_epoch
+            )
+
+    def _connect_serialized(self, task_id, agent_id, fence, push,
+                            request_id, bail_epoch):
+        """Phase A→B→C while holding the cross-process integration operation lock."""
         # 멱등(P0-9/D9): 이미 응결된 task는 재머지 없이 즉시 MERGED 회신.
         with self._cs():
             t0 = self.store.get_task(task_id)
@@ -1472,7 +2496,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 return a               # 거부(fenced_out 등)는 캐시 안 함(§3.C)
             if a.get("noop"):          # 이미 MERGED (멱등)
                 return a
-            # ----- Phase B: 락 밖(no _cs, no live tx) git merge -----
+            # ----- Phase B: 장기 락/tx 밖 Git merge; pre-CAS seal만 짧은 _cs -----
             token_id, intent = a["token_id"], a["intent"]
             merge_sha, err = self._connect_phase_b(intent, push=push)
             # ----- Phase C: 락 안 — merge_sha 먼저 기록 후 해제(P0-6) -----
@@ -1659,13 +2683,20 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 "branch": st.get("branch"), "fence": task_fence, "fences": fences,
                 "orbit_id": primary["orbit_id"] if primary else None,
                 "orbits": orbit_descriptors,
+                "attempt_id": st.get("attempt_id"),
                 "bail_epoch": agent["bail_epoch"] if agent else None,
                 "liveness_ttl": liveness_ttl}
 
     def _connect_phase_a(self, task_id, agent_id, fence, bail_epoch=None):
         """Phase A(임계구역): fence 재검증(P0-4) + merge_token 획득 + intent 영속 + pin + →CONNECTING."""
+        # Reclaim may remove a stale task worktree and delete its branch. Finish
+        # that maintenance before taking the same branch's raw-Git ref seal;
+        # otherwise our own <ref>.lock can make delete_branch fail-soft and wedge
+        # the next attempt on an orphaned branch.
         with self._cs():
             self._sweep_inline()
+        seal_branch, branch_lock = self._task_ref_seal(task_id)
+        with branch_lock, self._cs():
             # §D6: 회수/탈출된(또는 stale bail_epoch) 좀비의 connect는 부활 차단으로 거부.
             dead = self._check_alive(agent_id, bail_epoch)
             if dead:
@@ -1674,16 +2705,57 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             t = self.store.get_task(task_id)
             if t is None:
                 return {"ok": False, "reason": "no such task"}
+            if self.git and self._task_branch_identity(t) != seal_branch:
+                return {"ok": False, "reason": "task_branch_changed",
+                        "task_id": task_id}
             if t["state"] == "MERGED":
                 return {"ok": True, "noop": True, "task_id": task_id, "state": "MERGED",
                         "merge_sha": t["merge_sha"]}
-            writes = [o for o in self.store.orbits_for_task(task_id)
+            attempt = self.store.get_attempt(t["attempt_id"]) if t["attempt_id"] else None
+            if attempt is None:
+                owner = agent_id or t["agent_id"]
+                if owner:
+                    mismatch = self._attempt_owner_mismatch(task_id, owner)
+                    if mismatch is not None:
+                        self._emit(
+                            "connect_rejected", task_id,
+                            reason=mismatch["reason"], owner=mismatch["owner"],
+                            attempt_id=mismatch["attempt_id"],
+                        )
+                        return mismatch
+                    attempt = self._ensure_attempt(task_id, owner, "CONNECT_LEGACY")
+                    if attempt:
+                        self.store.set_task(task_id, attempt_id=attempt["attempt_id"])
+                        t = self.store.get_task(task_id)
+            attempt_id = attempt["attempt_id"] if attempt else None
+            current_orbits = self._current_attempt_orbits(t)
+            writes = [o for o in current_orbits
                       if o["mode"] in WRITE_MODES]
             if not writes:
+                historical_writes = [
+                    orbit for orbit in self.store.orbits_for_task(task_id)
+                    if orbit["mode"] in WRITE_MODES
+                ]
+                if historical_writes:
+                    stale = [orbit["orbit_id"] for orbit in historical_writes]
+                    self._emit(
+                        "connect_rejected", task_id, reason="stale_fence", stale=stale
+                    )
+                    return {
+                        "ok": False,
+                        "fenced_out": True,
+                        "reason": "stale fence: task execution generation ended",
+                        "stale": stale,
+                    }
                 return {"ok": False, "reason": "no write orbit for task"}
             # P0-4: 모든 write-orbit이 HELD여야(만료/해제면 stale). + 호출자가 (agent,fence)를
             # 줬으면 owner∧fence==task_fence(max individual fences) — ABA를 동일성으로 잡는다.
-            stale = [o["orbit_id"] for o in writes if o["state"] != "HELD"]
+            now = time.time()
+            stale = [
+                o["orbit_id"] for o in writes
+                if o["state"] != "HELD"
+                or (o["expires_at"] is not None and o["expires_at"] <= now)
+            ]
             if not stale and (agent_id is not None or fence is not None):
                 for o in writes:
                     if agent_id is not None and o["agent_id"] != agent_id:
@@ -1702,6 +2774,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             # **밖**의 파일을 건드렸으면 거부(merge 안 함, 토큰 안 잡음, 상태 불변). 이것으로
             # SINGULON 토대 (c)가 성립: 선언상 서로소 write-set이 *실제* write-set이 된다.
             write_globs = self._claimed_write_globs(task_id, writes)
+            uncommitted = self._task_worktree_changes(t)
+            if uncommitted:
+                return {"ok": False, "reason": "uncommitted_worktree_changes",
+                        "task_id": task_id, "changes": uncommitted}
             offending = self._writeset_audit(task_id, t["branch"], write_globs)
             if offending:
                 self._emit("connect_rejected", task_id, reason="writeset_violation",
@@ -1714,8 +2790,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             # 토큰 잡기 **전**에 검사(거부 시 토큰 쥐었다 반납하는 낭비/경합 회피).
             # 물방울 계약: rebase/재독 → read_refresh() 로 청산 후 재시도.
             ghost = self._ghost_reads(t)
-            stale_orbits = [o["orbit_id"] for o in
-                            self.store.stale_read_orbits_for_task(task_id)]
+            stale_orbits = [
+                o["orbit_id"] for o in current_orbits
+                if o["mode"] == "read" and o["state"] == "HELD" and o["stale"]
+            ]
             if ghost or stale_orbits:
                 self._emit("connect_rejected", task_id, reason="read_stale",
                            ghost_globs=ghost, stale_reads=stale_orbits)
@@ -1723,6 +2801,22 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                         "ghost_globs": ghost, "stale_reads": stale_orbits,
                         "hint": "rebase onto integration tip, then read_refresh() your "
                                 "read orbit(s) before retrying connect"}
+            branch_tip = None
+            integration_base = None
+            if self.git:
+                if not t["branch"]:
+                    return {"ok": False, "reason": "missing_task_branch",
+                            "task_id": task_id}
+                branch_tip = self.git.branch_tip(t["branch"])
+                integration_base = self.git.branch_tip(self.integration_branch)
+                if not branch_tip or not integration_base:
+                    return {
+                        "ok": False,
+                        "reason": "git_identity_unavailable",
+                        "task_id": task_id,
+                        "branch_tip_sha": branch_tip,
+                        "integration_base_sha": integration_base,
+                    }
             # merge_token(repo-wide Semaphore max=1) — 가용 아니면 retry(다른 connect 응결중).
             owner = agent_id or t["agent_id"] or f"connect:{task_id}"
             token_id = self._acquire_merge_token_locked(owner)
@@ -1732,6 +2826,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             s = t["state"]
             if s == "IN_ORBIT":
                 s = fsm.advance("task", s, "finish")
+                if attempt_id:
+                    self.store.finish_attempt(
+                        attempt_id, source="CONNECT_AUTO", finished_by=agent_id or t["agent_id"]
+                    )
             if s == "DONE":
                 s = fsm.advance("task", s, "connect")  # DONE→CONNECTING
             elif s != "CONNECTING":
@@ -1739,25 +2837,39 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 self._release_merge_token_locked(token_id)
                 return {"ok": False, "reason": f"task not connectable: {s}"}
             cap_fence = max((o["fence"] for o in writes if o["fence"] is not None), default=None)
-            branch_tip = None
-            integration_base = None
-            if self.git and t["branch"]:
-                branch_tip = self.git.branch_tip(t["branch"])
-                integration_base = self.git.branch_tip(self.integration_branch)
+            if attempt_id is None:
+                self._release_merge_token_locked(token_id)
+                return {"ok": False, "reason": "missing_attempt_identity"}
+            connect_attempt_id = self.store.add_connect_attempt(
+                attempt_id=attempt_id,
+                task_id=task_id,
+                token_id=token_id,
+                orbit_ids=[o["orbit_id"] for o in writes],
+                orbit_fences={o["orbit_id"]: o["fence"] for o in writes},
+                coordinator_epoch=self.leader_epoch,
+                branch_tip_sha=branch_tip,
+                integration_base_sha=integration_base,
+            )
             self.store.set_task(task_id, state=s, connect_fence=cap_fence,
                                 connect_intent_at=time.time(), branch_tip_sha=branch_tip,
-                                integration_base_sha=integration_base)
+                                integration_base_sha=integration_base,
+                                connect_attempt_id=connect_attempt_id)
             # 궤도 pin(merging=1) — sweep/reclaim이 응결중 궤도를 건드리지 않게(§E, 유계).
             check_budget = self.integration_check_timeout if self.integration_check else 0.0
             deadline = (time.time() + max(self.merge_timeout, 5.0)
                         + check_budget + MERGE_PIN_GRACE_S)
             for o in writes:
                 self.store.set_orbit(o["orbit_id"], merging=1, merge_deadline=deadline)
-            self._emit("connect_started", task_id, token_id=token_id, fence=cap_fence)
+            self._emit("connect_started", task_id, token_id=token_id, fence=cap_fence,
+                       attempt_id=attempt_id, connect_attempt_id=connect_attempt_id)
             intent = {"task_id": task_id, "branch": t["branch"], "worktree": t["worktree"],
                       "writes": [o["orbit_id"] for o in writes],
-                      "integration_base_sha": integration_base}
-            return {"ok": True, "token_id": token_id, "intent": intent}
+                      "integration_base_sha": integration_base,
+                      "branch_tip_sha": branch_tip,
+                      "attempt_id": attempt_id,
+                      "connect_attempt_id": connect_attempt_id}
+            return {"ok": True, "token_id": token_id, "intent": intent,
+                    "connect_attempt_id": connect_attempt_id}
 
     def _diagnose_conflict(self, branch, conflict_files):
         """P3 증분13(O1): 통합측에서 충돌 경로를 건드린 원인 커밋들을 bypass_audit 분류
@@ -1781,21 +2893,165 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         except GitError:
             return []
 
+    def _attest_connect_candidate(self, intent, candidate_sha, candidate_tree_sha):
+        """Durably bind the exact commit-tree object before its ref CAS.
+
+        This is the only deliberately short DB transaction inside Phase B.  Git
+        has created an unreachable candidate object, but the integration ref has
+        not moved.  Revalidate the entire admitted generation, then single-assign
+        its exact tree/commit identity so startup recovery never trusts a trailer
+        discovered in mutable Git history.
+        """
+        try:
+            with self._cs():
+                task_id = intent.get("task_id")
+                attempt_id = intent.get("attempt_id")
+                connect_attempt_id = intent.get("connect_attempt_id")
+                task = self.store.get_task(task_id)
+                attempt = (
+                    self.store.get_attempt(attempt_id) if attempt_id else None
+                )
+                connect_row = (
+                    self.store.get_connect_attempt(connect_attempt_id)
+                    if connect_attempt_id else None
+                )
+                token = (
+                    self.store.get_orbit(connect_row["token_id"])
+                    if connect_row is not None else None
+                )
+                try:
+                    orbit_ids = json.loads(connect_row["orbit_ids"])
+                    orbit_fences = json.loads(connect_row["orbit_fences"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    orbit_ids, orbit_fences = [], {}
+                orbits = self.store.orbits_by_ids(orbit_ids)
+                legacy_connect = (
+                    attempt is not None
+                    and attempt["opened_by"] in LEGACY_ATTEMPT_OPENERS
+                )
+                current_write_ids = (
+                    [
+                        orbit["orbit_id"]
+                        for orbit in self._current_attempt_orbits(task)
+                        if orbit["mode"] in WRITE_MODES
+                    ]
+                    if task is not None else []
+                )
+                captured_fence = max(
+                    (
+                        orbit_fences.get(orbit_id)
+                        for orbit_id in orbit_ids
+                        if orbit_fences.get(orbit_id) is not None
+                    ),
+                    default=None,
+                )
+                identity_ok = (
+                    isinstance(orbit_ids, list)
+                    and isinstance(orbit_fences, dict)
+                    and task is not None
+                    and task["state"] == "CONNECTING"
+                    and task["attempt_id"] == attempt_id
+                    and task["connect_attempt_id"] == connect_attempt_id
+                    and task["connect_fence"] == captured_fence
+                    and task["branch"] == intent.get("branch")
+                    and task["branch_tip_sha"] == intent.get("branch_tip_sha")
+                    and task["integration_base_sha"]
+                    == intent.get("integration_base_sha")
+                    and attempt is not None
+                    and attempt["task_id"] == task_id
+                    and attempt["branch"] == intent.get("branch")
+                    and attempt["terminal_at"] is None
+                    and connect_row is not None
+                    and connect_row["terminal_at"] is None
+                    and connect_row["attempt_id"] == attempt_id
+                    and connect_row["task_id"] == task_id
+                    and connect_row["coordinator_epoch"] == self.leader_epoch
+                    and connect_row["branch_tip_sha"]
+                    == intent.get("branch_tip_sha")
+                    and connect_row["integration_base_sha"]
+                    == intent.get("integration_base_sha")
+                    and token is not None
+                    and token["kind"] == "merge_token"
+                    and token["state"] == "HELD"
+                    and len(orbit_ids) == len(set(orbit_ids))
+                    and set(orbit_fences) == set(orbit_ids)
+                    and list(intent.get("writes", [])) == orbit_ids
+                    and set(current_write_ids) == set(orbit_ids)
+                    and len(orbits) == len(orbit_ids)
+                    and all(
+                        orbit["task_id"] == task_id
+                        and orbit["agent_id"] == attempt["agent_id"]
+                        and orbit["mode"] in WRITE_MODES
+                        and orbit["state"] == "HELD"
+                        and orbit["merging"]
+                        and orbit["fence"]
+                        == orbit_fences.get(orbit["orbit_id"])
+                        and (
+                            orbit["attempt_id"] == attempt_id
+                            or (legacy_connect and orbit["attempt_id"] is None)
+                        )
+                        for orbit in orbits
+                    )
+                )
+                if not identity_ok:
+                    raise RuntimeError(
+                        "connect provenance changed before candidate attestation"
+                    )
+                self.store.seal_connect_candidate(
+                    connect_attempt_id,
+                    tree_sha=candidate_tree_sha,
+                    commit_sha=candidate_sha,
+                )
+                sealed = self._validated_candidate_attestation(
+                    self.store.get_connect_attempt(connect_attempt_id)
+                )
+                if (
+                    sealed is None
+                    or sealed[0] != candidate_tree_sha
+                    or sealed[1] != candidate_sha
+                ):
+                    raise RuntimeError(
+                        "candidate attestation did not become durably complete"
+                    )
+        except GitIntegrationPreconditionError:
+            raise
+        except Exception as exc:
+            raise GitIntegrationPreconditionError(
+                "connect provenance changed before candidate attestation"
+            ) from exc
+
     def _connect_phase_b(self, intent, push=None):
-        """Phase B(**락 밖** — live tx 없음): 전용 통합 worktree에서 merge --no-ff(타임아웃, §E).
-        절대 _cs()/store.tx()를 잡지 않는다 — 다른 코디네이터 변이가 이 동안 interleave 가능.
-        push: per-call remote override(complete_task 등). None 이면 self.auto_push 상속."""
+        """Phase B: 전용 통합 worktree에서 merge --no-ff(타임아웃, §E).
+
+        후보 계산과 operator check는 live DB transaction 밖에서 돈다. 다만 commit-tree가
+        끝나고 ref CAS를 하기 직전에는 정확한 candidate OID/tree를 단일할당하는 짧은
+        ``_cs()`` attestation transaction 하나만 연다. push는 per-call override이며
+        ``None``이면 ``self.auto_push``를 상속한다.
+        """
         if not self.git:
             return None, None   # repo 미바인딩 — DB-only 응결(테스트/드라이런)
-        task_id, branch = intent["task_id"], intent["branch"]
+        task_id = intent["task_id"]
+        branch_tip = intent.get("branch_tip_sha")
+        integration_base = intent.get("integration_base_sha")
+        if not branch_tip or not integration_base:
+            return None, GitIntegrationPreconditionError(
+                "connect intent lacks pinned branch tip or integration base"
+            )
         try:
             wt = self._ensure_integration_wt()
-            msg = f"CLOUD CONNECT {task_id}\n\n{self._trailer(task_id)}"
-            sha = self.git.merge_into(wt, self.integration_branch, branch, msg,
+            msg = f"CLOUD CONNECT {task_id}\n\n{self._trailer(task_id, intent.get('attempt_id'), intent.get('connect_attempt_id'))}"
+            # Merge the Phase-A pinned full OID, not a movable branch name.
+            sha = self.git.merge_into(wt, self.integration_branch, branch_tip, msg,
                                       timeout=self.merge_timeout,
                                       check_argv=self.integration_check,
                                       check_timeout=self.integration_check_timeout,
-                                      check_output_limit=self.integration_check_output_limit)
+                                      check_output_limit=self.integration_check_output_limit,
+                                      expected_base=integration_base,
+                                      candidate_attestor=lambda commit_sha, tree_sha: (
+                                          self._attest_connect_candidate(
+                                              intent, commit_sha, tree_sha
+                                          )
+                                      ))
             # 연결=merge 직후 remote sync(operator "커밋하면 바로 sync"의 OMD 내장판).
             # opt-in(push override > self.auto_push). fail-soft: push 실패해도 merge 는 로컬
             # 반영됨이라 connect 는 성공 유지(다음 connect/수동 push 가 따라잡음). 강제 push 안 함.
@@ -1814,16 +3070,243 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
     def _connect_phase_c(self, task_id, token_id, intent, merge_sha, err):
         """Phase C(임계구역): Phase B 결과를 원자 반영. 성공이면 merge_sha 먼저 기록(P0-6) 후
         해제; 실패면 CONNECTING→DONE rollback(재시도가능). 어느 쪽이든 merge_token 반납 + unpin."""
-        with self._cs():
+        seal_attempt = (
+            self.store.get_attempt(intent.get("attempt_id"))
+            if self.git and intent.get("attempt_id") else None
+        )
+        seal_branch = seal_attempt["branch"] if seal_attempt else None
+        branch_lock = (
+            self.git.branch_ref_lock(seal_branch)
+            if self.git and seal_branch else nullcontext()
+        )
+        integration_lock = (
+            self.git.branch_ref_lock(self.integration_branch)
+            if self.git else nullcontext()
+        )
+        # Keep the global lock order task-ref -> integration-ref.  Startup
+        # recovery takes the same order, preventing a recovery/Phase-C lock
+        # inversion when singleton enforcement is explicitly disabled.
+        with branch_lock, integration_lock, \
+                self._post_commit_worktree_cleanup() as cleanup_worktrees, \
+                self._cs():
+            attempt_id = intent.get("attempt_id")
+            connect_attempt_id = intent.get("connect_attempt_id")
+            task = self.store.get_task(task_id)
+            token = self.store.get_orbit(token_id)
+            connect_row = (
+                self.store.get_connect_attempt(connect_attempt_id)
+                if connect_attempt_id else None
+            )
+            try:
+                durable_orbit_ids = json.loads(connect_row["orbit_ids"]) if connect_row else []
+                durable_fences = json.loads(connect_row["orbit_fences"]) if connect_row else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                durable_orbit_ids, durable_fences = [], {}
+            if not isinstance(durable_orbit_ids, list) or not isinstance(
+                durable_fences, dict
+            ):
+                durable_orbit_ids, durable_fences = [], {}
+            expected_orbits = self.store.orbits_by_ids(durable_orbit_ids)
+            attempt = self.store.get_attempt(attempt_id) if attempt_id else None
+            legacy_connect = (
+                attempt is not None
+                and attempt["opened_by"] in LEGACY_ATTEMPT_OPENERS
+            )
+            current_write_ids = (
+                list(durable_orbit_ids)
+                if legacy_connect else [
+                    orbit["orbit_id"]
+                    for orbit in self.store.orbits_for_attempt(attempt_id)
+                    if orbit["mode"] in WRITE_MODES
+                ] if attempt_id else []
+            )
+            candidate_values = (
+                (
+                    connect_row["candidate_tree_sha"],
+                    connect_row["candidate_commit_sha"],
+                    connect_row["candidate_prepared_at"],
+                )
+                if connect_row is not None else (None, None, None)
+            )
+            candidate_empty = all(value is None for value in candidate_values)
+            candidate_complete = (
+                all(value is not None for value in candidate_values)
+                and isinstance(candidate_values[0], str)
+                and bool(candidate_values[0].strip())
+                and isinstance(candidate_values[1], str)
+                and bool(candidate_values[1].strip())
+                and not isinstance(candidate_values[2], bool)
+                and isinstance(candidate_values[2], (int, float))
+                and math.isfinite(candidate_values[2])
+                and connect_row is not None
+                and candidate_values[2] >= connect_row["started_at"]
+            )
+            branch_tip_ok = not self.git
+            integration_tip_ok = not self.git
+            candidate_result_ok = True
+            success_outcome_code = "MERGED"
+            worktree_clean = True
+            if self.git and task is not None and task.get("branch"):
+                try:
+                    branch_tip_ok = self.git.branch_tip(task["branch"]) == (
+                        connect_row["branch_tip_sha"] if connect_row else None
+                    )
+                    expected_integration_tip = (
+                        merge_sha if merge_sha is not None
+                        else connect_row["integration_base_sha"] if connect_row else None
+                    )
+                    integration_tip_ok = self.git.branch_tip(
+                        self.integration_branch
+                    ) == expected_integration_tip
+                    if err is None and candidate_complete:
+                        candidate_result_ok = (
+                            merge_sha == candidate_values[1]
+                            and self.git.commit_tree(
+                                self.integration_worktree, merge_sha
+                            ) == candidate_values[0]
+                        )
+                    elif err is None and candidate_empty:
+                        candidate_result_ok = (
+                            merge_sha == connect_row["integration_base_sha"]
+                            and self.git.is_ancestor(
+                                connect_row["branch_tip_sha"],
+                                connect_row["integration_base_sha"],
+                                cwd=self.integration_worktree,
+                            )
+                        )
+                        if candidate_result_ok:
+                            success_outcome_code = "ALREADY_INTEGRATED"
+                except GitError:
+                    branch_tip_ok = False
+                    integration_tip_ok = False
+                    candidate_result_ok = False
+                worktree_clean = not self._task_worktree_changes(task)
+            captured_fences = [durable_fences.get(oid) for oid in durable_orbit_ids]
+            captured_task_fence = max(
+                (value for value in captured_fences if value is not None), default=None
+            )
+            projection_current = (
+                task is not None
+                and task["state"] == "CONNECTING"
+                and task["attempt_id"] == attempt_id
+                and task["connect_attempt_id"] == connect_attempt_id
+            )
+            durable_identity_ok = (
+                projection_current
+                and task["connect_fence"] == captured_task_fence
+                and token is not None
+                and token["state"] == "HELD"
+                and connect_row is not None
+                and connect_row["terminal_at"] is None
+                and connect_row["attempt_id"] == attempt_id
+                and connect_row["task_id"] == task_id
+                and connect_row["token_id"] == token_id
+                and connect_row["coordinator_epoch"] == self.leader_epoch
+                and attempt is not None
+                and attempt["task_id"] == task_id
+                and attempt["terminal_at"] is None
+                and attempt["branch"] == intent.get("branch")
+                and (task["branch"] if task else None) == attempt["branch"]
+                and len(expected_orbits) == len(durable_orbit_ids)
+                and set(durable_fences) == set(durable_orbit_ids)
+                and len(set(durable_orbit_ids)) == len(durable_orbit_ids)
+                and set(current_write_ids) == set(durable_orbit_ids)
+                and (candidate_empty or candidate_complete)
+                and candidate_result_ok
+                and branch_tip_ok
+                and integration_tip_ok
+                and worktree_clean
+                and all(
+                    orbit["state"] == "HELD"
+                    and orbit["merging"]
+                    and (
+                        orbit["attempt_id"] == attempt_id
+                        or (legacy_connect and orbit["attempt_id"] is None)
+                    )
+                    and orbit["fence"] == durable_fences.get(orbit["orbit_id"])
+                    for orbit in expected_orbits
+                )
+            )
+            intent_identity_ok = (
+                connect_row is not None
+                and connect_row["branch_tip_sha"] == intent.get("branch_tip_sha")
+                and connect_row["integration_base_sha"] == intent.get(
+                    "integration_base_sha"
+                )
+                and durable_orbit_ids == list(intent.get("writes", []))
+            )
+            identity_ok = durable_identity_ok and intent_identity_ok
+            if not identity_ok:
+                if connect_row is not None and connect_row["terminal_at"] is None \
+                        and merge_sha is not None:
+                    self.store.mark_connect_indeterminate(
+                        connect_attempt_id,
+                        outcome_code="STALE_AFTER_GIT_MERGE",
+                        detail="Phase-C identity failed after Git returned a merge SHA",
+                    )
+                    self._emit("connect_fail_stopped", task_id,
+                               reason="stale_connect_after_merge",
+                               attempt_id=attempt_id,
+                               connect_attempt_id=connect_attempt_id,
+                               merge_sha=merge_sha)
+                    return {"ok": False, "task_id": task_id,
+                            "state": task["state"] if task else None,
+                            "reason": "stale_connect_after_merge",
+                            "retryable": False, "merge_sha": merge_sha,
+                            "connect_attempt_id": connect_attempt_id}
+                if projection_current and connect_row is not None \
+                        and connect_row["terminal_at"] is None:
+                    self.store.mark_connect_indeterminate(
+                        connect_attempt_id,
+                        outcome_code="PHASE_C_IDENTITY_MISMATCH",
+                        detail="Current connect projection failed durable Phase-C identity",
+                    )
+                    self._emit("connect_fail_stopped", task_id,
+                               reason="phase_c_identity_mismatch",
+                               attempt_id=attempt_id,
+                               connect_attempt_id=connect_attempt_id)
+                    return {"ok": False, "task_id": task_id,
+                            "state": "CONNECTING", "reason": "stale_connect_attempt",
+                            "fenced_out": True, "retryable": False,
+                            "connect_attempt_id": connect_attempt_id}
+                if connect_row is not None and connect_row["terminal_at"] is None:
+                    self.store.finish_connect_attempt(
+                        connect_attempt_id,
+                        outcome="STALE",
+                        outcome_code="STALE_CONNECT_ATTEMPT",
+                        merge_sha=merge_sha,
+                        resolution_source="LIVE",
+                        detail="Phase-C identity/token/orbit CAS failed",
+                    )
+                for orbit in expected_orbits:
+                    if (orbit["attempt_id"] == attempt_id or (
+                            legacy_connect and orbit["attempt_id"] is None
+                    )) and orbit["merging"]:
+                        self.store.set_orbit(
+                            orbit["orbit_id"], merging=0, merge_deadline=None
+                        )
+                if token is not None and token["state"] == "HELD":
+                    self._release_merge_token_locked(token_id)
+                self._emit("connect_stale_phase_c", task_id,
+                           attempt_id=attempt_id,
+                           connect_attempt_id=connect_attempt_id)
+                return {"ok": False, "task_id": task_id,
+                        "reason": "stale_connect_attempt", "fenced_out": True,
+                        "connect_attempt_id": connect_attempt_id}
             if err is not None:
                 # checker가 tracked tree를 바꿔 merge --abort 뒤 원상복구를 증명하지 못한 경우는
                 # 자동 DONE rollback 금지. CONNECTING+token+pin을 보존해 증거를 조사하게 한다.
                 if isinstance(err, GitRollbackError):
-                    for o in self.store.pinned_orbits_for_task(task_id):
+                    for o in expected_orbits:
                         self.store.set_orbit(o["orbit_id"], merge_deadline=None)
                     self._emit("connect_fail_stopped", task_id,
                                reason="integration_rollback_failed",
                                problems=list(err.problems))
+                    self.store.mark_connect_indeterminate(
+                        connect_attempt_id,
+                        outcome_code="INTEGRATION_ROLLBACK_FAILED",
+                        detail=str(err),
+                    )
                     return {
                         "ok": False,
                         "task_id": task_id,
@@ -1834,10 +3317,11 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                         "problems": list(err.problems),
                     }
                 # Phase B 실패 → rollback(재시도가능). 궤도 unpin + 토큰 반납.
-                for o in self.store.pinned_orbits_for_task(task_id):
+                for o in expected_orbits:
                     self.store.set_orbit(o["orbit_id"], merging=0, merge_deadline=None)
                 self.store.set_task(task_id, state=fsm.advance("task", "CONNECTING", "rollback"),
-                                    connect_intent_at=None, integration_base_sha=None)
+                                    connect_intent_at=None, integration_base_sha=None,
+                                    connect_attempt_id=None)
                 self._release_merge_token_locked(token_id)
                 self._promote_pending()
                 if isinstance(err, GitIntegrationCheckTimeout):
@@ -1869,8 +3353,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 # P2 shared 레인: shared 궤도를 쥔 task 의 merge conflict 는 불변식 버그가
                 # 아니라 **정상사건**(같은 hunk 동시편집) — 경보 대신 rebase 복구 힌트(P3).
                 # 배타(write-only) task 의 conflict 는 기존 '구조적 불가=경보' 의미론 유지.
-                shared = any(o["mode"] == "shared"
-                             for o in self.store.orbits_for_task(task_id))
+                shared = any(o["mode"] == "shared" for o in expected_orbits)
                 if reason == "merge conflict" and shared:
                     reason = "shared_conflict"
                     out["hint"] = ("shared-lane 3-way conflict (정상사건) — worktree 브랜치를 "
@@ -1893,11 +3376,20 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     out["error"] = str(err)
                 else:
                     out["reason"] = f"{reason}: {err}"
+                self.store.finish_connect_attempt(
+                    connect_attempt_id,
+                    outcome="FAILED",
+                    outcome_code=reason.upper(),
+                    resolution_source="LIVE",
+                    detail=str(err),
+                )
+                out["connect_attempt_id"] = connect_attempt_id
                 return out
             # 성공: P0-6 순서 — merge_sha 먼저 기록 → MERGED → write-orbit 해제(+unpin).
             self.store.set_task(task_id, merge_sha=merge_sha, merged_at=time.time())
             self.store.set_task(task_id, state=fsm.advance("task", "CONNECTING", "merged"),
-                                connect_intent_at=None, integration_base_sha=None)
+                                connect_intent_at=None, integration_base_sha=None,
+                                connect_attempt_id=None)
             # §D12: 통합 generation 전진 + 겹치는 live read-궤도 stale 표시(write-orbit 해제
             # **전** — pathspec 이 아직 잡힐 때 글로브를 모은다).
             new_gen = self.store.bump_integration_gen()
@@ -1905,17 +3397,28 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             # merge_log: 이 gen 에 통합으로 들어간 write-globs 기록 — consumer 가 release 한 뒤에도
             # connect 에서 자기 read-set 코히런스를 검사할 수 있게(궤도 생명과 분리, §D12).
             self.store.append_merge_log(new_gen, task_id, merged_globs)
+            self.store.finish_connect_attempt(
+                connect_attempt_id,
+                outcome="MERGED",
+                outcome_code=success_outcome_code,
+                merge_sha=merge_sha,
+                merge_gen=new_gen,
+                resolution_source="LIVE",
+            )
+            self._close_attempt(attempt_id, "MERGED", "connect_merged")
             stale_reads = self._mark_stale_reads(task_id, new_gen, merged_globs)
             self._release_task_write_orbits(task_id)
             self._release_merge_token_locked(token_id)
             if self.git and intent.get("worktree"):
-                self.git.remove_worktree(intent["worktree"])
+                cleanup_worktrees.append(intent["worktree"])
             self.store.set_flag(task_id, "merged")
             self._emit("connect_merged", task_id, merge_sha=merge_sha,
                        gen=new_gen, stale_reads=len(stale_reads))
             self._promote_pending()
             return {"ok": True, "task_id": task_id, "state": "MERGED", "merge_sha": merge_sha,
-                    "gen": new_gen, "stale_reads": stale_reads}
+                    "gen": new_gen, "stale_reads": stale_reads,
+                    "attempt_id": attempt_id,
+                    "connect_attempt_id": connect_attempt_id}
 
     def status(self):
         self.sweep()

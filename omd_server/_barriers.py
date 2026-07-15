@@ -6,11 +6,16 @@ N-task 응결 rendezvous — 참가자 사망/타임아웃은 BROKEN 으로 전�
 """
 from __future__ import annotations
 
+from contextvars import ContextVar
 import json
 import time
 
 from . import fsm
-from ._const import MERGE_PIN_GRACE_S, WRITE_MODES
+from ._const import LEGACY_ATTEMPT_OPENERS, MERGE_PIN_GRACE_S, WRITE_MODES
+
+
+_BARRIER_CONNECT_CONTEXT = ContextVar("omd_barrier_connect_context", default=None)
+
 
 class BarrierMixin:
     # ---- D5 배리어: 세대-스탬프 응결 랑데부 + BROKEN 종단 (§D5, §1.2, §3.D) ----
@@ -24,14 +29,36 @@ class BarrierMixin:
                 out.append(t["task_id"])
         return out
 
-    def _party_write_fence(self, task_id):
-        """이 task 의 HELD write-orbit 들의 capture fence(arrive 시점 기록 / trip 재검증 기준).
-        write-orbit 이 하나도 HELD 가 아니면 None(=참가 자격 없음/사망)."""
-        writes = [o for o in self.store.orbits_for_task(task_id)
+    def _party_write_identity(self, task_id):
+        """Return the current attempt owner and fence for one barrier member."""
+        task = self.store.get_task(task_id)
+        if task is None:
+            return None
+        writes = [o for o in self._current_attempt_orbits(task)
                   if o["mode"] in WRITE_MODES and o["state"] == "HELD"]
         if not writes:
             return None
-        return max((o["fence"] for o in writes if o["fence"] is not None), default=None)
+        owners = {o["agent_id"] for o in writes}
+        if len(owners) != 1:
+            return None
+        attempt_id = task["attempt_id"]
+        if attempt_id:
+            attempt = self.store.get_attempt(attempt_id)
+            if attempt is None or attempt["terminal_at"] is not None:
+                return None
+            if attempt["agent_id"] != next(iter(owners)):
+                return None
+        return {
+            "attempt_id": attempt_id,
+            "owner": next(iter(owners)),
+            "fence": max(
+                (o["fence"] for o in writes if o["fence"] is not None), default=None
+            ),
+        }
+
+    def _party_write_fence(self, task_id):
+        identity = self._party_write_identity(task_id)
+        return identity["fence"] if identity else None
 
     def _party_alive(self, party) -> bool:
         """참가 task 가 아직 응결 가능한 살아있는 상태인가(도착 전/후 사망 판정, §D5).
@@ -109,10 +136,12 @@ class BarrierMixin:
                                    state=fsm.advance("barrier", "ARMED", "fill"))
             self._emit("barrier_tripping", b["name"], barrier=b["name"],
                        generation=b["generation"], parties=len(live))
-            # 결정적 순서(task_id) — 도착 fence 와 함께. 이미 MERGED 면 plan 제외(멱등).
-            return [{"task_id": p["task_id"], "expected_fence": p["arrive_fence"]}
-                    for p in sorted(live, key=lambda x: x["task_id"])
-                    if (self.store.get_task(p["task_id"]) or {}).get("state") != "MERGED"]
+            # 결정적 순서(task_id) — 도착 fence 와 함께. MERGED 멤버도 plan에 남겨
+            # 이 barrier generation의 connect 증거인지 _barrier_connect_phase_a가 검증한다.
+            return [{"task_id": p["task_id"], "expected_fence": p["arrive_fence"],
+                     "expected_attempt_id": p.get("arrive_attempt_id"),
+                     "expected_agent_id": p.get("agent_id")}
+                    for p in sorted(live, key=lambda x: x["task_id"])]
         return None
 
     def barrier_declare(self, name, task_ids, *, kind="connect", policy="break",
@@ -152,6 +181,17 @@ class BarrierMixin:
         """참가자 도착(§D5). task 가 응결 준비됨(write-orbit HELD)을 표시하고 arrive_fence 를
         기록. 전원 도착하면 배리어가 trip(전 task 를 결정적 순서로 응결=merge)하고 TRIPPED.
         한 명이라도 사망/타임아웃이면 BROKEN(전원 기상). merge(Phase B)는 락 밖에서 돈다."""
+        # The final arrival and the resulting trip are one recovery-visible
+        # operation.  Acquire before ARMED -> TRIPPING so recovery cannot mistake
+        # the live pre-first-member window for an abandoned partial trip.
+        with self._integration_operation_guard():
+            return self._barrier_arrive_serialized(
+                name, agent_id, task_id, fence=fence, request_id=request_id,
+                bail_epoch=bail_epoch,
+            )
+
+    def _barrier_arrive_serialized(self, name, agent_id, task_id, *, fence=None,
+                                   request_id=None, bail_epoch=None):
         # Phase A(락): 도착 기록 + eval → 트립 plan. merge 는 락 밖(아래).
         plan = None
         with self._cs():
@@ -178,15 +218,22 @@ class BarrierMixin:
                 if party is None:
                     return cache.set({"ok": False, "reason": "task not a barrier member",
                                       "name": name, "task": task_id})
-                cap = self._party_write_fence(task_id)
-                if cap is None:
+                identity = self._party_write_identity(task_id)
+                if identity is None:
                     return cache.set({"ok": False, "reason": "no HELD write orbit for task",
                                       "name": name, "task": task_id})
+                if identity["owner"] != agent_id:
+                    return cache.set({"ok": False, "reason": "not task attempt owner",
+                                      "fenced_out": True, "owner": identity["owner"],
+                                      "name": name, "task": task_id})
+                cap = identity["fence"]
                 if fence is not None and fence != cap:
                     return {"ok": False, "fenced_out": True,
                             "reason": "stale fence", "current": cap, "yours": fence}
                 self.store.set_barrier_party(b["barrier_id"], b["generation"], task_id,
-                                             arrived=1, arrive_fence=cap, agent_id=agent_id)
+                                             arrived=1, arrive_fence=cap,
+                                             arrive_attempt_id=identity["attempt_id"],
+                                             agent_id=agent_id)
                 self._emit("barrier_arrived", name, barrier=name, task=task_id,
                            generation=b["generation"], fence=cap)
                 plan = self._barrier_eval(b["barrier_id"], can_trip=True)
@@ -202,15 +249,57 @@ class BarrierMixin:
                                       "parties": len(parts)})
                 bid, gen = b["barrier_id"], b["generation"]
         # Phase B/C(락밖 merge + 원자 commit): 트립 plan 의 각 task 를 결정적 순서로 응결.
-        return self._barrier_trip(bid, gen, name, plan, request_id, agent_id)
+        return self._barrier_trip_serialized(
+            bid, gen, name, plan, request_id, agent_id,
+            idem_args=[name, task_id, fence],
+        )
 
-    def _barrier_trip(self, barrier_id, generation, name, plan, request_id, agent_id):
+    def _barrier_trip(self, barrier_id, generation, name, plan, request_id, agent_id,
+                      *, idem_args):
         """트립 실행(§D5): plan 의 각 task 를 _barrier_connect_one 으로 응결(공개 connect 아님).
         하나라도 실패(fence stale/merge 충돌)면 배리어 BROKEN(policy break — 전원 깸) + 이미
         응결된 것은 그대로(전진), 나머지는 멈춤. 전부 성공하면 TRIPPED."""
+        # A barrier trip is one integration publication operation.  Serializing
+        # each member separately leaves a recovery window between members where
+        # another coordinator can observe a legitimate partial trip as a crash,
+        # mark the barrier BROKEN, and race the live driver through the remainder.
+        with self._integration_operation_guard():
+            return self._barrier_trip_serialized(
+                barrier_id, generation, name, plan, request_id, agent_id,
+                idem_args=idem_args,
+            )
+
+    def _barrier_trip_serialized(self, barrier_id, generation, name, plan, request_id,
+                                 agent_id, *, idem_args):
         merged = []
         for step in plan:
-            res = self._barrier_connect_one(step["task_id"], step["expected_fence"])
+            # Defensive fail-closed check in addition to the operation lock.  It
+            # protects no-Git coordinators and detects any out-of-band state or
+            # generation change before publishing another member.
+            with self._cs():
+                current = self.store.get_barrier(barrier_id)
+                if (current is None or current["generation"] != generation
+                        or current["state"] != "TRIPPING"):
+                    state = current["state"] if current is not None else "MISSING"
+                    return {
+                        "ok": False, "state": state, "name": name,
+                        "reason": "barrier trip is no longer active",
+                        "merged": merged,
+                    }
+            context_token = _BARRIER_CONNECT_CONTEXT.set({
+                "expected_attempt_id": step.get("expected_attempt_id"),
+                "expected_agent_id": step.get("expected_agent_id"),
+                "barrier_id": barrier_id,
+                "barrier_generation": generation,
+            })
+            try:
+                # Keep the historical two-argument private hook intact.  Crash
+                # injectors and integrations wrap it to observe partial trips.
+                res = self._barrier_connect_one(
+                    step["task_id"], step["expected_fence"],
+                )
+            finally:
+                _BARRIER_CONNECT_CONTEXT.reset(context_token)
             if not res.get("ok"):
                 with self._cs():
                     b = self.store.get_barrier(barrier_id)
@@ -224,28 +313,49 @@ class BarrierMixin:
         out = None
         with self._cs():
             b = self.store.get_barrier(barrier_id)
-            if b and b["state"] == "TRIPPING":
-                self.store.set_barrier(barrier_id,
-                                       state=fsm.advance("barrier", "TRIPPING", "trip"))
-                self._emit("barrier_tripped", name, barrier=name, generation=generation,
-                           merged=merged)
+            if (b is None or b["generation"] != generation
+                    or b["state"] != "TRIPPING"):
+                state = b["state"] if b is not None else "MISSING"
+                return {
+                    "ok": False, "state": state, "name": name,
+                    "reason": "barrier trip changed before publication",
+                    "merged": merged,
+                }
+            self.store.set_barrier(barrier_id,
+                                   state=fsm.advance("barrier", "TRIPPING", "trip"))
+            self._emit("barrier_tripped", name, barrier=name, generation=generation,
+                       merged=merged)
             nb = self.store.get_barrier(barrier_id)
             out = {"ok": True, "state": nb["state"], "name": name, "merged": merged,
                    "generation": generation}
             if request_id is not None and self._is_success(out):
                 self.store.begin_idem(request_id, agent_id, "barrier_arrive",
-                                      self._arg_hash("barrier_arrive", [name, None, None]))
+                                      self._arg_hash("barrier_arrive", idem_args))
                 self.store.finish_idem(request_id, out)
         return out
 
     def _barrier_connect_one(self, task_id, expected_fence):
+        # _barrier_trip holds the integration-operation lock across the entire
+        # plan.  Keep this two-argument method as the historical injection hook;
+        # reacquiring the file lock here would deadlock because it is non-reentrant.
+        return self._barrier_connect_one_serialized(task_id, expected_fence)
+
+    def _barrier_connect_one_serialized(self, task_id, expected_fence):
         """응결 trip 프리미티브(§D5) — 공개 connect() 를 재호출하지 않는다(그 Phase A 의
         _sweep_inline 이 방금 검증한 궤도를 재진입 만료시킴). 대신 sweep 없는 Phase A'(fence==
         expected_fence 재검증) + 공유 Phase B(락밖 merge) + Phase C 를 직접 돌린다."""
+        context = _BARRIER_CONNECT_CONTEXT.get() or {}
+        expected_attempt_id = context.get("expected_attempt_id")
+        expected_agent_id = context.get("expected_agent_id")
+        barrier_id = context.get("barrier_id")
+        barrier_generation = context.get("barrier_generation")
         check_budget = self.integration_check_timeout if self.integration_check else 0.0
         deadline = time.time() + max(self.merge_timeout, 5.0) + check_budget + 10.0
         while True:
-            a = self._barrier_connect_phase_a(task_id, expected_fence)
+            a = self._barrier_connect_phase_a(
+                task_id, expected_fence, expected_attempt_id, expected_agent_id,
+                barrier_id, barrier_generation,
+            )
             if not a["ok"]:
                 if a.get("retry") and time.time() < deadline:
                     time.sleep(0.01)
@@ -257,22 +367,62 @@ class BarrierMixin:
             merge_sha, err = self._connect_phase_b(intent)
             return self._connect_phase_c(task_id, token_id, intent, merge_sha, err)
 
-    def _barrier_connect_phase_a(self, task_id, expected_fence):
+    def _barrier_connect_phase_a(self, task_id, expected_fence, expected_attempt_id=None,
+                                 expected_agent_id=None, barrier_id=None,
+                                 barrier_generation=None):
         """Phase A'(임계구역, **sweep 없음**): write-orbit 이 HELD ∧ fence==expected_fence 재검증
         (ABA 차단) + write-set 감사 + merge_token 획득 + →CONNECTING + pin + intent 영속.
         _connect_phase_a 와 동일하되 _sweep_inline 을 부르지 않는다(§D5 핵심)."""
-        with self._cs():
+        seal_branch, branch_lock = self._task_ref_seal(task_id)
+        with branch_lock, self._cs():
             t = self.store.get_task(task_id)
             if t is None:
                 return {"ok": False, "reason": "no such task"}
+            if self.git and self._task_branch_identity(t) != seal_branch:
+                return {"ok": False, "reason": "task_branch_changed",
+                        "task_id": task_id}
+            if expected_attempt_id is not None and t["attempt_id"] != expected_attempt_id:
+                return {"ok": False, "fenced_out": True,
+                        "reason": "barrier attempt changed since arrival"}
+            if expected_agent_id is not None and t["agent_id"] != expected_agent_id:
+                return {"ok": False, "fenced_out": True,
+                        "reason": "barrier owner changed since arrival"}
             if t["state"] == "MERGED":
-                return {"ok": True, "noop": True, "task_id": task_id, "state": "MERGED",
-                        "merge_sha": t["merge_sha"]}
-            writes = [o for o in self.store.orbits_for_task(task_id)
+                matching = [
+                    row for row in self.store.connect_attempts_for_attempt(
+                        expected_attempt_id
+                    )
+                    if row["outcome"] == "MERGED"
+                    and row["trigger_kind"] == "BARRIER"
+                    and row["barrier_id"] == barrier_id
+                    and row["barrier_generation"] == barrier_generation
+                ] if expected_attempt_id else []
+                if not matching:
+                    return {"ok": False, "fenced_out": True,
+                            "reason": "barrier merge provenance mismatch"}
+                return {"ok": True, "noop": True, "task_id": task_id,
+                        "state": "MERGED", "merge_sha": t["merge_sha"]}
+            attempt = self.store.get_attempt(t["attempt_id"]) if t["attempt_id"] else None
+            if attempt is None and t["agent_id"]:
+                mismatch = self._attempt_owner_mismatch(task_id, t["agent_id"])
+                if mismatch is not None:
+                    return mismatch
+                attempt = self._ensure_attempt(task_id, t["agent_id"], "BARRIER_CONNECT_LEGACY")
+                if attempt:
+                    self.store.set_task(task_id, attempt_id=attempt["attempt_id"])
+                    t = self.store.get_task(task_id)
+            attempt_id = attempt["attempt_id"] if attempt else None
+            attempt_orbits = self._current_attempt_orbits(t)
+            writes = [o for o in attempt_orbits
                       if o["mode"] in WRITE_MODES]
             if not writes:
                 return {"ok": False, "reason": "no write orbit for task"}
-            stale = [o["orbit_id"] for o in writes if o["state"] != "HELD"]
+            now = time.time()
+            stale = [
+                o["orbit_id"] for o in writes
+                if o["state"] != "HELD"
+                or (o["expires_at"] is not None and o["expires_at"] <= now)
+            ]
             if not stale and expected_fence is not None:
                 cur = max((o["fence"] for o in writes if o["fence"] is not None),
                           default=None)
@@ -283,10 +433,30 @@ class BarrierMixin:
                         "reason": "stale fence: lease changed since arrival",
                         "stale": stale}
             write_globs = self._claimed_write_globs(task_id, writes)
+            uncommitted = self._task_worktree_changes(t)
+            if uncommitted:
+                return {"ok": False, "reason": "uncommitted_worktree_changes",
+                        "task_id": task_id, "changes": uncommitted}
             offending = self._writeset_audit(task_id, t["branch"], write_globs)
             if offending:
                 return {"ok": False, "reason": "writeset_violation",
                         "offending": offending, "task_id": task_id}
+            branch_tip = None
+            integration_base = None
+            if self.git:
+                if not t["branch"]:
+                    return {"ok": False, "reason": "missing_task_branch",
+                            "task_id": task_id}
+                branch_tip = self.git.branch_tip(t["branch"])
+                integration_base = self.git.branch_tip(self.integration_branch)
+                if not branch_tip or not integration_base:
+                    return {
+                        "ok": False,
+                        "reason": "git_identity_unavailable",
+                        "task_id": task_id,
+                        "branch_tip_sha": branch_tip,
+                        "integration_base_sha": integration_base,
+                    }
             owner = t["agent_id"] or f"barrier:{task_id}"
             token_id = self._acquire_merge_token_locked(owner)
             if token_id is None:
@@ -294,6 +464,10 @@ class BarrierMixin:
             s = t["state"]
             if s == "IN_ORBIT":
                 s = fsm.advance("task", s, "finish")
+                if attempt_id:
+                    self.store.finish_attempt(
+                        attempt_id, source="BARRIER_AUTO", finished_by=t["agent_id"]
+                    )
             if s == "DONE":
                 s = fsm.advance("task", s, "connect")
             elif s != "CONNECTING":
@@ -301,29 +475,56 @@ class BarrierMixin:
                 return {"ok": False, "reason": f"task not connectable: {s}"}
             cap_fence = max((o["fence"] for o in writes if o["fence"] is not None),
                             default=None)
-            branch_tip = None
-            integration_base = None
-            if self.git and t["branch"]:
-                branch_tip = self.git.branch_tip(t["branch"])
-                integration_base = self.git.branch_tip(self.integration_branch)
+            if attempt_id is None:
+                self._release_merge_token_locked(token_id)
+                return {"ok": False, "reason": "missing_attempt_identity"}
+            connect_attempt_id = self.store.add_connect_attempt(
+                attempt_id=attempt_id,
+                task_id=task_id,
+                token_id=token_id,
+                orbit_ids=[o["orbit_id"] for o in writes],
+                orbit_fences={o["orbit_id"]: o["fence"] for o in writes},
+                coordinator_epoch=self.leader_epoch,
+                branch_tip_sha=branch_tip,
+                integration_base_sha=integration_base,
+                trigger_kind="BARRIER",
+                barrier_id=barrier_id,
+                barrier_generation=barrier_generation,
+            )
             self.store.set_task(task_id, state=s, connect_fence=cap_fence,
                                 connect_intent_at=time.time(), branch_tip_sha=branch_tip,
-                                integration_base_sha=integration_base)
+                                integration_base_sha=integration_base,
+                                connect_attempt_id=connect_attempt_id)
             check_budget = self.integration_check_timeout if self.integration_check else 0.0
             mdeadline = (time.time() + max(self.merge_timeout, 5.0)
                          + check_budget + MERGE_PIN_GRACE_S)
             for o in writes:
                 self.store.set_orbit(o["orbit_id"], merging=1, merge_deadline=mdeadline)
             self._emit("connect_started", task_id, token_id=token_id, fence=cap_fence,
-                       via="barrier")
+                       via="barrier", attempt_id=attempt_id,
+                       connect_attempt_id=connect_attempt_id)
             intent = {"task_id": task_id, "branch": t["branch"], "worktree": t["worktree"],
                       "writes": [o["orbit_id"] for o in writes],
-                      "integration_base_sha": integration_base}
-            return {"ok": True, "token_id": token_id, "intent": intent}
+                      "integration_base_sha": integration_base,
+                      "branch_tip_sha": branch_tip,
+                      "attempt_id": attempt_id,
+                      "connect_attempt_id": connect_attempt_id}
+            return {"ok": True, "token_id": token_id, "intent": intent,
+                    "connect_attempt_id": connect_attempt_id}
 
     def barrier_abort(self, name, agent_id=None, *, request_id=None, bail_epoch=None):
         """배리어를 강제로 깬다(§D5, Python Barrier.abort 시맨틱) — 도착해 있던 전원이 BROKEN
         으로 기상. 미달 상태에서 한 참가자가 진행 불가를 깨달았을 때(영구 hang 방지)."""
+        # Once a trip has begun, its member publications form one integration
+        # operation.  Abort linearizes before that operation or waits until it is
+        # terminal; it must never return BROKEN while a live driver keeps merging.
+        with self._integration_operation_guard():
+            return self._barrier_abort_serialized(
+                name, agent_id, request_id=request_id, bail_epoch=bail_epoch,
+            )
+
+    def _barrier_abort_serialized(self, name, agent_id=None, *, request_id=None,
+                                  bail_epoch=None):
         with self._cs():
             with self._idem(request_id, agent_id, "barrier_abort", [name]) as cache:
                 if cache.hit:

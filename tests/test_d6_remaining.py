@@ -26,13 +26,15 @@ def _setup_task(omd, task="A", agent="agA", paths="a/**"):
 
 # ---------- finish: owner+fence 가드 ----------
 def test_finish_rejects_stale_fence(tmp_path):
-    """작업 중 write-orbit fence 가 bump(ABA)됐으면 finish 는 FENCED_OUT — task 미완료."""
+    """보유자가 아닌 stale fence로 finish하면 FENCED_OUT — task 미완료.
+
+    R3에서 granted fence 자체는 immutable provenance라 같은 orbit row를
+    덮어쓰는 식의 ABA 모사는 DB trigger가 별도로 차단한다.
+    """
     omd = Coordinator(db_path=str(tmp_path / "omd.db"))
     r = _setup_task(omd)
     captured = r["fence"]
-    with omd.store.tx():  # ABA: 같은 궤도가 HELD 인 채 fence 만 바뀜(만료→재부여 모사)
-        omd.store.set_orbit(r["orbit_id"], state="HELD", fence=captured + 100)
-    res = omd.finish("A", "agA", captured)
+    res = omd.finish("A", "agA", captured + 100)
     assert res["ok"] is False and res.get("fenced_out"), res
     assert omd.store.get_task("A")["state"] == "IN_ORBIT"  # 완료 안 됨
 

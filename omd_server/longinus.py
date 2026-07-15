@@ -13,12 +13,33 @@ tests/test_longinus_bindings.py 가 매 커밋 가드(omd CI `pytest -q -rs` 자
 from __future__ import annotations
 
 import hashlib
+from importlib.metadata import PackageNotFoundError, distribution
 import json
 import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]            # omd repo root
-MANIFEST = ROOT / "docs" / "longinus_bindings.json"
+
+
+def _manifest_path() -> Path:
+    """Resolve the source-tree or wheel-installed canonical manifest."""
+    source = ROOT / "docs" / "longinus_bindings.json"
+    if source.exists():
+        return source
+    try:
+        dist = distribution("omd")
+        files = dist.files or ()
+    except PackageNotFoundError:
+        return source
+    for relative in files:
+        if tuple(relative.parts[-2:]) == ("docs", "longinus_bindings.json"):
+            candidate = Path(dist.locate_file(relative))
+            if candidate.exists():
+                return candidate
+    return source
+
+
+MANIFEST = _manifest_path()
 
 
 def _load(manifest: Path | None = None) -> dict:

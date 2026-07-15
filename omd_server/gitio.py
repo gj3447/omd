@@ -6,14 +6,17 @@ OMD의 명제를 실물 git에서 집행: 각 물방울은 독립 worktree+브�
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import re
 import signal
+import stat
 import subprocess
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -109,15 +112,27 @@ class GitRepo:
 
     # 테스트·헤드리스에서 전역 git config 없이도 커밋되게 신원 주입
     _IDENT = ["-c", "user.name=omd", "-c", "user.email=omd@acme"]
+    _REF_LOCK_MARKER_RE = re.compile(
+        rb"OMD-BRANCH-REF-LOCK v1 pid=([1-9][0-9]*) nonce=([0-9a-f]{32})\n"
+    )
+    _REF_LOCK_MARKER_LIMIT = 256
 
     def __init__(self, root: str):
         self.root = str(Path(root).resolve())
 
-    def _git(self, *args, cwd=None, timeout=None) -> str:
+    def _git(self, *args, cwd=None, timeout=None, input_text=None) -> str:
+        env = os.environ.copy()
+        # Runtime provenance is about the object named by the stored OID, not a
+        # mutable replacement/graft overlay that can reinterpret that OID after
+        # a crash.  NO_REPLACE does not disable legacy .git/info/grafts, so seal
+        # both history-rewrite mechanisms for every authoritative Git query.
+        env["GIT_NO_REPLACE_OBJECTS"] = "1"
+        env["GIT_GRAFT_FILE"] = os.devnull
         try:
             r = subprocess.run(
                 ["git", *args], cwd=cwd or self.root,
-                capture_output=True, text=True, timeout=timeout,
+                capture_output=True, text=True, timeout=timeout, input=input_text,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             raise GitTimeout(f"git {' '.join(args)} → timeout after {timeout}s")
@@ -127,6 +142,200 @@ class GitRepo:
 
     def current_branch(self, cwd=None) -> str:
         return self._git("rev-parse", "--abbrev-ref", "HEAD", cwd=cwd)
+
+    def revision_tip(self, revision: str = "HEAD", cwd=None) -> str:
+        """Resolve one immutable full object ID for provenance and split-phase pinning."""
+        return self._git("rev-parse", "--verify", revision, cwd=cwd)
+
+    def worktree_changes(self, worktree: str) -> list[str]:
+        """Return every staged, unstaged, or untracked task-worktree change."""
+        raw = self._git("status", "--porcelain=v1", cwd=worktree)
+        return raw.splitlines() if raw else []
+
+    @staticmethod
+    def _pid_is_dead(pid: int) -> bool:
+        """Return true only when the kernel positively reports that ``pid`` is absent.
+
+        Permission errors and unfamiliar platform errors are treated as a live
+        owner.  Stale-lock recovery must prefer a false negative over deleting a
+        lock that another process may still own.
+        """
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+
+    @staticmethod
+    def _same_file(lock_path: Path, identity: os.stat_result) -> bool:
+        """Revalidate a lock pathname without following a replacement symlink."""
+        try:
+            current = lock_path.stat(follow_symlinks=False)
+        except OSError:
+            return False
+        return (
+            stat.S_ISREG(current.st_mode)
+            and current.st_dev == identity.st_dev
+            and current.st_ino == identity.st_ino
+        )
+
+    @classmethod
+    def _reap_stale_omd_ref_lock(cls, lock_path: Path) -> bool:
+        """Remove a crashed OMD lock, never an ordinary Git or live OMD lock.
+
+        The marker is deliberately strict and bounded.  A candidate is eligible
+        only when it is a regular file containing the exact OMD marker and its PID
+        is positively dead.  The pathname's device/inode are then revalidated
+        against the opened file immediately before unlinking, so a concurrently
+        replaced Git lock is left untouched.  ``True`` means the caller should
+        retry ``O_EXCL`` immediately (the file was removed or disappeared).
+        """
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            existing_fd = os.open(lock_path, flags)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        try:
+            identity = os.fstat(existing_fd)
+            if not stat.S_ISREG(identity.st_mode):
+                return False
+            chunks = []
+            remaining = cls._REF_LOCK_MARKER_LIMIT + 1
+            while remaining:
+                chunk = os.read(existing_fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            marker = b"".join(chunks)
+            match = cls._REF_LOCK_MARKER_RE.fullmatch(marker)
+            if match is None or not cls._pid_is_dead(int(match.group(1))):
+                return False
+            if not cls._same_file(lock_path, identity):
+                return False
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                return True
+            return True
+        finally:
+            os.close(existing_fd)
+
+    @contextmanager
+    def _exclusive_omd_lock(self, lock_path: Path, label: str, timeout: float):
+        """Acquire one crash-reapable OMD-owned lock file with ``O_EXCL``."""
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + max(0.0, timeout)
+        marker = (
+            f"OMD-BRANCH-REF-LOCK v1 pid={os.getpid()} "
+            f"nonce={os.urandom(16).hex()}\n"
+        ).encode("ascii")
+        fd = None
+        identity = None
+        while fd is None:
+            try:
+                flags = (
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                )
+                fd = os.open(lock_path, flags, 0o600)
+            except FileExistsError as exc:
+                if self._reap_stale_omd_ref_lock(lock_path):
+                    continue
+                if time.monotonic() >= deadline:
+                    raise GitError(f"timed out sealing {label}") from exc
+                time.sleep(0.01)
+                continue
+            try:
+                written = 0
+                while written < len(marker):
+                    count = os.write(fd, marker[written:])
+                    if count <= 0:
+                        raise OSError("short write while marking OMD branch ref lock")
+                    written += count
+                os.fsync(fd)
+                identity = os.fstat(fd)
+            except BaseException:
+                try:
+                    if identity is None:
+                        identity = os.fstat(fd)
+                    if self._same_file(lock_path, identity):
+                        try:
+                            lock_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                finally:
+                    os.close(fd)
+                    fd = None
+                raise
+        try:
+            yield
+        finally:
+            try:
+                if identity is not None and self._same_file(lock_path, identity):
+                    try:
+                        lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
+            finally:
+                os.close(fd)
+
+    @contextmanager
+    def branch_ref_lock(self, branch: str, *, timeout: float = 5.0):
+        """Seal one task branch ref against concurrent raw Git commits.
+
+        Git itself uses ``<ref>.lock`` for compare-and-swap updates. Holding the
+        same lock from validation through the SQLite commit closes raw-writer
+        gaps. OMD marker/PID/inode checks make crashed locks safely reapable while
+        ordinary Git locks and live OMD owners are never removed.
+        """
+        ref_path = Path(self._git("rev-parse", "--git-path", f"refs/heads/{branch}"))
+        if not ref_path.is_absolute():
+            ref_path = Path(self.root, ref_path)
+        lock_path = Path(str(ref_path.resolve()) + ".lock")
+        with self._exclusive_omd_lock(
+            lock_path, f"branch ref {branch}", timeout
+        ):
+            yield
+
+    @contextmanager
+    def integration_operation_lock(self, integration_branch: str, *, timeout: float):
+        """Serialize OMD connect/recovery across lease-disabled MCP processes.
+
+        This lock is separate from Git's integration ref lock, so merge/update-ref
+        can still publish normally. It spans Phase A→B→C (or all of recovery),
+        preventing one coordinator from mistaking another live merge for a
+        crash-dangling token when leader leasing is intentionally disabled.
+        """
+        common = Path(
+            self._git("rev-parse", "--path-format=absolute", "--git-common-dir")
+        )
+        digest = hashlib.sha256(integration_branch.encode("utf-8")).hexdigest()
+        lock_path = common / "omd-locks" / f"integration-{digest}.lock"
+        with self._exclusive_omd_lock(
+            lock_path, f"integration operation {integration_branch}", timeout
+        ):
+            yield
+
+    def repository_identity(self) -> str:
+        """Best-effort logical integration-stream identity.
+
+        Operators should pass Coordinator(repo_id=...) when clones must share a
+        stable logical name.  The fallback prefers origin and only then the Git
+        common directory; the latter is explicitly a local identity.
+        """
+        try:
+            origin = self._git("remote", "get-url", "origin")
+            return "origin-sha256:" + hashlib.sha256(origin.encode()).hexdigest()
+        except GitError:
+            common = Path(self._git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+            return f"local-common-dir:{common.resolve()}"
 
     def add_worktree(self, branch: str, path: str, base: str = "HEAD") -> str:
         """base에서 새 branch를 만들어 path에 linked worktree로 체크아웃."""
@@ -196,7 +405,9 @@ class GitRepo:
                    branch: str, msg: str, *, timeout: float | None = None,
                    check_argv: Sequence[str] | None = None,
                    check_timeout: float = 300.0,
-                   check_output_limit: int = 16_384) -> str:
+                   check_output_limit: int = 16_384,
+                   expected_base: str | None = None,
+                   candidate_attestor: Callable[[str, str], None] | None = None) -> str:
         """전용 통합 worktree에서 integration_branch에 branch를 --no-ff merge(§D11).
         Phase B 본체 — **락 밖**에서 호출된다. 충돌/타임아웃이면 `merge --abort` 후 raise.
         msg에 고유 trailer를 넣어 두면 복구가 통합 브랜치에서 머지 여부를 trailer-probe 한다."""
@@ -205,42 +416,80 @@ class GitRepo:
                 integration_worktree, integration_branch, branch, msg,
                 timeout=timeout, check_argv=check_argv,
                 check_timeout=check_timeout, check_output_limit=check_output_limit,
+                expected_base=expected_base,
+                candidate_attestor=candidate_attestor,
             )
         wt = str(Path(integration_worktree).resolve())
+        integration_ref = f"refs/heads/{integration_branch}"
         # 명시적으로 integration_branch를 체크아웃(사용자 HEAD가 아님을 보장).
         self._git("checkout", integration_branch, cwd=wt)
+        self._require_symbolic_head(wt, integration_ref, "before merge candidate")
+        original_head = self._git("rev-parse", "HEAD", cwd=wt)
+        if expected_base is not None and original_head != expected_base:
+            raise GitIntegrationPreconditionError(
+                "integration branch changed after connect admission: "
+                f"expected {expected_base}, got {original_head}"
+            )
+        expected_merge_head = self._git("rev-parse", "--verify", branch, cwd=wt)
         try:
-            self._git(*self._IDENT, "merge", "--no-ff", "-m", msg, branch,
+            self._git(*self._IDENT, "merge", "--no-ff", "--no-commit", "-m", msg, branch,
                       cwd=wt, timeout=timeout)
         except GitError as e:
             if isinstance(e, GitTimeout):
-                try:
-                    self._git("merge", "--abort", cwd=wt)
-                except GitError:
-                    pass
-                raise GitTimeout(f"merge timeout on {branch}: {e}")
+                failure: GitError = GitTimeout(f"merge timeout on {branch}: {e}")
+                self._abort_and_verify(
+                    wt, original_head, failure, expected_ref=integration_ref
+                )
+                raise failure
             # P3 증분13: 충돌 검사. rerere.autoUpdate 가 기록된 해소로 *전부* 해소했으면
-            # (unmerged 0 + MERGE_HEAD 존재) merge 를 완성한다 — --no-edit 이 MERGE_MSG
-            # (우리 msg + OMD-Connect trailer)를 그대로 써 재기동 trailer-probe 호환.
+            # (unmerged 0 + MERGE_HEAD 존재) 아래의 fixed-parent CAS publication으로 진행한다.
             unmerged = self.unmerged_paths(wt)
             in_merge = self._merge_in_progress(wt)
-            if in_merge and not unmerged:
-                self._git(*self._IDENT, "commit", "--no-edit", cwd=wt)
-                return self._git("rev-parse", "HEAD", cwd=wt)
-            try:
-                self._git("merge", "--abort", cwd=wt)
-            except GitError:
-                pass
-            if in_merge:
-                raise GitMergeConflict(f"merge conflict on {branch}: {e}",
-                                       conflicts=unmerged)
-            raise GitError(f"merge failed on {branch}: {e}")
-        return self._git("rev-parse", "HEAD", cwd=wt)
+            if not (in_merge and not unmerged):
+                failure = (
+                    GitMergeConflict(
+                        f"merge conflict on {branch}: {e}", conflicts=unmerged
+                    ) if in_merge else GitError(f"merge failed on {branch}: {e}")
+                )
+                self._abort_and_verify(
+                    wt, original_head, failure, expected_ref=integration_ref
+                )
+                raise failure
+        if not self._merge_in_progress(wt):
+            return self._git("rev-parse", "HEAD", cwd=wt)
+        try:
+            self._require_symbolic_head(wt, integration_ref, "before publication")
+            merge_heads, _merge_message = self._merge_metadata_snapshot(
+                wt, expected_merge_head
+            )
+        except GitError as failure:
+            self._abort_and_verify(
+                wt, original_head, failure, expected_ref=integration_ref
+            )
+            raise
+        merge_index = self._git("write-tree", cwd=wt)
+        before_tracked = self._tracked_worktree_diff(wt)
+        if before_tracked:
+            failure = GitIntegrationPreconditionError(
+                f"candidate merge worktree differs from its index: {before_tracked}"
+            )
+            self._abort_and_verify(
+                wt, original_head, failure, expected_ref=integration_ref
+            )
+            raise failure
+        return self._commit_merge_candidate_cas(
+            wt, integration_branch, original_head, merge_index,
+            merge_heads=merge_heads, commit_message=msg,
+            candidate_attestor=candidate_attestor,
+        )
 
     def _merge_into_checked(self, integration_worktree: str, integration_branch: str,
                             branch: str, msg: str, *, timeout: float | None,
                             check_argv: Sequence[str], check_timeout: float,
-                            check_output_limit: int) -> str:
+                            check_output_limit: int,
+                            expected_base: str | None = None,
+                            candidate_attestor: Callable[[str, str], None] | None = None,
+                            ) -> str:
         """검사 가능한 후보 merge를 만들고 green일 때만 commit한다.
 
         ``check_argv``는 shell을 거치지 않고 그대로 실행된다. 검사 전후의 HEAD, index tree,
@@ -249,8 +498,16 @@ class GitRepo:
         """
         argv = self._validate_check_args(check_argv, check_timeout, check_output_limit)
         wt = str(Path(integration_worktree).resolve())
+        integration_ref = f"refs/heads/{integration_branch}"
         self._git("checkout", integration_branch, cwd=wt)
+        self._require_symbolic_head(wt, integration_ref, "before merge candidate")
         original_head = self._git("rev-parse", "HEAD", cwd=wt)
+        if expected_base is not None and original_head != expected_base:
+            raise GitIntegrationPreconditionError(
+                "integration branch changed after connect admission: "
+                f"expected {expected_base}, got {original_head}"
+            )
+        expected_merge_head = self._git("rev-parse", "--verify", branch, cwd=wt)
         dirty = self._tracked_status(wt)
         if self._merge_in_progress(wt) or dirty:
             details = "MERGE_HEAD exists" if self._merge_in_progress(wt) else dirty
@@ -281,7 +538,9 @@ class GitRepo:
                     )
                 else:
                     failure = GitError(f"merge failed on {branch}: {merge_error}")
-                self._abort_and_verify(wt, original_head, failure)
+                self._abort_and_verify(
+                    wt, original_head, failure, expected_ref=integration_ref
+                )
                 raise failure
 
         # "Already up to date" has no MERGE_HEAD and therefore no candidate commit. Preserve
@@ -289,13 +548,25 @@ class GitRepo:
         if not self._merge_in_progress(wt):
             return self._git("rev-parse", "HEAD", cwd=wt)
 
+        try:
+            self._require_symbolic_head(wt, integration_ref, "before operator check")
+            merge_heads, merge_message = self._merge_metadata_snapshot(
+                wt, expected_merge_head
+            )
+        except GitError as failure:
+            self._abort_and_verify(
+                wt, original_head, failure, expected_ref=integration_ref
+            )
+            raise
         merge_index = self._git("write-tree", cwd=wt)
         before_tracked = self._tracked_worktree_diff(wt)
         if before_tracked:
             failure = GitIntegrationPreconditionError(
                 f"candidate merge worktree differs from its index: {before_tracked}"
             )
-            self._abort_and_verify(wt, original_head, failure)
+            self._abort_and_verify(
+                wt, original_head, failure, expected_ref=integration_ref
+            )
             raise failure
 
         try:
@@ -307,7 +578,9 @@ class GitRepo:
                 f"integration check could not start: {exc}", argv=argv,
                 returncode=None, stderr=str(exc),
             )
-            self._abort_and_verify(wt, original_head, failure)
+            self._abort_and_verify(
+                wt, original_head, failure, expected_ref=integration_ref
+            )
             raise failure
 
         if timed_out:
@@ -315,14 +588,18 @@ class GitRepo:
                 f"integration check timed out after {check_timeout}s",
                 argv=argv, stdout=stdout, stderr=stderr,
             )
-            self._abort_and_verify(wt, original_head, failure)
+            self._abort_and_verify(
+                wt, original_head, failure, expected_ref=integration_ref
+            )
             raise failure
         if returncode != 0:
             failure = GitIntegrationCheckFailed(
                 f"integration check exited with {returncode}", argv=argv,
                 returncode=returncode, stdout=stdout, stderr=stderr,
             )
-            self._abort_and_verify(wt, original_head, failure)
+            self._abort_and_verify(
+                wt, original_head, failure, expected_ref=integration_ref
+            )
             raise failure
 
         mutations: list[str] = []
@@ -332,6 +609,14 @@ class GitRepo:
                 mutations.append(f"HEAD {original_head} -> {current_head}")
         except GitError as exc:
             mutations.append(f"HEAD became unreadable: {exc}")
+        try:
+            current_symbolic_head = self._symbolic_head(wt)
+            if current_symbolic_head != integration_ref:
+                mutations.append(
+                    f"symbolic HEAD {integration_ref} -> {current_symbolic_head}"
+                )
+        except GitError as exc:
+            mutations.append(f"symbolic HEAD became unreadable: {exc}")
         try:
             current_index = self._git("write-tree", cwd=wt)
             if current_index != merge_index:
@@ -344,20 +629,275 @@ class GitRepo:
                 mutations.append(f"tracked worktree changed: {tracked_diff}")
         except GitError as exc:
             mutations.append(f"tracked worktree became unreadable: {exc}")
+        try:
+            current_heads, current_message = self._merge_metadata_snapshot(
+                wt, expected_merge_head
+            )
+            if current_heads != merge_heads:
+                mutations.append(
+                    f"MERGE_HEAD {merge_heads!r} -> {current_heads!r}"
+                )
+            if current_message != merge_message:
+                mutations.append("MERGE_MSG changed")
+        except (GitError, OSError) as exc:
+            mutations.append(f"MERGE_HEAD/MERGE_MSG became invalid: {exc}")
         if mutations:
             failure = GitIntegrationMutation(
                 "integration check mutated its candidate merge", argv=argv,
                 stdout=stdout, stderr=stderr, mutations=mutations,
             )
-            self._abort_and_verify(wt, original_head, failure)
+            self._abort_and_verify(
+                wt, original_head, failure, expected_ref=integration_ref
+            )
             raise failure
 
+        return self._commit_merge_candidate_cas(
+            wt, integration_branch, original_head, merge_index,
+            merge_heads=merge_heads, commit_message=msg,
+            candidate_attestor=candidate_attestor,
+        )
+
+    def _worktree_git_path(self, worktree: str, name: str) -> Path:
+        raw = self._git("rev-parse", "--git-path", name, cwd=worktree)
+        path = Path(raw)
+        return path if path.is_absolute() else Path(worktree, path)
+
+    def _symbolic_head(self, worktree: str) -> str:
+        """Return the exact symbolic ref checked out by one worktree."""
+        return self._git("symbolic-ref", "-q", "HEAD", cwd=worktree)
+
+    def _require_symbolic_head(
+        self, worktree: str, expected_ref: str, context: str,
+    ) -> str:
+        """Reject detached or retargeted integration worktree HEAD identity."""
         try:
-            self._git(*self._IDENT, "commit", "--no-edit", cwd=wt)
+            actual_ref = self._symbolic_head(worktree)
+        except GitError as exc:
+            raise GitIntegrationPreconditionError(
+                f"integration worktree HEAD is not symbolic {context}"
+            ) from exc
+        if actual_ref != expected_ref:
+            raise GitIntegrationPreconditionError(
+                f"integration worktree HEAD changed {context}: "
+                f"expected {expected_ref}, got {actual_ref}"
+            )
+        return actual_ref
+
+    def _merge_metadata_snapshot(
+        self, worktree: str, expected_merge_head: str,
+    ) -> tuple[tuple[str, ...], str]:
+        """Freeze and validate the candidate's non-worktree Git metadata."""
+
+        try:
+            merge_heads = tuple(
+                line.strip()
+                for line in self._worktree_git_path(
+                    worktree, "MERGE_HEAD"
+                ).read_text().splitlines()
+                if line.strip()
+            )
+            merge_message_path = self._worktree_git_path(worktree, "MERGE_MSG")
+            merge_message = merge_message_path.read_text()
+        except OSError as exc:
+            raise GitIntegrationPreconditionError(
+                f"cannot read merge candidate metadata: {exc}"
+            ) from exc
+        if merge_heads != (expected_merge_head,):
+            raise GitIntegrationPreconditionError(
+                "merge candidate parent identity changed: "
+                f"expected {(expected_merge_head,)!r}, got {merge_heads!r}"
+            )
+        return merge_heads, merge_message
+
+    def _discard_merge_candidate_without_ref_update(
+        self, worktree: str, integration_ref: str, cause: BaseException,
+    ) -> None:
+        """Align index/worktree to the current ref without ever rewriting it.
+
+        This is the CAS-failure path: another writer already owns the ref.  Using
+        ``merge --abort`` or ``reset --hard`` could move that ref back and erase
+        the winner, so cleanup is limited to merge-state removal plus ``read-tree``.
+        """
+        problems: list[str] = []
+        current_tip: str | None = None
+        try:
+            current_tip = self._git("rev-parse", integration_ref, cwd=worktree)
+        except GitError as exc:
+            problems.append(f"cannot read winning integration ref: {exc}")
+        if self._merge_in_progress(worktree):
+            try:
+                self._git("merge", "--quit", cwd=worktree)
+            except GitError as exc:
+                problems.append(f"merge --quit failed: {exc}")
+        if current_tip is not None:
+            try:
+                self._git("read-tree", "--reset", "-u", current_tip, cwd=worktree)
+            except GitError as exc:
+                problems.append(f"cannot align worktree to winning ref: {exc}")
+        try:
+            actual_head = self._git("rev-parse", "HEAD", cwd=worktree)
+            if current_tip is not None and actual_head != current_tip:
+                problems.append(f"HEAD is {actual_head}, winner is {current_tip}")
+        except GitError as exc:
+            actual_head = None
+            problems.append(f"cannot read HEAD after CAS failure: {exc}")
+        if self._merge_in_progress(worktree):
+            problems.append("MERGE_HEAD still exists after CAS failure")
+        try:
+            dirty = self._tracked_status(worktree)
+            if dirty:
+                problems.append(f"tracked tree is not clean after CAS failure: {dirty}")
+        except GitError as exc:
+            problems.append(f"cannot prove tracked tree clean after CAS failure: {exc}")
+        if problems:
+            raise GitRollbackError(
+                "integration CAS cleanup proof failed: " + "; ".join(problems),
+                cause=cause, expected_head=current_tip or "<unreadable>",
+                actual_head=actual_head, problems=problems,
+            ) from cause
+
+    def _commit_merge_candidate_cas(
+        self, worktree: str, integration_branch: str,
+        original_head: str, merge_index: str,
+        *, merge_heads: Sequence[str], commit_message: str,
+        candidate_attestor: Callable[[str, str], None] | None = None,
+    ) -> str:
+        """Create a fixed-parent merge commit, then install it with one ref CAS.
+
+        ``git commit`` reads symbolic HEAD again immediately before updating it;
+        an external ref move could therefore become an unaudited first parent.
+        ``commit-tree`` freezes the audited tree and parents without changing refs,
+        and ``update-ref <new> <expected-old>`` is the single atomic publication.
+        """
+        integration_ref = f"refs/heads/{integration_branch}"
+        if len(merge_heads) != 1 or not merge_heads[0]:
+            failure = GitIntegrationPreconditionError(
+                "checked merge parent snapshot is incomplete"
+            )
+            self._abort_and_verify(
+                worktree, original_head, failure, expected_ref=integration_ref
+            )
+            raise failure
+        try:
+            self._require_symbolic_head(
+                worktree, integration_ref, "before merge publication"
+            )
         except GitError as failure:
-            self._abort_and_verify(wt, original_head, failure)
+            self._abort_and_verify(
+                worktree, original_head, failure, expected_ref=integration_ref
+            )
             raise
-        return self._git("rev-parse", "HEAD", cwd=wt)
+
+        args = [*self._IDENT, "commit-tree", merge_index, "-p", original_head]
+        for parent in merge_heads:
+            args.extend(("-p", parent))
+        args.extend(("-F", "-"))
+        try:
+            candidate_sha = self._git(
+                *args, cwd=worktree, input_text=commit_message
+            )
+        except GitError as failure:
+            self._abort_and_verify(
+                worktree, original_head, failure, expected_ref=integration_ref
+            )
+            raise
+
+        # The candidate object exists, but the integration ref still names the
+        # captured base.  Persist the exact OID/tree in the trusted coordination
+        # DB before publication so recovery never has to trust a discoverable
+        # trailer or recompute a rerere-resolved tree.
+        if candidate_attestor is not None:
+            try:
+                self._require_symbolic_head(
+                    worktree, integration_ref, "before candidate attestation"
+                )
+                candidate_attestor(candidate_sha, merge_index)
+                self._require_symbolic_head(
+                    worktree, integration_ref, "after candidate attestation"
+                )
+            except Exception as exc:
+                failure = (
+                    exc if isinstance(exc, GitError)
+                    else GitIntegrationPreconditionError(
+                        f"candidate attestation failed: {exc}"
+                    )
+                )
+                self._abort_and_verify(
+                    worktree, original_head, failure, expected_ref=integration_ref
+                )
+                if failure is exc:
+                    raise
+                raise failure from exc
+
+        try:
+            self._git(
+                "update-ref", integration_ref, candidate_sha, original_head,
+                cwd=worktree,
+            )
+        except GitError as failure:
+            self._discard_merge_candidate_without_ref_update(
+                worktree, integration_ref, failure
+            )
+            raise GitIntegrationPreconditionError(
+                "integration branch changed before checked merge publication"
+            ) from failure
+
+        try:
+            self._git("merge", "--quit", cwd=worktree)
+        except GitError as failure:
+            raise GitRollbackError(
+                "checked merge was published but merge state could not be cleared",
+                cause=failure, expected_head=candidate_sha,
+                actual_head=self._git("rev-parse", "HEAD", cwd=worktree),
+                problems=(str(failure),),
+            ) from failure
+
+        current_tip = self._git("rev-parse", integration_ref, cwd=worktree)
+        if current_tip != candidate_sha:
+            failure = GitIntegrationPreconditionError(
+                "integration branch moved immediately after checked merge CAS"
+            )
+            self._discard_merge_candidate_without_ref_update(
+                worktree, integration_ref, failure
+            )
+            raise failure
+        problems = []
+        try:
+            symbolic_head = self._symbolic_head(worktree)
+            if symbolic_head != integration_ref:
+                problems.append(
+                    f"symbolic HEAD is {symbolic_head}, expected {integration_ref}"
+                )
+        except GitError as exc:
+            problems.append(f"cannot prove symbolic HEAD after CAS: {exc}")
+        try:
+            actual_head = self._git("rev-parse", "HEAD", cwd=worktree)
+            if actual_head != candidate_sha:
+                problems.append(f"HEAD is {actual_head}, expected {candidate_sha}")
+        except GitError as exc:
+            actual_head = None
+            problems.append(f"cannot read HEAD after CAS: {exc}")
+        if self._merge_in_progress(worktree):
+            problems.append("MERGE_HEAD remains after checked merge CAS")
+        current_index = self._git("write-tree", cwd=worktree)
+        if current_index != merge_index:
+            problems.append(f"index is {current_index}, expected {merge_index}")
+        try:
+            tracked_status = self._tracked_status(worktree)
+            if tracked_status:
+                problems.append(
+                    f"tracked status differs from published tree: {tracked_status}"
+                )
+        except GitError as exc:
+            problems.append(f"cannot prove tracked status clean after CAS: {exc}")
+        if problems:
+            raise GitRollbackError(
+                "checked merge publication proof failed: " + "; ".join(problems),
+                cause=GitError("post-CAS verification failed"),
+                expected_head=candidate_sha, actual_head=actual_head,
+                problems=problems,
+            )
+        return candidate_sha
 
     @staticmethod
     def _validate_check_args(check_argv: Sequence[str], check_timeout: float,
@@ -459,15 +999,38 @@ class GitRepo:
         return [line for line in out.splitlines() if line.strip()]
 
     def _abort_and_verify(self, worktree: str, expected_head: str,
-                          cause: BaseException) -> None:
-        """후보 merge를 abort하고 세 가지 구조적 원상복구 증거를 확인한다."""
+                          cause: BaseException, *,
+                          expected_ref: str | None = None) -> None:
+        """Discard a candidate without ever moving the integration ref.
+
+        ``merge --abort`` can reset a symbolic branch after an external writer
+        has advanced it.  Instead, remove merge metadata and align only the
+        index/worktree with the observed ref tip.  Unstaged checker mutations are
+        preserved as evidence and therefore make rollback proof fail closed.
+        """
         problems: list[str] = []
-        if self._merge_in_progress(worktree):
-            try:
-                self._git("merge", "--abort", cwd=worktree)
-            except GitError as exc:
-                problems.append(f"merge --abort failed: {exc}")
         actual_head: str | None = None
+        try:
+            actual_head = self._git("rev-parse", "HEAD", cwd=worktree)
+        except GitError as exc:
+            problems.append(f"cannot read HEAD: {exc}")
+        try:
+            unstaged = self._tracked_worktree_diff(worktree)
+        except GitError as exc:
+            unstaged = ["<unreadable>"]
+            problems.append(f"cannot inspect tracked worktree: {exc}")
+        preserve_unstaged = bool(unstaged) and isinstance(
+            cause, (GitIntegrationCheckError, GitIntegrationPreconditionError)
+        )
+        if preserve_unstaged:
+            problems.append(f"tracked tree is not clean: {unstaged}")
+        elif actual_head is not None:
+            try:
+                if self._merge_in_progress(worktree):
+                    self._git("merge", "--quit", cwd=worktree)
+                self._git("read-tree", "--reset", "-u", actual_head, cwd=worktree)
+            except GitError as exc:
+                problems.append(f"non-ref rollback failed: {exc}")
         try:
             actual_head = self._git("rev-parse", "HEAD", cwd=worktree)
             if actual_head != expected_head:
@@ -487,9 +1050,18 @@ class GitRepo:
         try:
             dirty = self._tracked_status(worktree)
             if dirty:
-                problems.append(f"tracked tree is not clean: {dirty}")
+                problems.append(f"tracked status is not clean: {dirty}")
         except GitError as exc:
             problems.append(f"cannot prove tracked tree clean: {exc}")
+        if expected_ref is not None:
+            try:
+                symbolic_head = self._symbolic_head(worktree)
+                if symbolic_head != expected_ref:
+                    problems.append(
+                        f"symbolic HEAD is {symbolic_head}, expected {expected_ref}"
+                    )
+            except GitError as exc:
+                problems.append(f"cannot prove symbolic HEAD after rollback: {exc}")
         if problems:
             raise GitRollbackError(
                 "integration rollback proof failed: " + "; ".join(problems),
@@ -503,8 +1075,28 @@ class GitRepo:
         MERGE_HEAD가 이미 없어도 HEAD/clean tracked tree를 검증한다. 증명 실패는 destructive
         reset으로 덮지 않고 :class:`GitRollbackError`로 fail-stop한다.
         """
-        cause = GitError("recover dangling checked merge")
+        cause = GitIntegrationPreconditionError(
+            "recover dangling checked merge with unproven worktree"
+        )
         self._abort_and_verify(str(Path(worktree).resolve()), expected_head, cause)
+
+    def abort_merge_preserving_ref(self, worktree: str,
+                                   integration_branch: str) -> None:
+        """Discard dangling merge state without moving the integration ref.
+
+        A token-only recovery has no durable pre-merge base to restore.  It must
+        therefore align the index/worktree to the *currently observed* branch tip
+        and fail if that tip changes, never use ``git merge --abort`` (which can
+        reset a symbolic branch to stale ``ORIG_HEAD`` and erase an external win).
+        """
+        cause = GitIntegrationPreconditionError(
+            "recover dangling merge token without a durable connect intent"
+        )
+        self._discard_merge_candidate_without_ref_update(
+            str(Path(worktree).resolve()),
+            f"refs/heads/{integration_branch}",
+            cause,
+        )
 
     def unmerged_paths(self, worktree: str) -> list[str]:
         """머지 진행중 worktree 의 미해소 충돌 경로들(구조적 판별 — diff-filter=U)."""
@@ -570,6 +1162,45 @@ class GitRepo:
             return None
         return out or None
 
+    def commit_has_trailers(self, worktree: str, commit: str,
+                            trailers: Sequence[str]) -> bool:
+        """Verify exact generated trailer lines on one recovered commit."""
+        try:
+            body = self._git("show", "-s", "--format=%B", commit, cwd=worktree)
+        except GitError:
+            return False
+        lines = {line.strip() for line in body.splitlines() if line.strip()}
+        return all(trailer in lines for trailer in trailers)
+
+    def commit_parents(self, worktree: str, commit: str) -> tuple[str, ...]:
+        """Return one commit's ordered, immutable parent identity."""
+        parents = self._git(
+            "show", "-s", "--format=%P", commit, cwd=worktree
+        )
+        return tuple(parents.split())
+
+    def commit_tree(self, worktree: str, commit: str) -> str:
+        """Return one commit's full tree OID with replacement refs disabled."""
+        return self._git("rev-parse", f"{commit}^{{tree}}", cwd=worktree)
+
+    def is_ancestor(self, ancestor: str, descendant: str, cwd=None) -> bool:
+        env = os.environ.copy()
+        env["GIT_NO_REPLACE_OBJECTS"] = "1"
+        env["GIT_GRAFT_FILE"] = os.devnull
+        try:
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+                cwd=cwd or self.root, check=True, capture_output=True, text=True,
+                env=env,
+            )
+            return True
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode == 1:
+                return False
+            raise GitError(
+                f"git merge-base --is-ancestor failed: {exc.stderr.strip()}"
+            ) from exc
+
     def has_merge_in_progress(self, worktree: str) -> bool:
         """worktree에 dangling MERGE_HEAD(중단 안 된 머지)가 있나 — 복구가 abort 판정."""
         try:
@@ -585,11 +1216,22 @@ class GitRepo:
         except GitError:
             pass
 
-    def remove_worktree(self, path: str):
+    def remove_worktree(self, path: str, *, force: bool = False,
+                        ignore_errors: bool = False) -> bool:
+        resolved = str(Path(path).resolve())
+        if not Path(resolved).exists():
+            return True
+        args = ["worktree", "remove"]
+        if force:
+            args.append("--force")
+        args.append(resolved)
         try:
-            self._git("worktree", "remove", "--force", str(Path(path).resolve()))
+            self._git(*args)
         except GitError:
-            pass
+            if ignore_errors:
+                return False
+            raise
+        return True
 
     def branch_exists(self, branch: str) -> bool:
         try:

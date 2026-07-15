@@ -8,6 +8,16 @@ from __future__ import annotations
 # write 와 동급으로 취급돼 disjoint(write) 궤도의 배타 의미론은 불변.
 WRITE_MODES = ("write", "shared")
 
+# Rolling-upgrade adapters for live pre-R3 orbits whose immutable attempt_id is
+# legitimately NULL.  These attempts are operational bridges, never native-v3
+# measurement evidence.
+LEGACY_ATTEMPT_OPENERS = frozenset({
+    "CLAIM_LEGACY",
+    "START_LEGACY",
+    "CONNECT_LEGACY",
+    "BARRIER_CONNECT_LEGACY",
+})
+
 # Phase B(락밖 merge) 응결 pin 유예. 이 시간 동안 sweep/reclaim 이 진행중 merge 를 건드리지 않는다.
 MERGE_PIN_GRACE_S = 60.0
 
