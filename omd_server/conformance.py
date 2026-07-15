@@ -26,18 +26,20 @@ def _src(root: Path, rel: str) -> str:
 def _admission_contract_probe(root: Path) -> bool:
     """Execute a real typed decision, reducer step, and legacy projection."""
     script = r'''
+from omd_server.admission import ADMISSION_POLICY_VERSION
 from omd_server.admission_contract import bind_decision_id, project_legacy, step
 snapshot = "a" * 64
 context = {
     "state": "REQUESTED", "repository_id": "repo", "request_id": "request",
     "orbit_id": "orbit", "request_generation": 0, "owner_agent": "owner",
     "bail_epoch": 0, "mode": "write", "pathspec_digest": "b" * 64,
-    "policy_version": "omd-admission/fair-reservation-v1",
+    "policy_version": ADMISSION_POLICY_VERSION,
 }
 payload = bind_decision_id("ADMISSION_GRANTED", {
     **{key: value for key, value in context.items() if key != "state"},
     "actor": "authority", "event_id": "event",
     "authority_snapshot_hash": snapshot, "fence": 1, "lease_deadline": 2.0,
+    "base_priority": 0, "effective_priority": 0, "observed_at": 1.0,
 })
 result = step(context, "ADMISSION_GRANTED", payload,
               trusted_authority_snapshot_hash=snapshot)

@@ -74,10 +74,10 @@
       "file": "omd_server/core.py",
       "symbol": "_reclaim_agent_inline",
       "kind": "function",
-      "line_hint": 746,
-      "sha256": "e0c6e2699ae95c64",
+      "line_hint": 1431,
+      "sha256": "14fbbc6d54e6b4f4",
       "layer": "domain-policy",
-      "frege_sinn": "긴급탈출(bail)/좀비회수 단일 회수 루틴 — 궤도해제+requeue+worktree정리+RETIRE, 멱등(§D2)"
+      "frege_sinn": "긴급탈출(bail)/좀비회수 단일 회수 루틴 — 동일 observed time으로 궤도해제+requeue+worktree정리+RETIRE, 멱등(§D2)"
     },
     {
       "sourceId": "core._break_ephemeral_flags_for_lease",

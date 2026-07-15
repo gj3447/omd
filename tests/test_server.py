@@ -156,6 +156,56 @@ def test_invalid_server_queue_capacity_fails_before_db_creation(
     assert not db.exists()
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 60.0), ("", 60.0), ("  ", 60.0), ("0.5", 0.5), ("120", 120.0)],
+)
+def test_server_admission_aging_quantum_contract(raw, expected):
+    from omd_server.server import _parse_admission_aging_quantum
+
+    assert _parse_admission_aging_quantum(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "not-a-number"])
+def test_invalid_server_aging_quantum_fails_before_db_creation(
+    tmp_path, monkeypatch, raw
+):
+    pytest.importorskip("fastmcp")
+    from omd_server.server import build_server
+
+    db = tmp_path / "invalid-aging-quantum.db"
+    monkeypatch.setenv("OMD_ADMISSION_AGING_QUANTUM_SECONDS", raw)
+    with pytest.raises(ValueError, match="OMD_ADMISSION_AGING_QUANTUM_SECONDS"):
+        build_server(str(db))
+    assert not db.exists()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 10), ("", 10), ("  ", 10), ("0", 0), ("25", 25)],
+)
+def test_server_admission_max_age_boost_contract(raw, expected):
+    from omd_server.server import _parse_admission_max_age_boost
+
+    assert _parse_admission_max_age_boost(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw", ["-1", "1.5", "nan", "inf", "not-a-number", str(1 << 63)]
+)
+def test_invalid_server_max_age_boost_fails_before_db_creation(
+    tmp_path, monkeypatch, raw
+):
+    pytest.importorskip("fastmcp")
+    from omd_server.server import build_server
+
+    db = tmp_path / "invalid-max-age-boost.db"
+    monkeypatch.setenv("OMD_ADMISSION_MAX_AGE_BOOST", raw)
+    with pytest.raises(ValueError, match="OMD_ADMISSION_MAX_AGE_BOOST"):
+        build_server(str(db))
+    assert not db.exists()
+
+
 def test_server_lifespan_sweep_delivers_idle_wait_deadline(tmp_path):
     anyio = pytest.importorskip("anyio")
     pytest.importorskip("fastmcp")

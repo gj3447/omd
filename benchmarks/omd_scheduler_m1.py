@@ -25,9 +25,9 @@ def injected_pending_predecessor_bypass(enabled: bool) -> Iterator[None]:
         yield
         return
 
-    def held_only(request, held, pending):
+    def held_only(request, held, pending, **decision_context):
         del pending
-        return original(request, held, ())
+        return original(request, held, (), **decision_context)
 
     core.decide_admission = held_only
     try:

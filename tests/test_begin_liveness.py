@@ -123,3 +123,70 @@ def test_begin_returns_explicit_renewal_descriptors(tmp_path):
         ("shared", ("constants/env.py",)),
     }
     assert all(o["state"] == "HELD" for o in r["orbits"])
+
+
+def test_begin_batch_does_not_promote_between_member_claims(tmp_path):
+    omd = _omd(tmp_path, agent_ttl=None)
+    omd.claim("B", ["z/**"], ttl=1_000.0)
+    omd.claim("D", ["w/**"], ttl=1_000.0)
+    a_wait = omd.claim("A", ["z/**"], priority=20)
+    b_wait = omd.claim("B", ["x/**", "y/**", "w/**"], priority=5)
+    c_wait = omd.claim("C", ["y/**"], priority=1)
+
+    result = omd.begin(
+        "task-A",
+        "A",
+        ["x/**"],
+        shared=["y/**"],
+        priority=10,
+    )
+
+    assert result["ok"] is True
+    assert {item["mode"] for item in result["orbits"]} == {"write", "shared"}
+    assert all(item["state"] == "HELD" for item in result["orbits"])
+    assert omd.store.get_orbit(b_wait["orbit_id"])["state"] == "DENIED"
+    assert omd.store.get_orbit(c_wait["orbit_id"])["state"] == "PENDING"
+    assert omd.store.get_orbit(a_wait["orbit_id"])["state"] == "PENDING"
+    omd.close()
+
+
+def test_begin_rolls_back_new_members_on_defensive_claim_failure(tmp_path):
+    omd = _omd(tmp_path, agent_ttl=None)
+    conflict = omd.claim(
+        "other",
+        ["other/**"],
+        request_id="batch:claim-shared",
+    )
+    before_fence = omd.store.current_fence()
+    before_seq = omd.store.current_seq()
+    before_orbits = {
+        row["orbit_id"]
+        for row in omd.store.db.execute("SELECT orbit_id FROM orbits").fetchall()
+    }
+
+    result = omd.begin(
+        "task-A",
+        "A",
+        ["x/**"],
+        shared=["y/**"],
+        request_id="batch",
+    )
+
+    assert result["ok"] is False
+    assert result["stage"] == "claim"
+    assert result["rollback"] == "transaction"
+    assert omd.store.current_fence() == before_fence
+    assert omd.store.current_seq() == before_seq
+    assert omd.store.orbit_by_request("batch:claim") is None
+    assert omd.store.get_idem("batch:claim") is None
+    assert {
+        row["orbit_id"]
+        for row in omd.store.db.execute("SELECT orbit_id FROM orbits").fetchall()
+    } == before_orbits
+    assert [
+        row
+        for row in omd.store.held_orbits()
+        if row["agent_id"] == "A" and row["task_id"] == "task-A"
+    ] == []
+    assert omd.store.get_orbit(conflict["orbit_id"])["state"] == "HELD"
+    omd.close()

@@ -43,15 +43,20 @@ except ImportError:  # pragma: no cover - multi-process OMD currently targets Un
 
 from . import bypass_audit, fsm, task_state
 from .admission import (
-    ADMISSION_POLICY_VERSION,
+    AGING_POLICY_SCHEMA,
+    DEFAULT_ADMISSION_AGING_QUANTUM,
+    DEFAULT_ADMISSION_MAX_AGE_BOOST,
     AdmissionRequest,
+    QueuePolicy,
     authority_snapshot_hash,
+    canonical_json,
     decide_admission,
     exact_conflict,
     normalize_pathspec,
     pathspec_digest,
     sha256_json,
 )
+from .admission_config import DEFAULT_ADMISSION_QUEUE_CAPACITY
 from .admission_contract import bind_decision_id, project_legacy, step as admission_step
 from .disjoint import path_in_globs, sets_overlap
 from .events import NOOP
@@ -85,7 +90,6 @@ LEADER_TTL_S = 30.0
 
 # Repository-authority PENDING rows are bounded by default.  This is an
 # operational default, not a value derived from the scheduler proof contract.
-DEFAULT_ADMISSION_QUEUE_CAPACITY = 1024
 
 # A task-bound orbit is acquired before execution starts.  Later lifecycle
 # states may retain an old claim response, but they are not admission authority.
@@ -162,6 +166,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                  idem_ttl: float | None = 3600.0,
                  admission_wait_timeout: float = 3600.0,
                  admission_queue_capacity: int = DEFAULT_ADMISSION_QUEUE_CAPACITY,
+                 admission_aging_quantum: float = DEFAULT_ADMISSION_AGING_QUANTUM,
+                 admission_max_age_boost: int = DEFAULT_ADMISSION_MAX_AGE_BOOST,
                  strict_writeset: bool = False,
                  sweep_interval: float | None = None,
                  integration_check=None,
@@ -207,6 +213,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             raise ValueError(
                 "admission_queue_capacity must be a non-negative integer"
             )
+        admission_policy = QueuePolicy(
+            aging_quantum=admission_aging_quantum,
+            max_age_boost=admission_max_age_boost,
+        )
         sweep_interval = _normalize_sweep_interval(sweep_interval)
         # §D14: `:memory:` 디폴트 금지 — 재기동마다 모든 fence/leader_epoch 가 0 으로 리셋되어
         # 낡은 토큰/잔여 merge 와 충돌(고스트 writer). 영속 DB 필수. 단위테스트는 allow_memory_db=
@@ -286,7 +296,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # split effect on the same DB, then acquires leadership, then mutates schema.
         # Thus a rejected peer and a process racing a live Git child are both
         # unable to exercise migration authority.
-        if not self.store.schema_requires_migration():
+        schema_requires_migration = self.store.schema_requires_migration()
+        if not schema_requires_migration:
             if self.enforce_single_coordinator:
                 self._acquire_leadership()
         else:
@@ -319,12 +330,57 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 persisted_repository_id = repository_id_seed
             self.repository_id = persisted_repository_id
             persisted_capacity = self.store.get_meta("admission_queue_capacity")
+            persisted_policy_version = self.store.get_meta(
+                "admission_queue_policy_version"
+            )
+            persisted_policy_envelope = self.store.get_meta(
+                "admission_queue_policy_envelope"
+            )
+            persisted_policy_marker = self.store.get_meta(
+                "admission_policy_initialized"
+            )
+            policy_pair_missing = (
+                persisted_policy_version is None
+                and persisted_policy_envelope is None
+            )
+            persisted_v2_policy_versions = {
+                row["policy_version"]
+                for row in self.store.db.execute(
+                    "SELECT DISTINCT policy_version FROM orbits WHERE "
+                    "policy_version LIKE ?",
+                    (f"{AGING_POLICY_SCHEMA}/%",),
+                ).fetchall()
+            }
+            persisted_v2_decision = self.store.db.execute(
+                "SELECT 1 FROM orbits WHERE "
+                "decision_schema='admission_decision/v2' "
+                "LIMIT 1",
+            ).fetchone() is not None
+            persisted_v2_authority = bool(
+                persisted_v2_policy_versions or persisted_v2_decision
+            )
+            # schema_version and the authority pins historically completed in
+            # separate transactions.  A missing marker plus a wholly absent
+            # policy pair is the one resumable crash cut, but only before any v2
+            # row could have observed a concrete policy.  Once the marker or v2
+            # evidence exists, any missing key is corruption and fails closed.
+            policy_initialization_allowed = (
+                persisted_policy_marker is None
+                and not persisted_v2_authority
+                and (schema_requires_migration or policy_pair_missing)
+            )
             capacity_policy_error = None
             capacity_mismatch = False
+            initialize_capacity = (
+                persisted_capacity is None and policy_initialization_allowed
+            )
             if persisted_capacity is None:
-                self.store.set_meta(
-                    "admission_queue_capacity", admission_queue_capacity
-                )
+                if policy_initialization_allowed:
+                    durable_capacity = admission_queue_capacity
+                else:
+                    capacity_policy_error = (
+                        "durable admission_queue_capacity is missing"
+                    )
             else:
                 try:
                     durable_capacity = int(persisted_capacity)
@@ -340,17 +396,110 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     capacity_mismatch = (
                         durable_capacity != admission_queue_capacity
                     )
-        if capacity_policy_error or capacity_mismatch:
+            expected_policy_envelope = canonical_json(admission_policy.envelope)
+            aging_policy_error = (
+                None
+                if persisted_policy_marker in (None, "1")
+                else "durable admission policy completion marker is invalid"
+            )
+            aging_policy_mismatch = False
+            initialize_aging_policy = (
+                policy_pair_missing and policy_initialization_allowed
+            )
+            if policy_pair_missing:
+                if policy_initialization_allowed:
+                    durable_policy = admission_policy
+                else:
+                    aging_policy_error = (
+                        "durable admission queue policy is missing"
+                    )
+            elif persisted_policy_version is None or persisted_policy_envelope is None:
+                aging_policy_error = "durable admission queue policy is incomplete"
+            else:
+                try:
+                    decoded_policy_envelope = json.loads(
+                        persisted_policy_envelope
+                    )
+                    if not isinstance(decoded_policy_envelope, dict):
+                        raise ValueError(
+                            "admission queue policy envelope must be an object"
+                        )
+                    durable_policy = QueuePolicy(
+                        **{
+                            key: value
+                            for key, value in decoded_policy_envelope.items()
+                            if key in {"aging_quantum", "max_age_boost"}
+                        }
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    aging_policy_error = (
+                        f"durable admission queue policy is invalid: {exc}"
+                    )
+                else:
+                    if canonical_json(durable_policy.envelope) != persisted_policy_envelope:
+                        aging_policy_error = (
+                            "durable admission queue policy envelope is non-canonical"
+                        )
+                    elif durable_policy.version != persisted_policy_version:
+                        aging_policy_error = (
+                            "durable admission queue policy version does not match its envelope"
+                        )
+                    aging_policy_mismatch = (
+                        durable_policy != admission_policy
+                    )
+            if (
+                persisted_policy_version is not None
+                and persisted_v2_policy_versions
+                - {persisted_policy_version}
+            ):
+                aging_policy_error = (
+                    "durable admission queue policy does not match persisted v2 rows"
+                )
+            if not (
+                capacity_policy_error
+                or capacity_mismatch
+                or aging_policy_error
+                or aging_policy_mismatch
+            ):
+                if initialize_capacity:
+                    self.store.set_meta(
+                        "admission_queue_capacity", admission_queue_capacity
+                    )
+                if initialize_aging_policy:
+                    self.store.set_meta(
+                        "admission_queue_policy_version", admission_policy.version
+                    )
+                    self.store.set_meta(
+                        "admission_queue_policy_envelope", expected_policy_envelope
+                    )
+                if persisted_policy_marker is None:
+                    self.store.set_meta("admission_policy_initialized", "1")
+        if (
+            capacity_policy_error
+            or capacity_mismatch
+            or aging_policy_error
+            or aging_policy_mismatch
+        ):
             # Queue policy is repository authority, not a per-process hint.
             # Refuse configuration drift before recovery or any admission work.
             if self.leader_epoch is not None:
                 self.resign()
             self.store.db.close()
-            raise ValueError(
-                capacity_policy_error
-                or "admission_queue_capacity conflicts with the durable repository "
-                f"policy ({persisted_capacity})"
-            )
+            if capacity_policy_error:
+                policy_message = capacity_policy_error
+            elif aging_policy_error:
+                policy_message = aging_policy_error
+            elif capacity_mismatch:
+                policy_message = (
+                    "admission_queue_capacity conflicts with the durable repository "
+                    f"policy ({persisted_capacity})"
+                )
+            else:
+                policy_message = (
+                    "admission aging configuration conflicts with the durable "
+                    f"repository policy ({persisted_policy_version})"
+                )
+            raise ValueError(policy_message)
         self.merge_timeout = merge_timeout if merge_timeout is not None else MERGE_TIMEOUT_S
         self.integration_check = integration_check
         self.integration_check_timeout = integration_check_timeout
@@ -368,6 +517,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # Embedded delivery is opt-in; the MCP server owns a default lifespan sweep.
         self.admission_wait_timeout = admission_wait_timeout
         self.admission_queue_capacity = admission_queue_capacity
+        self.admission_policy = admission_policy
         # P5 strict-writeset: True 면 commit-time 에 write-set 위반 즉시 거부+soft-reset(빠른 fail-loud).
         # 기본 off(connect-time enforce 유지=하위호환). env OMD_STRICT_WRITESET 폴백(정확 truthy 파싱).
         self.strict_writeset = bool(strict_writeset) or (
@@ -637,16 +787,79 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             if exact_conflict(pathspec, mode, o)
         ]
 
-    def _admission_decision(self, pathspec, mode, priority, queue_seq, orbit_id=None):
+    def _rank_observation(self, row, observed_at):
+        """Return persisted rank inputs plus the v1/v2 effective priority."""
+        base_priority = int(row.get("priority") or 0)
+        policy_version = row.get("policy_version")
+        effective_priority = self.admission_policy.effective_priority(
+            base_priority,
+            policy_version=policy_version,
+            enqueued_at=row.get("enqueued_at"),
+            observed_at=observed_at,
+            allow_unenqueued=row.get("state") != "PENDING",
+        )
+        return {
+            "base_priority": base_priority,
+            "effective_priority": effective_priority,
+            "observed_at": observed_at,
+            "policy_version": policy_version,
+        }
+
+    def _ordered_pending(self, observed_at, pending=None):
+        """Order valid ranks dynamically; corrupt/unknown authority sorts first."""
+        rows = list(self.store.pending_orbits() if pending is None else pending)
+
+        def key(row):
+            rank = self.admission_policy.rank_key(
+                int(row.get("priority") or 0),
+                row.get("queue_seq"),
+                policy_version=row.get("policy_version"),
+                enqueued_at=row.get("enqueued_at"),
+                observed_at=observed_at,
+            )
+            if rank is None:
+                return (0, 0, int(row.get("queue_seq") or -1), row["orbit_id"])
+            return (1, rank[0], rank[1], row["orbit_id"])
+
+        return sorted(rows, key=key)
+
+    def _admission_decision(
+        self,
+        pathspec,
+        mode,
+        priority,
+        queue_seq,
+        orbit_id=None,
+        *,
+        policy_version=None,
+        enqueued_at=None,
+        observed_at,
+    ):
         """Shared initial-claim/promotion decision over one authority snapshot."""
         held = self.store.held_orbits()
         pending = self.store.pending_orbits()
         request = AdmissionRequest.build(
-            pathspec, mode, priority, queue_seq, orbit_id=orbit_id
+            pathspec,
+            mode,
+            priority,
+            queue_seq,
+            orbit_id=orbit_id,
+            policy_version=policy_version or self.admission_policy.version,
+            enqueued_at=enqueued_at,
         )
-        decision = decide_admission(request, held, pending)
+        decision = decide_admission(
+            request,
+            held,
+            pending,
+            policy=self.admission_policy,
+            observed_at=observed_at,
+        )
         snapshot_hash = authority_snapshot_hash(
-            held, pending, coordinator_epoch=self.leader_epoch
+            held,
+            pending,
+            coordinator_epoch=self.leader_epoch,
+            policy=self.admission_policy,
+            observed_at=observed_at,
         )
         return decision, snapshot_hash
 
@@ -670,7 +883,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             "bail_epoch": int(source.get("bail_epoch") or 0),
             "mode": source["mode"],
             "pathspec_digest": digest,
-            "policy_version": source.get("policy_version") or ADMISSION_POLICY_VERSION,
+            "policy_version": (
+                source.get("policy_version") or self.admission_policy.version
+            ),
         }
 
     def _admission_payload(self, event_type, identity, snapshot_hash, **variant):
@@ -818,15 +1033,24 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         return timed_out
 
     def _promote_pending(self, now=None):
-        # Same pure decision table as claim().  Iteration is priority DESC then
-        # durable queue_seq ASC; disjoint requests may all promote in one pass.
+        # Same pure decision table as claim(). Dynamic effective priority is
+        # evaluated once at ``now``; disjoint requests may all promote in one pass.
         now = time.time() if now is None else now
-        for o in self.store.pending_orbits():
+        for o in self._ordered_pending(now):
             # Defense in depth: all public callers reconcile deadlines/owners
             # first, but a direct internal call must still never grant either.
             if o["wait_deadline"] is not None and o["wait_deadline"] <= now:
                 continue
             if not self._pending_owner_fresh(o, now):
+                continue
+            rank_observation = self._rank_observation(o, now)
+            if rank_observation["effective_priority"] is None:
+                self._emit(
+                    "orbit_policy_unavailable",
+                    o["agent_id"],
+                    orbit_id=o["orbit_id"],
+                    policy_version=o.get("policy_version"),
+                )
                 continue
             decision, snapshot_hash = self._admission_decision(
                 json.loads(o["pathspec"]),
@@ -834,6 +1058,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 o["priority"],
                 o["queue_seq"],
                 orbit_id=o["orbit_id"],
+                policy_version=o["policy_version"],
+                enqueued_at=o["enqueued_at"],
+                observed_at=now,
             )
             identity = self._admission_identity(o)
             if decision.grantable:
@@ -849,8 +1076,16 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     queue_seq=o["queue_seq"],
                     fence=fence,
                     lease_deadline=lease_deadline,
+                    base_priority=decision.base_priority,
+                    effective_priority=decision.effective_priority,
+                    observed_at=decision.observed_at,
                 )
-                context = {**identity, "state": "PENDING", "queue_seq": o["queue_seq"]}
+                context = {
+                    **identity,
+                    "state": "PENDING",
+                    "queue_seq": o["queue_seq"],
+                    **rank_observation,
+                }
                 self._assert_admission_projection(
                     context, "PROMOTION_GRANTED", payload, snapshot_hash, "HELD"
                 )
@@ -863,6 +1098,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     authority_snapshot_hash=snapshot_hash,
                     decision_id=payload["decision_id"],
                     decision_type="PROMOTION_GRANTED",
+                    decision_schema="admission_decision/v2",
+                    decision_observed_at=decision.observed_at,
+                    decision_effective_priority=decision.effective_priority,
                     blocker_ids=[],
                 )
                 self._emit("orbit_granted", o["agent_id"], orbit_id=o["orbit_id"],
@@ -876,8 +1114,16 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     snapshot_hash,
                     queue_seq=o["queue_seq"],
                     blocker_fingerprint=blocker_fingerprint,
+                    base_priority=decision.base_priority,
+                    effective_priority=decision.effective_priority,
+                    observed_at=decision.observed_at,
                 )
-                context = {**identity, "state": "PENDING", "queue_seq": o["queue_seq"]}
+                context = {
+                    **identity,
+                    "state": "PENDING",
+                    "queue_seq": o["queue_seq"],
+                    **rank_observation,
+                }
                 self._assert_admission_projection(
                     context, "PROMOTION_BLOCKED", payload, snapshot_hash, "PENDING"
                 )
@@ -886,6 +1132,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     authority_snapshot_hash=snapshot_hash,
                     decision_id=payload["decision_id"],
                     decision_type="PROMOTION_BLOCKED",
+                    decision_schema="admission_decision/v2",
+                    decision_observed_at=decision.observed_at,
+                    decision_effective_priority=decision.effective_priority,
                     blocker_ids=list(decision.blocker_ids),
                 )
 
@@ -911,34 +1160,55 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             )
             self._emit("orbit_expired", orbit["agent_id"], orbit_id=orbit["orbit_id"])
         if reclaim and self.agent_ttl:
-            self._reclaim_zombies_inline(promote=False)
+            self._reclaim_zombies_inline(now=now, promote=False)
         self._timeout_pending(now)
+        self._deny_reservation_cycles(now)
         self._promote_pending(now)
 
-    def _wait_for(self) -> dict:
+    def _wait_for(self, observed_at, *, with_sources=False):
         """Combined HELD ownership + higher-ranked PENDING reservation graph."""
         held = self.store.held_orbits()
         pending = self.store.pending_orbits()
         by_id = {o["orbit_id"]: o for o in held + pending}
         edges: dict = {}
+        edge_sources: dict[tuple[str, str], set[str]] = {}
         for p in pending:
+            if self._rank_observation(p, observed_at)["effective_priority"] is None:
+                # Unknown policy authority is fail-closed for promotion. It can
+                # still block valid newer rows, but cannot assert its own edges.
+                continue
             request = AdmissionRequest.build(
                 json.loads(p["pathspec"]),
                 p["mode"],
                 p["priority"],
                 p["queue_seq"],
                 orbit_id=p["orbit_id"],
+                policy_version=p["policy_version"],
+                enqueued_at=p["enqueued_at"],
             )
-            decision = decide_admission(request, held, pending)
+            decision = decide_admission(
+                request,
+                held,
+                pending,
+                policy=self.admission_policy,
+                observed_at=observed_at,
+            )
             for blocker_id in decision.blocker_ids:
                 blocker = by_id[blocker_id]
                 if blocker["agent_id"] != p["agent_id"]:
-                    edges.setdefault(p["agent_id"], set()).add(blocker["agent_id"])
+                    source = p["agent_id"]
+                    target = blocker["agent_id"]
+                    edges.setdefault(source, set()).add(target)
+                    edge_sources.setdefault((source, target), set()).add(
+                        p["orbit_id"]
+                    )
+        if with_sources:
+            return edges, edge_sources
         return edges
 
-    def _cycle_with(self, node) -> bool:
+    def _cycle_with(self, node, observed_at) -> bool:
         """node가 wait-for 그래프에서 자기 자신으로 되돌아오는 사이클에 있나(데드락)."""
-        edges = self._wait_for()
+        edges = self._wait_for(observed_at)
 
         def dfs(n, path):
             for m in edges.get(n, ()):
@@ -949,6 +1219,102 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             return False
 
         return dfs(node, {node})
+
+    def _deny_reservation_cycles(
+        self,
+        observed_at,
+        *,
+        reason="reservation_cycle_after_rank_change",
+    ):
+        """Resolve cycles introduced by time-varying rank before promotion.
+
+        Aging can reverse a reservation edge after insertion, and a new HELD
+        grant can add an ownership edge. Preserve older reservations by denying
+        the largest queue_seq that participates in the discovered agent cycle,
+        then recompute until the graph is acyclic.
+        """
+        denied = []
+        while True:
+            edges, edge_sources = self._wait_for(
+                observed_at, with_sources=True
+            )
+            cycle = self._find_cycle(edges)
+            if cycle is None:
+                return denied
+            source_ids = set()
+            for source, target in zip(cycle, cycle[1:]):
+                source_ids.update(edge_sources.get((source, target), ()))
+            candidates = [
+                self.store.get_orbit(orbit_id) for orbit_id in source_ids
+            ]
+            candidates = [
+                row for row in candidates if row is not None and row["state"] == "PENDING"
+            ]
+            if not candidates:
+                raise RuntimeError(
+                    "reservation cycle has no authoritative PENDING source"
+                )
+            victim = max(
+                candidates,
+                key=lambda row: (int(row["queue_seq"]), row["orbit_id"]),
+            )
+            decision, snapshot_hash = self._admission_decision(
+                json.loads(victim["pathspec"]),
+                victim["mode"],
+                victim["priority"],
+                victim["queue_seq"],
+                orbit_id=victim["orbit_id"],
+                policy_version=victim["policy_version"],
+                enqueued_at=victim["enqueued_at"],
+                observed_at=observed_at,
+            )
+            identity = self._admission_identity(victim)
+            payload = self._admission_payload(
+                "PROMOTION_DENIED",
+                identity,
+                snapshot_hash,
+                queue_seq=victim["queue_seq"],
+                reason=reason,
+                base_priority=decision.base_priority,
+                effective_priority=decision.effective_priority,
+                observed_at=decision.observed_at,
+            )
+            context = {
+                **identity,
+                "state": "PENDING",
+                "queue_seq": victim["queue_seq"],
+                **self._rank_observation(victim, observed_at),
+            }
+            self._assert_admission_projection(
+                context,
+                "PROMOTION_DENIED",
+                payload,
+                snapshot_hash,
+                "DENIED",
+            )
+            self.store.set_orbit(
+                victim["orbit_id"],
+                state=fsm.advance("orbit", "PENDING", "deny"),
+                released_at=observed_at,
+                authority_snapshot_hash=snapshot_hash,
+                decision_id=payload["decision_id"],
+                decision_type="PROMOTION_DENIED",
+                decision_schema="admission_decision/v2",
+                decision_observed_at=decision.observed_at,
+                decision_effective_priority=decision.effective_priority,
+                blocker_ids=list(decision.blocker_ids),
+                terminal_reason=reason,
+            )
+            denied.append(victim["orbit_id"])
+            self._emit(
+                "orbit_denied",
+                victim["agent_id"],
+                orbit_id=victim["orbit_id"],
+                deadlock=True,
+                dynamic_rank_cycle=True,
+                queue_seq=victim["queue_seq"],
+                decision_id=payload["decision_id"],
+            )
 
     # ---- task 의존 DAG 사이클 게이트 (§D7, P0-10) ----
     def _dep_graph(self, extra_edges=None) -> dict:
@@ -973,7 +1339,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         def visit(n):
             color[n] = GRAY
             stack.append(n)
-            for m in graph.get(n, ()):
+            for m in sorted(graph.get(n, ()), key=str):
                 c = color.get(m, WHITE)
                 if c == GRAY:
                     # back-edge → 사이클. stack[m..] + m 닫힘.
@@ -986,7 +1352,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             stack.pop()
             return None
 
-        for n in list(graph):
+        for n in sorted(graph, key=str):
             if color.get(n, WHITE) == WHITE:
                 cyc = visit(n)
                 if cyc:
@@ -1002,9 +1368,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         g.setdefault(task_id, set())
         return self._find_cycle(g)
 
-    def _sweep_inline(self):
+    def _sweep_inline(self, now=None):
         """임계구역 안에서 도는 sweep 본체(만료 회수 + 좀비 회수 + promote). tx 자기관리 안 함."""
-        now = time.time()
+        now = time.time() if now is None else now
         self._reconcile_admission(now)
         # D3(§1.2): TTL 만료된 flag_ephemeral lease — 보유자가 renew 안 함(GC-pause/사망) →
         # 받쳐주던 EPHEMERAL 플래그를 BROKEN(자동 clear) + 대기자 PRODUCER_DEAD 기상. 영구 hang 0.
@@ -1035,14 +1401,15 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # completed_at NULL 로 보존. now 는 위에서 이미 정의됨(시각 일관).
         if self.idem_ttl:
             self.store.gc_idem(now - self.idem_ttl)
+        return now
 
-    def _reclaim_zombies_inline(self, *, promote=True):
+    def _reclaim_zombies_inline(self, *, now=None, promote=True):
         """heartbeat 끊긴 물방울(involuntary) — 단일 회수 루틴으로 위임.
         F2: 생존창은 per-agent(liveness_ttl 선언, 미선언=agent_ttl) — 판정은 store 쿼리가 원자."""
         if not self.agent_ttl:
             return []
         out = []
-        now = time.time()
+        now = time.time() if now is None else now
         for a in self.store.stale_agents(now, self.agent_ttl):
             # Phase B merge/check subprocess는 coordinator가 직접 관측하고 write-orbit에 유계 pin을
             # 박는다. 그 한가운데서 heartbeat만 보고 회수하면 checker와 abort가 동시에 달린다.
@@ -1056,16 +1423,19 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             if active_connect_pin:
                 continue
             self._reclaim_agent_inline(
-                a["agent_id"], voluntary=False, promote=promote
+                a["agent_id"], voluntary=False, now=now, promote=promote
             )
             out.append(a["agent_id"])
         return out
 
-    def _reclaim_agent_inline(self, agent_id, *, voluntary, promote=True):
+    def _reclaim_agent_inline(
+        self, agent_id, *, voluntary, now=None, promote=True
+    ):
         """긴급탈출(voluntary `bail`) / 좀비회수(involuntary) **단일 루틴** (D2).
         이 agent가 쥔 모든 궤도(HELD/PENDING)를 해제하고, 진행중 작업(CLAIMED/IN_ORBIT/CONNECTING)을
         requeue하고, worktree+브랜치를 정리하고, agent를 RETIRE한다 → 어떤 보유물도 고아가 안 된다.
         멱등 — 도중 죽어도 sweeper가 같은 루틴으로 마저 정리(이중해제·누락 없음)."""
+        now = time.time() if now is None else now
         ag = self.store.get_agent(agent_id)
         if ag is None or ag["state"] == "RETIRED":
             return {"agent": agent_id, "noop": True}
@@ -1079,7 +1449,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             self._abort_dangling_merge(mt)
             self.store.set_orbit(mt["orbit_id"],
                                  state=fsm.advance("orbit", "HELD", "expire"),
-                                 released_at=time.time())
+                                 released_at=now)
             self._emit("merge_token_reclaimed", agent_id, orbit_id=mt["orbit_id"])
         # 죽은 보유자의 flag_ephemeral lease: 받쳐주던 EPHEMERAL 플래그를 BROKEN(자동 clear)
         # + lease EXPIRE + 대기자 PRODUCER_DEAD 기상(§1.2 — "작업중 플래그 영구 잔존" 해소).
@@ -1087,7 +1457,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             self._break_ephemeral_flags_for_lease(fl["orbit_id"], reason="producer_dead")
             self.store.set_orbit(fl["orbit_id"],
                                  state=fsm.advance("orbit", "HELD", "expire"),
-                                 released_at=time.time())
+                                 released_at=now)
             self._emit("flag_lease_reclaimed", agent_id, orbit_id=fl["orbit_id"])
         # 죽은 보유자의 sem_permit: EXPIRE → 가용 슬롯 복구(누수 0, §D4). 복구된 세마포어의
         # 대기자를 줄선 순서로 부여(no-overtaking, §D7) — 영구 hang/기아 없음.
@@ -1095,7 +1465,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         for p in self.store.sem_permits_owned_by(agent_id, ("HELD",)):
             self.store.set_orbit(p["orbit_id"],
                                  state=fsm.advance("orbit", "HELD", "expire"),
-                                 released_at=time.time())
+                                 released_at=now)
             self._emit("sem_permit_reclaimed", agent_id, orbit_id=p["orbit_id"],
                        sem=p["resource_key"])
             reclaimed_sems.add(p["resource_key"])
@@ -1110,19 +1480,19 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 decision_type = "LEASE_OWNER_RECLAIMED"
                 terminal_reason = "lease_owner_reclaimed"
                 snapshot_hash, _, _ = self._reduce_orbit_lifecycle(
-                    o, decision_type
+                    o, decision_type, observed_at=now
                 )
             else:
                 decision_type = "WAIT_OWNER_RECLAIMED"
                 terminal_reason = "wait_owner_reclaimed"
                 snapshot_hash, _, _ = self._reduce_orbit_lifecycle(
-                    o, decision_type, no_lease_fence=0
+                    o, decision_type, observed_at=now, no_lease_fence=0
                 )
             # merging pin은 회수와 함께 해제(§E pin은 유계 — 보유자 사망도 한 경계).
             self.store.set_orbit(
                 o["orbit_id"],
                 state=fsm.advance("orbit", o["state"], trig),
-                released_at=time.time(),
+                released_at=now,
                 merging=0,
                 authority_snapshot_hash=snapshot_hash,
                 decision_id=None,
@@ -1163,7 +1533,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         for sem_id in reclaimed_sems:
             self._promote_sem_waiters(sem_id)  # 복구된 슬롯을 줄선 순서로 부여(§D7)
         if promote:
-            self._reconcile_admission(reclaim=False)
+            self._reconcile_admission(now=now, reclaim=False)
         return {"agent": agent_id, "voluntary": voluntary, "orbits": freed, "tasks": requeued}
 
     def _check_owner(self, o, agent_id, fence):
@@ -2375,7 +2745,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         return dict(response, replayed=True)
 
     def claim(self, agent_id, pathspec, mode="write", *, ttl=600.0, task_id=None,
-              reason="", priority=0, request_id=None, bail_epoch=None):
+              reason="", priority=0, request_id=None, bail_epoch=None,
+              _observed_at=None):
         if not isinstance(agent_id, str) or not agent_id:
             return {"ok": False, "state": "REJECTED", "reason": "invalid_agent_id"}
         if request_id is not None and (
@@ -2426,7 +2797,14 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             with self._idem(request_id, agent_id, "claim", args) as cache:
                 if cache.hit:
                     return cache.value
-                self._sweep_inline()
+                # begin() supplies an already-swept authority cut for every
+                # member of one batch. Re-sweeping between members could promote
+                # a waiter after the first grant and break all-or-none acquisition.
+                observed_at = (
+                    self._sweep_inline()
+                    if _observed_at is None
+                    else _observed_at
+                )
                 # §D6: 회수/탈출된 좀비는 새 궤도조차 못 잡음(부활 차단).
                 dead = self._check_alive(agent_id, bail_epoch)
                 if dead:
@@ -2515,29 +2893,45 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                            "conflicts": json.loads(dup["blocker_ids"] or "[]"),
                            "decision_id": dup["decision_id"], "dedup": True}
                     return cache.set(out)
+                if not self.admission_policy.accepts_base_priority(priority):
+                    return cache.set({
+                        "ok": False,
+                        "state": "REJECTED",
+                        "reason": "invalid_admission_request",
+                        "detail": (
+                            "priority must leave signed-64-bit headroom for "
+                            "max_age_boost"
+                        ),
+                    })
                 # Preview the next durable ticket under the same BEGIN IMMEDIATE
                 # transaction.  A terminal overload must not consume a ticket.
                 queue_seq = self.store.current_seq() + 1
                 oid = "orb-" + uuid.uuid4().hex[:12]
                 semantic_request_id = request_id or f"internal:{oid}"
                 decision, snapshot_hash = self._admission_decision(
-                    pathspec, mode, priority, queue_seq, orbit_id=oid
+                    pathspec,
+                    mode,
+                    priority,
+                    queue_seq,
+                    orbit_id=oid,
+                    policy_version=self.admission_policy.version,
+                    enqueued_at=observed_at,
+                    observed_at=observed_at,
                 )
                 identity = self._admission_identity(
                     orbit_id=oid, request_id=semantic_request_id,
                     request_generation=request_generation,
                     agent_id=agent_id, bail_epoch=effective_bail_epoch, mode=mode,
                     pathspec=pathspec, pathspec_digest=pathspec_digest(pathspec),
-                    policy_version=ADMISSION_POLICY_VERSION,
+                    policy_version=self.admission_policy.version,
                 )
                 if not decision.grantable:
                     queue_stats = self.store.pending_queue_stats()
                     queue_depth = queue_stats["depth"]
                     if queue_depth >= self.admission_queue_capacity:
-                        now = time.time()
                         retry_after_at = queue_stats["earliest_wait_deadline"]
-                        if retry_after_at is None or retry_after_at <= now:
-                            retry_after_at = now + min(
+                        if retry_after_at is None or retry_after_at <= observed_at:
+                            retry_after_at = observed_at + min(
                                 1.0, self.admission_wait_timeout
                             )
                         payload = self._admission_payload(
@@ -2548,6 +2942,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                             queue_depth=queue_depth,
                             queue_capacity=self.admission_queue_capacity,
                             retry_after_at=retry_after_at,
+                            base_priority=decision.base_priority,
+                            effective_priority=decision.effective_priority,
+                            observed_at=decision.observed_at,
                         )
                         self._assert_admission_projection(
                             {**identity, "state": "REQUESTED"},
@@ -2566,6 +2963,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                             "retry_after_at": retry_after_at,
                             "queue_depth": queue_depth,
                             "queue_capacity": self.admission_queue_capacity,
+                            "base_priority": decision.base_priority,
+                            "effective_priority": decision.effective_priority,
+                            "observed_at": decision.observed_at,
                             "repository_id": identity["repository_id"],
                             "request_id": identity["request_id"],
                             "request_generation": identity["request_generation"],
@@ -2601,12 +3001,15 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                         raise RuntimeError(
                             "admission queue ticket changed inside authority transaction"
                         )
-                    enqueued_at = time.time()
+                    enqueued_at = observed_at
                     wait_deadline = enqueued_at + self.admission_wait_timeout
                     payload = self._admission_payload(
                         "ADMISSION_QUEUED", identity, snapshot_hash,
                         queue_seq=queue_seq, enqueued_at=enqueued_at,
                         wait_deadline=wait_deadline,
+                        base_priority=decision.base_priority,
+                        effective_priority=decision.effective_priority,
+                        observed_at=decision.observed_at,
                     )
                     self._assert_admission_projection(
                         {**identity, "state": "REQUESTED"}, "ADMISSION_QUEUED",
@@ -2615,7 +3018,8 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                         orbit_id=oid, task_id=task_id, agent_id=agent_id,
                         pathspec=pathspec, mode=mode, state="PENDING", reason=reason,
                         priority=priority, intent_key=ikey, queue_seq=queue_seq,
-                        requested_ttl=ttl, policy_version=ADMISSION_POLICY_VERSION,
+                        requested_ttl=ttl,
+                        policy_version=self.admission_policy.version,
                         pathspec_digest=identity["pathspec_digest"],
                         request_id=semantic_request_id,
                         request_generation=request_generation,
@@ -2623,25 +3027,48 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                         authority_snapshot_hash=snapshot_hash,
                         decision_id=payload["decision_id"],
                         decision_type="ADMISSION_QUEUED",
+                        decision_schema="admission_decision/v2",
+                        decision_observed_at=decision.observed_at,
+                        decision_effective_priority=decision.effective_priority,
                         blocker_ids=list(decision.blocker_ids),
                         enqueued_at=enqueued_at,
                         wait_deadline=wait_deadline)
-                    if self._cycle_with(agent_id):  # 대기 시 데드락 사이클이면 거부
+                    if self._cycle_with(agent_id, observed_at):
                         held = self.store.held_orbits()
                         pending = self.store.pending_orbits()
                         denial_snapshot = authority_snapshot_hash(
-                            held, pending, coordinator_epoch=self.leader_epoch)
+                            held,
+                            pending,
+                            coordinator_epoch=self.leader_epoch,
+                            policy=self.admission_policy,
+                            observed_at=observed_at,
+                        )
                         denial = self._admission_payload(
                             "PROMOTION_DENIED", identity, denial_snapshot,
-                            queue_seq=queue_seq, reason="reservation_cycle")
+                            queue_seq=queue_seq,
+                            reason="reservation_cycle",
+                            base_priority=decision.base_priority,
+                            effective_priority=decision.effective_priority,
+                            observed_at=decision.observed_at,
+                        )
                         self._assert_admission_projection(
-                            {**identity, "state": "PENDING", "queue_seq": queue_seq},
+                            {
+                                **identity,
+                                "state": "PENDING",
+                                "queue_seq": queue_seq,
+                                "base_priority": decision.base_priority,
+                                "effective_priority": decision.effective_priority,
+                                "observed_at": decision.observed_at,
+                            },
                             "PROMOTION_DENIED", denial, denial_snapshot, "DENIED")
                         self.store.set_orbit(
                             oid, state=fsm.advance("orbit", "PENDING", "deny"),
                             authority_snapshot_hash=denial_snapshot,
                             decision_id=denial["decision_id"],
                             decision_type="PROMOTION_DENIED",
+                            decision_schema="admission_decision/v2",
+                            decision_observed_at=decision.observed_at,
+                            decision_effective_priority=decision.effective_priority,
                             terminal_reason="reservation_cycle")
                         self._emit("orbit_denied", agent_id, orbit_id=oid, deadlock=True,
                                    queue_seq=queue_seq, decision_id=denial["decision_id"])
@@ -2654,6 +3081,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                                           "deadlock": True,
                                           "reason": "reservation_cycle",
                                           "queue_seq": queue_seq,
+                                          "base_priority": decision.base_priority,
+                                          "effective_priority": decision.effective_priority,
+                                          "observed_at": decision.observed_at,
                                           "conflicts": list(decision.blocker_ids),
                                           "held_conflicts": list(decision.held_blockers),
                                           "pending_predecessors": list(
@@ -2672,6 +3102,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                                       "wait_deadline": wait_deadline,
                                       "queue_depth": queue_depth,
                                       "queue_capacity": self.admission_queue_capacity,
+                                      "base_priority": decision.base_priority,
+                                      "effective_priority": decision.effective_priority,
+                                      "observed_at": decision.observed_at,
                                       "conflicts": list(decision.blocker_ids),
                                       "held_conflicts": list(decision.held_blockers),
                                       "pending_predecessors": list(
@@ -2683,10 +3116,15 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                         "admission queue ticket changed inside authority transaction"
                     )
                 fence = self.store.next_fence()
-                lease_deadline = time.time() + ttl
+                lease_deadline = observed_at + ttl
                 payload = self._admission_payload(
                     "ADMISSION_GRANTED", identity, snapshot_hash,
-                    fence=fence, lease_deadline=lease_deadline)
+                    fence=fence,
+                    lease_deadline=lease_deadline,
+                    base_priority=decision.base_priority,
+                    effective_priority=decision.effective_priority,
+                    observed_at=decision.observed_at,
+                )
                 self._assert_admission_projection(
                     {**identity, "state": "REQUESTED"}, "ADMISSION_GRANTED",
                     payload, snapshot_hash, "HELD")
@@ -2698,14 +3136,27 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     pathspec=pathspec, mode=mode, state="HELD", fence=fence,
                     expires_at=lease_deadline, reason=reason, priority=priority,
                     intent_key=ikey, read_gen=read_gen, queue_seq=queue_seq,
-                    requested_ttl=ttl, policy_version=ADMISSION_POLICY_VERSION,
+                    requested_ttl=ttl,
+                    policy_version=self.admission_policy.version,
                     pathspec_digest=identity["pathspec_digest"],
                     request_id=semantic_request_id,
                     request_generation=request_generation,
                     bail_epoch=effective_bail_epoch,
                     authority_snapshot_hash=snapshot_hash,
                     decision_id=payload["decision_id"],
-                    decision_type="ADMISSION_GRANTED", blocker_ids=[])
+                    decision_type="ADMISSION_GRANTED",
+                    decision_schema="admission_decision/v2",
+                    decision_observed_at=decision.observed_at,
+                    decision_effective_priority=decision.effective_priority,
+                    blocker_ids=[])
+                # A fresh HELD ownership edge can close a cycle with another
+                # request already queued by the same agent. Queue insertion and
+                # promotion paths are checked separately; close the immediate-
+                # grant cutpoint in this same authority transaction and clock.
+                self._deny_reservation_cycles(
+                    observed_at,
+                    reason="reservation_cycle_after_grant",
+                )
                 # §D12: read claim 은 그 task 의 read-set 동기화 gen 을 박는다(궤도 생명과 분리 —
                 # 궤도를 release 한 뒤에도 consumer 의 connect 가 코히런스를 검사하도록). 여러 read
                 # 를 claim 하면 가장 옛 gen(보수적)로 고정한다.
@@ -2721,6 +3172,9 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                                   "request_generation": request_generation,
                                   "state": "HELD", "fence": fence,
                                   "queue_seq": queue_seq, "conflicts": [],
+                                  "base_priority": decision.base_priority,
+                                  "effective_priority": decision.effective_priority,
+                                  "observed_at": decision.observed_at,
                                   "decision_id": payload["decision_id"],
                                   "bail_epoch": effective_bail_epoch})
 
@@ -3556,6 +4010,41 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 return {"ok": False, "stage": "validate",
                         "reason": "liveness_exceeds_orbit_ttl",
                         "ttl": ttl, "liveness_ttl": liveness_ttl}
+        specs = []
+        if writes:
+            specs.append(("write", list(writes), "claim"))
+        if shared:
+            specs.append(("shared", list(shared), "claim-shared"))
+
+        def _legacy_resume_intents_live():
+            return bool(specs) and all(
+                (dup := self.store.orbit_by_intent(
+                    self._intent_key(agent_id, paths, mode, task_id)
+                ))
+                is not None
+                and dup["agent_id"] == agent_id
+                and int(dup["priority"] or 0) == priority
+                and self.admission_policy.accepts_base_priority(
+                    priority,
+                    policy_version=dup.get("policy_version"),
+                )
+                for mode, paths, _ in specs
+            )
+
+        legacy_resume = False
+        if not self.admission_policy.accepts_base_priority(priority) and specs:
+            with self._cs():
+                legacy_resume = _legacy_resume_intents_live()
+        if (
+            not self.admission_policy.accepts_base_priority(priority)
+            and not legacy_resume
+        ):
+            return {
+                "ok": False,
+                "stage": "validate",
+                "reason": "invalid_priority",
+                "priority": priority,
+            }
         # 1) declare (task_id 키 upsert — 자연 멱등, 진행중 state 는 보존)
         dc = self.declare(task_id, name=name, writes=writes, reads=reads, deps=deps,
                           priority=priority, shared=shared)
@@ -3577,14 +4066,17 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # 먼저 같은 임계구역에서 *전부* preflight해, 뒤쪽 shared가 충돌할 때 앞쪽 exclusive
         # HELD만 남는 partial acquisition을 막는다. 충돌한 클래스 하나만 PENDING으로 등록해
         # promote→begin 재시도가 자연스럽게 이어진다. writes/shared 자체 중첩은 declare가 거부.
-        specs = []
-        if writes:
-            specs.append(("write", list(writes), "claim"))
-        if shared:
-            specs.append(("shared", list(shared), "claim-shared"))
         claims = {}
         with self._cs():
-            self._sweep_inline()
+            observed_at = self._sweep_inline()
+            if legacy_resume and not _legacy_resume_intents_live():
+                return {
+                    "ok": False,
+                    "stage": "claim",
+                    "reason": "invalid_priority",
+                    "detail": "legacy resume authority is no longer live",
+                    "priority": priority,
+                }
             for offset, (mode, paths, rid_suffix) in enumerate(specs, start=1):
                 dup = self.store.orbit_by_intent(
                     self._intent_key(agent_id, paths, mode, task_id)
@@ -3602,13 +4094,20 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 # writer lock.  It lets begin see PENDING predecessors before acquiring
                 # any member of its batch, preventing partial HELD acquisition.
                 admission, _ = self._admission_decision(
-                    paths, mode, priority, self.store.current_seq() + offset
+                    paths,
+                    mode,
+                    priority,
+                    self.store.current_seq() + offset,
+                    policy_version=self.admission_policy.version,
+                    enqueued_at=observed_at,
+                    observed_at=observed_at,
                 )
                 if not admission.grantable:
                     pending = self.claim(
                         agent_id, paths, mode=mode, ttl=ttl, task_id=task_id,
                         priority=priority,
                         request_id=_rid(rid_suffix), bail_epoch=bail_epoch,
+                        _observed_at=observed_at,
                     )
                     self._emit("begin_blocked", task_id, reason="claim", mode=mode,
                                state=pending.get("state"))
@@ -3618,6 +4117,13 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                             "conflicts": pending.get(
                                 "conflicts", list(admission.blocker_ids))}
             # 전 클래스가 지금 grant 가능하거나 이미 HELD임을 확인한 뒤 같은 tx에서 획득.
+            # The savepoint includes every nested claim side effect: orbit rows,
+            # request generations, fence/queue counters, cycle denial, and DONE
+            # idempotency receipts.  A defensive later-member failure therefore
+            # restores the exact pre-batch authority cut instead of publishing a
+            # stale HELD receipt and then trying to compensate with release().
+            self.store.db.execute("SAVEPOINT omd_begin_batch_acquire")
+
             for mode, paths, rid_suffix in specs:
                 if mode in claims:
                     continue
@@ -3625,15 +4131,24 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     agent_id, paths, mode=mode, ttl=ttl, task_id=task_id,
                     priority=priority,
                     request_id=_rid(rid_suffix), bail_epoch=bail_epoch,
+                    _observed_at=observed_at,
                 )
                 if claimed.get("state") != "HELD":  # preflight 아래서는 방어적 불변식 가드
+                    self.store.db.execute(
+                        "ROLLBACK TO SAVEPOINT omd_begin_batch_acquire"
+                    )
+                    self.store.db.execute(
+                        "RELEASE SAVEPOINT omd_begin_batch_acquire"
+                    )
                     self._emit("begin_blocked", task_id, reason="claim", mode=mode,
                                state=claimed.get("state"))
                     return {"ok": False, "stage": "claim", "task_id": task_id,
                             "mode": mode, "orbit_id": claimed.get("orbit_id"),
                             "state": claimed.get("state"),
-                            "conflicts": claimed.get("conflicts", [])}
+                            "conflicts": claimed.get("conflicts", []),
+                            "rollback": "transaction"}
                 claims[mode] = claimed
+            self.store.db.execute("RELEASE SAVEPOINT omd_begin_batch_acquire")
         # 4) promote → READY (PENDING/BLOCKED 만; 이미 진행중이면 skip → 멱등 재시작).
         t = self.store.get_task(task_id)
         if t["state"] in ("PENDING", "BLOCKED"):
@@ -4125,10 +4640,35 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                     "gen": new_gen, "stale_reads": stale_reads}
 
     def status(self):
-        self.sweep()
-        snapshot = self.store.snapshot()
-        snapshot["admission_queue"] = {
-            **self.store.pending_queue_stats(),
-            "capacity": self.admission_queue_capacity,
-        }
-        return snapshot
+        with self._cs():
+            observed_at = self._sweep_inline()
+            pending = []
+            for row in self._ordered_pending(observed_at):
+                rank = self._rank_observation(row, observed_at)
+                effective = rank["effective_priority"]
+                pending.append(
+                    {
+                        "orbit_id": row["orbit_id"],
+                        "queue_seq": row["queue_seq"],
+                        "base_priority": rank["base_priority"],
+                        "effective_priority": effective,
+                        "age_boost": (
+                            None
+                            if effective is None
+                            else effective - rank["base_priority"]
+                        ),
+                        "enqueued_at": row["enqueued_at"],
+                        "wait_deadline": row["wait_deadline"],
+                        "policy_version": rank["policy_version"],
+                    }
+                )
+            snapshot = self.store.snapshot()
+            snapshot["admission_queue"] = {
+                **self.store.pending_queue_stats(),
+                "capacity": self.admission_queue_capacity,
+                "observed_at": observed_at,
+                "policy_version": self.admission_policy.version,
+                "policy": self.admission_policy.envelope,
+                "pending": pending,
+            }
+            return snapshot

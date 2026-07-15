@@ -15,8 +15,15 @@ orphan rows. The MCP server owns a default autonomous sweep; embedded
 coordinators remain opt-in. The repository queue is now bounded (default 1024,
 operator-pinned per DB), and full queues return a typed, replayable
 `QUEUE_FULL` receipt without allocating an Orbit, fence or queue ticket.
-Saturating aging, notification outbox, candidate indexing, the prepared Connect
-pipeline, and protected-ref control plane remain unimplemented. Do not
+The queue now uses a content-addressed v2 saturating-aging policy: the operational
+default is a 60-second quantum with a +10 ceiling, the canonical envelope is
+pinned per DB, and one transaction clock binds rank, authority snapshot and
+`admission_decision/v2` evidence. Reconciliation recomputes aging-dependent
+reservation edges and denies the newest participating ticket if a rank change
+or immediate grant creates a cycle. Finite boost is not a starvation proof;
+`wait_deadline` remains the bounded-resolution authority. Notification outbox,
+candidate indexing, the prepared Connect pipeline, and protected-ref control
+plane remain unimplemented. Do not
 describe this slice as the complete durable waiter, an optimized scheduler, a
 production rollout, or a scientific progress result.
 
@@ -338,6 +345,10 @@ grant(R) iff
   and no higher-ranked conflicting PENDING predecessor exists
 ```
 
+For v2 rows, `age=max(0, observed_at-enqueued_at)`,
+`boost=min(max_age_boost, floor(age/aging_quantum))`, and
+`effective_priority=base_priority+boost`; legacy v1 rows receive boost zero.
+New v2 priorities must leave signed-64 headroom for the configured ceiling.
 Rank is effective priority descending and then durable queue sequence ascending.
 Precedence exists only between conflicting, mode-incompatible requests. A global
 queue head must not block disjoint work.
@@ -380,25 +391,28 @@ invalidates the downstream evidence.
 
 ### 10.1 Implemented M1 fairness slice
 
-The current runtime closes evidence items 1--5 and 7 for the bounded real-code
-trace, and the queue-order part of item 8:
+The current runtime closes evidence items 1--8 for the bounded real-code trace;
+item 9 remains open because the runtime deliberately uses the full exact scan:
 
 - `omd_server/admission.py` is the pure mode compatibility, exact-overlap,
-  priority/FIFO rank and blocker decision table used by both `claim()` and
-  `_promote_pending()`;
+  versioned priority/aging/FIFO rank and blocker decision table used by both
+  `claim()` and `_promote_pending()`;
 - SQLite persists monotonic `queue_seq`, requested TTL, policy version, path
   digest, request id/generation, bail epoch, enqueue/deadline timestamps,
-  authority snapshot, canonical decision id/type and blockers. Legacy PENDING
+  authority snapshot, canonical decision schema/id/type, observed time,
+  effective priority and blockers. Legacy PENDING
   rows receive the reconstructable request/rank/deadline fields through a
   deterministic one-time backfill ordered by `(created_at, orbit_id)`; the next
   reconciliation records current decision metadata. `created_at` is not the M1
   ordering authority;
 - the combined wait-for graph includes HELD-owner and higher-ranked conflicting
-  PENDING-reservation edges, so a new reservation cycle is denied before it is
-  exposed;
+  PENDING-reservation edges. It rejects an insertion cycle before exposure,
+  recomputes aging-dependent edges before promotion, and rechecks after an
+  immediate HELD grant; the newest participating PENDING ticket is denied until
+  the graph is acyclic;
 - `omd_server/admission_contract.py` loads the JSON FSM transition, context
   update and effect bindings, computes nine-field identity, trusted authority,
-  queue-sequence and replay guards from typed payloads, and verifies the
+  queue-sequence, rank-evidence and replay guards from typed payloads, and verifies the
   one-way legacy projection;
 - reconciliation expires HELD authority, reclaims stale owners, delivers due
   `WAIT_TIMEOUT` decisions, and only then considers promotion. The same order
@@ -467,6 +481,14 @@ binds depth, capacity and `retry_after_at` in its decision ID, creates no live
 row, and exact request-ID replay returns the same terminal receipt; a later
 attempt uses a fresh request ID. Task cancellation also terminalizes its own
 PENDING/HELD rows.
+The active aging policy is a canonical, content-addressed DB authority. Startup
+rejects incomplete, malformed or drifted envelopes before recovery; v1 and
+legacy rows remain replayable at boost zero. One observed time is reused across
+sweep, admission, begin preflight/nested claim, snapshot and decision. Rank
+inputs and the resulting effective priority are persisted as
+`admission_decision/v2` evidence. Aging arithmetic covers subnormal positive
+quanta and signed-64 priority boundaries without a later SQLite overflow or an
+order-changing final-priority clamp.
 Item 9 has no
 candidate index to prove yet (the runtime uses the sound full exact scan).
 Policy-denial generation rollover is implemented; explicit non-denial rollover
@@ -633,7 +655,7 @@ slice is ready to commit only when:
 
 Landing those files makes the **M1 fairness implementation slice** durable. It
 does not make full M1 or the development cycle `CLOSED`: embedded-runtime
-default delivery, saturating aging, candidate-index soundness, an independent
+default delivery, candidate-index soundness, a durable notification outbox, an independent
 scripted progress judgment and finalization receipts remain future work.
 
 ## 14. Known limitations and promotion blockers
@@ -651,7 +673,8 @@ scripted progress judgment and finalization receipts remain future work.
 4. Production admission/grant/queue/promotion/denial, due-timeout, standalone
    wait cancellation, renew/release, lease expiry and both owner-reclaim paths
    are bound to the JSON semantic reducer. MCP timeout delivery is autonomous
-   by default; embedded-runtime default delivery, aging, notification
+   by default; content-addressed saturating aging and dynamic rank-cycle
+   resolution are implemented. Embedded-runtime default delivery, notification
    outbox and candidate-index soundness remain the open M1 front. Task-bound
    `CANCEL`/`RELEASE` projection is also implemented.
 5. The prepared candidate, expected-old ref CAS, independent ref reader and

@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
+from .admission_config import (
+    parse_admission_aging_quantum,
+    parse_admission_max_age_boost,
+    parse_admission_queue_capacity,
+)
 from .core import Coordinator
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="omd", description="OMD 입체운행물방울 군단장 CLI")
     p.add_argument("--db", default="omd.db")
+    p.add_argument("--admission-queue-capacity")
+    p.add_argument("--admission-aging-quantum-seconds")
+    p.add_argument("--admission-max-age-boost")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("claim"); c.add_argument("agent"); c.add_argument("paths", nargs="+")
@@ -116,7 +125,27 @@ def main(argv=None):
     sub.add_parser("status")
 
     a = p.parse_args(argv)
-    omd = Coordinator(a.db)
+    capacity = parse_admission_queue_capacity(
+        a.admission_queue_capacity
+        if a.admission_queue_capacity is not None
+        else os.environ.get("OMD_ADMISSION_QUEUE_CAPACITY")
+    )
+    aging_quantum = parse_admission_aging_quantum(
+        a.admission_aging_quantum_seconds
+        if a.admission_aging_quantum_seconds is not None
+        else os.environ.get("OMD_ADMISSION_AGING_QUANTUM_SECONDS")
+    )
+    max_age_boost = parse_admission_max_age_boost(
+        a.admission_max_age_boost
+        if a.admission_max_age_boost is not None
+        else os.environ.get("OMD_ADMISSION_MAX_AGE_BOOST")
+    )
+    omd = Coordinator(
+        a.db,
+        admission_queue_capacity=capacity,
+        admission_aging_quantum=aging_quantum,
+        admission_max_age_boost=max_age_boost,
+    )
     rid = lambda: getattr(a, "request_id", None)
     be = lambda: getattr(a, "bail_epoch", None)
     try:

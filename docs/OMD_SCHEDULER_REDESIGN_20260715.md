@@ -15,7 +15,12 @@ both PENDING/HELD owner-reclaim paths now pass through the typed lifecycle
 reducer before legacy mutation. Repository wait capacity is durable and bounded
 (default 1024; `0` is no-wait); a full queue returns a replayable semantic
 `QUEUE_FULL` receipt without a row, fence or ticket, while disjoint work still
-grants. Saturating aging, candidate indexing, notification outbox and the prepared Connect pipeline remain
+grants. A content-addressed saturating-aging v2 policy is pinned per DB (the
+operational default is a 60-second quantum and +10 ceiling), uses one observed
+time per authority transaction, persists rank evidence, and rechecks dynamic
+reservation cycles after rank changes and immediate grants. Finite aging does
+not replace the wait-deadline liveness bound. Candidate indexing, notification
+outbox and the prepared Connect pipeline remain
 implementation fronts. Do not describe this branch as the complete
 durable waiter, an optimized scheduler, a production rollout or a scientific
 progress result. The governing `L_IDE` lifecycle is documented in
@@ -296,8 +301,9 @@ grant(R) iff
   and no older-or-higher-priority conflicting PENDING
 ```
 
-Add durable queue sequence, aging floor, capacity/backpressure, and notification
-or condition-driven wakeup.  Preserve priority first and FIFO within a priority.
+Add durable queue sequence, versioned saturating aging, capacity/backpressure,
+and notification or condition-driven wakeup. Preserve effective priority first
+and FIFO within an effective-priority tie.
 The synchronous API becomes a bounded compatibility waiter over the queue.
 
 Required receipts:
@@ -326,14 +332,24 @@ Implemented fairness slice:
   receive a deterministic one-time backfill of reconstructable
   request/rank/deadline fields, ordered by `(created_at, orbit_id)`; current
   decision metadata is recorded by reconciliation;
-- the pure admission kernel compares priority descending and queue sequence
-  ascending only among exact, mode-incompatible overlaps;
+- the pure admission kernel compares effective priority descending and queue sequence
+  ascending only among exact, mode-incompatible overlaps. For v2 rows,
+  `effective=base+min(ceiling,floor(age/quantum))`; legacy v1 rows receive boost
+  zero, and new v2 priority must leave signed-64 headroom for its ceiling;
+- the active canonical policy envelope and content-addressed version are pinned
+  in repository metadata. Startup fails before recovery on drift or corruption;
+  rank, authority snapshot and decision share one observed transaction time,
+  and decision schema/time/effective priority persist for restart readback;
 - initial admission and promotion use that same kernel, so the older broad
   waiter prevents the later narrow claim while unrelated work still grants;
 - promotion restores the persisted requested TTL rather than a hard-coded 600s;
-- wait-for cycle detection combines HELD-owner and reservation-precedence edges;
-- canonical `admission_decision/v1` payloads bind the nine-field request
-  identity, trusted authority snapshot and decision variant, then execute the
+- wait-for cycle detection combines HELD-owner and reservation-precedence edges,
+  recomputes time-varying rank edges before promotion, and rechecks after an
+  immediate grant. It denies the newest participating PENDING ticket until the
+  graph is acyclic;
+- canonical `admission_decision/v2` payloads bind the nine-field request
+  identity, trusted authority snapshot, base/effective priority, single
+  `observed_at` and decision variant, then execute the
   JSON FSM's context/effect bindings before legacy projection;
 - a live admission id or DONE-cached transport id with a different agent, verb,
   path, mode, priority, reason or bail epoch returns typed
@@ -378,7 +394,7 @@ producer/readback backend. It explicitly records no separate oracle and awaits
 independent judgment; it is not promoted to `external_verdict`.
 
 Still open before full M1: embedded-runtime default wait-deadline delivery,
-saturating aging, notification outbox,
+notification outbox,
 candidate-index soundness, explicit non-denial request-generation rollover,
 independent judgment and finalization. The current exact full scan is sound but is not an implemented
 candidate index. The existing Connect path now has process-tree effect fencing,
@@ -604,8 +620,8 @@ SHA-256 is
   `WAIT_TIMEOUT`, standalone wait `CANCEL`, renew/release, lease expiry and both
   owner-reclaim variants, are bound to current runtime code. MCP deadline
   delivery is default-on; repository capacity and typed overload are bound;
-  embedded-runtime default delivery, aging,
-  outbox and candidate-index soundness remain open. Task-bound
+  content-addressed aging and dynamic rank-cycle resolution are implemented;
+  embedded-runtime default delivery, outbox and candidate-index soundness remain open. Task-bound
   `CANCEL`/`RELEASE` projection is also implemented. The prepared Connect
   pipeline is still contract-only.
 - M0's measured numbers and LakatoTree `partial` verdict describe reproducible

@@ -30,6 +30,9 @@ def _assert_overload_projection(result):
         "authority_snapshot_hash": result["authority_snapshot_hash"],
         "decision_id": result["decision_id"],
         "reason": result["reason"],
+        "base_priority": result["base_priority"],
+        "effective_priority": result["effective_priority"],
+        "observed_at": result["observed_at"],
         "queue_depth": result["queue_depth"],
         "queue_capacity": result["queue_capacity"],
         "retry_after_at": result["retry_after_at"],
@@ -57,6 +60,9 @@ def _assert_overload_projection(result):
             "queue_depth": result["queue_depth"],
             "queue_capacity": result["queue_capacity"],
             "retry_after_at": result["retry_after_at"],
+            "base_priority": result["base_priority"],
+            "effective_priority": result["effective_priority"],
+            "observed_at": result["observed_at"],
         },
     )
     tampered = dict(payload, queue_depth=payload["queue_depth"] + 1)

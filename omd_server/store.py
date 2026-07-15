@@ -20,7 +20,8 @@ from contextlib import contextmanager
 
 from .admission import LEGACY_ADMISSION_POLICY_VERSION, pathspec_digest
 
-SCHEMA_VERSION = "omd/2026-07-15-m1"
+SCHEMA_VERSION = "omd/2026-07-16-m1-aging"
+MIGRATABLE_SCHEMA_VERSIONS = frozenset({None, "omd/2026-07-15-m1"})
 
 
 class UnsupportedSchemaVersion(RuntimeError):
@@ -54,6 +55,9 @@ CREATE TABLE IF NOT EXISTS orbits (
   authority_snapshot_hash TEXT,         -- 판정이 읽은 authority facts digest
   decision_id TEXT,                     -- canonical admission decision digest; lifecycle-only event면 NULL
   decision_type TEXT,                   -- 마지막 reducer event(ADMISSION_/PROMOTION_ 또는 lifecycle)
+  decision_schema TEXT,                 -- canonical decision envelope schema
+  decision_observed_at REAL,            -- 마지막 admission/promotion 판정의 단일 clock
+  decision_effective_priority INTEGER,  -- 그 clock에서 계산된 effective rank evidence
   blocker_ids TEXT NOT NULL DEFAULT '[]',
   enqueued_at REAL,
   wait_deadline REAL,
@@ -213,6 +217,9 @@ _MIGRATIONS = [
     ("orbits", "authority_snapshot_hash", "TEXT"),
     ("orbits", "decision_id", "TEXT"),
     ("orbits", "decision_type", "TEXT"),
+    ("orbits", "decision_schema", "TEXT"),
+    ("orbits", "decision_observed_at", "REAL"),
+    ("orbits", "decision_effective_priority", "INTEGER"),
     ("orbits", "blocker_ids", "TEXT NOT NULL DEFAULT '[]'"),
     ("orbits", "enqueued_at", "REAL"),
     ("orbits", "wait_deadline", "REAL"),
@@ -278,7 +285,7 @@ class Store:
     def schema_requires_migration(self) -> bool:
         """Return legacy/current state and reject unknown generations read-only."""
         version = self.get_meta("schema_version")
-        if version is None:
+        if version in MIGRATABLE_SCHEMA_VERSIONS:
             return True
         if version == SCHEMA_VERSION:
             return False
@@ -378,6 +385,10 @@ class Store:
                         row["orbit_id"],
                     ),
                 )
+            self.db.execute(
+                "UPDATE orbits SET decision_schema='admission_decision/v1' "
+                "WHERE decision_id IS NOT NULL AND decision_schema IS NULL"
+            )
             self.db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_orbits_queue_seq "
                 "ON orbits(queue_seq) "
@@ -564,7 +575,9 @@ class Store:
                   requested_ttl=None, policy_version=None,
                   pathspec_digest=None, request_id=None, request_generation=0,
                   bail_epoch=0, authority_snapshot_hash=None, decision_id=None,
-                  decision_type=None, blocker_ids=None, enqueued_at=None,
+                  decision_type=None, decision_schema=None,
+                  decision_observed_at=None, decision_effective_priority=None,
+                  blocker_ids=None, enqueued_at=None,
                   wait_deadline=None, terminal_reason=None) -> str:
         oid = orbit_id or "orb-" + uuid.uuid4().hex[:12]
         self.db.execute(
@@ -572,14 +585,16 @@ class Store:
             "fence,expires_at,created_at,reason,priority,kind,resource_key,intent_key,"
             "read_gen,queue_seq,requested_ttl,policy_version,pathspec_digest,request_id,"
             "request_generation,bail_epoch,authority_snapshot_hash,decision_id,blocker_ids,"
-            "decision_type,enqueued_at,wait_deadline,terminal_reason) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "decision_type,decision_schema,decision_observed_at,"
+            "decision_effective_priority,enqueued_at,wait_deadline,terminal_reason) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (oid, task_id, agent_id, json.dumps(pathspec), mode, state,
              fence, expires_at, time.time(), reason, priority, kind, resource_key,
              intent_key, read_gen, queue_seq, requested_ttl, policy_version,
              pathspec_digest, request_id, request_generation, bail_epoch,
              authority_snapshot_hash, decision_id, json.dumps(blocker_ids or []),
-             decision_type, enqueued_at, wait_deadline, terminal_reason))
+             decision_type, decision_schema, decision_observed_at,
+             decision_effective_priority, enqueued_at, wait_deadline, terminal_reason))
         return oid
 
     def orbit_by_intent(self, intent_key) -> dict | None:
@@ -632,8 +647,20 @@ class Store:
                   merging=..., merge_deadline=..., merge_started_mono=...,
                   operation_id=..., owner_instance=..., owner_generation=...,
                   read_gen=..., stale=..., authority_snapshot_hash=...,
-                  decision_id=..., decision_type=..., blocker_ids=...,
+                  decision_id=..., decision_type=..., decision_schema=...,
+                  decision_observed_at=..., decision_effective_priority=...,
+                  blocker_ids=...,
                   enqueued_at=..., wait_deadline=..., terminal_reason=...):
+        if decision_id is None:
+            # A lifecycle event replaces the admission decision digest. Clear
+            # its schema/rank evidence in the same update so stale v2 evidence
+            # cannot appear to belong to RENEW/RELEASE/EXPIRE/CANCEL/TIMEOUT.
+            if decision_schema is ...:
+                decision_schema = None
+            if decision_observed_at is ...:
+                decision_observed_at = None
+            if decision_effective_priority is ...:
+                decision_effective_priority = None
         sets, args = [], []
         for col, val in (("state", state), ("expires_at", expires_at),
                          ("released_at", released_at), ("fence", fence),
@@ -646,6 +673,9 @@ class Store:
                          ("authority_snapshot_hash", authority_snapshot_hash),
                          ("decision_id", decision_id),
                          ("decision_type", decision_type),
+                         ("decision_schema", decision_schema),
+                         ("decision_observed_at", decision_observed_at),
+                         ("decision_effective_priority", decision_effective_priority),
                          ("blocker_ids", json.dumps(blocker_ids)
                           if blocker_ids is not ... else ...),
                          ("enqueued_at", enqueued_at),
@@ -664,10 +694,11 @@ class Store:
             "SELECT * FROM orbits WHERE state='HELD' AND kind='orbit'"))
 
     def pending_orbits(self) -> list[dict]:
-        # 우선순위 DESC → 같으면 durable FIFO(queue_seq ASC). created_at은 M1 authority가 아님.
+        # Raw durable order only. Dynamic v2 effective priority is evaluated by
+        # the pure queue policy at one observed_at inside Coordinator authority.
         return _rows(self.db.execute(
             "SELECT * FROM orbits WHERE state='PENDING' AND kind='orbit' "
-            "ORDER BY priority DESC, queue_seq ASC"))
+            "ORDER BY queue_seq ASC"))
 
     def pending_queue_stats(self) -> dict:
         """Repository-authority PENDING depth and earliest automatic relief."""
@@ -695,7 +726,7 @@ class Store:
         return _rows(self.db.execute(
             "SELECT * FROM orbits WHERE state='PENDING' AND kind='orbit' "
             "AND wait_deadline IS NOT NULL AND wait_deadline<=? "
-            "ORDER BY priority DESC, queue_seq ASC",
+            "ORDER BY wait_deadline ASC, queue_seq ASC",
             (now,),
         ))
 
@@ -1203,6 +1234,7 @@ class Store:
             "orbits": _rows(self.db.execute(
                 "SELECT orbit_id,task_id,agent_id,mode,state,priority,queue_seq,fence,"
                 "expires_at,requested_ttl,policy_version,decision_id,decision_type,"
+                "decision_schema,decision_observed_at,decision_effective_priority,"
                 "blocker_ids,enqueued_at,wait_deadline "
                 "FROM orbits"
             )),

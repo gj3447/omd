@@ -13,6 +13,7 @@ import pytest
 from omd_server import Coordinator
 from omd_server.admission import (
     LEGACY_ADMISSION_POLICY_VERSION,
+    STATIC_ADMISSION_POLICY_VERSION,
     AdmissionRequest,
     decide_admission,
     modes_compatible,
@@ -33,6 +34,8 @@ def _row(orbit_id, mode, pathspec, *, priority=0, queue_seq=0):
         "pathspec": json.dumps(pathspec),
         "priority": priority,
         "queue_seq": queue_seq,
+        "policy_version": STATIC_ADMISSION_POLICY_VERSION,
+        "enqueued_at": 0.0,
         "fence": None,
     }
 

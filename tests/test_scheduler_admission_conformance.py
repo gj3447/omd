@@ -45,6 +45,9 @@ def _decision(context, event_type, **variant):
         "actor": "lease-authority",
         "event_id": f"event-{event_type.lower()}",
         "authority_snapshot_hash": SNAPSHOT,
+        "base_priority": context.get("base_priority", 0),
+        "effective_priority": context.get("effective_priority", 0),
+        "observed_at": context.get("observed_at", 100.0),
         **variant,
     }
     return bind_decision_id(event_type, payload)
@@ -337,6 +340,9 @@ def _production_payload(omd, row):
         "actor": omd.coordinator_id,
         "event_id": "reconstructed-event-id-not-hashed",
         "authority_snapshot_hash": row["authority_snapshot_hash"],
+        "base_priority": row["priority"],
+        "effective_priority": row["decision_effective_priority"],
+        "observed_at": row["decision_observed_at"],
     }
     event_type = row["decision_type"]
     if event_type == "ADMISSION_GRANTED":

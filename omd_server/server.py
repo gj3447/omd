@@ -22,6 +22,11 @@ import contextlib
 import math
 import os
 
+from .admission_config import (
+    parse_admission_aging_quantum as _parse_admission_aging_quantum,
+    parse_admission_max_age_boost as _parse_admission_max_age_boost,
+    parse_admission_queue_capacity as _parse_admission_queue_capacity,
+)
 from .core import Coordinator, CoordinatorConflict
 from .events import Emitter
 from .sinks import JsonlSink
@@ -65,7 +70,6 @@ except ImportError:  # 서버 extra 미설치
 
 
 DEFAULT_SERVER_SWEEP_INTERVAL = 1.0
-DEFAULT_SERVER_ADMISSION_QUEUE_CAPACITY = 1024
 
 
 def _parse_server_sweep_interval(raw: str | None) -> float | None:
@@ -81,23 +85,6 @@ def _parse_server_sweep_interval(raw: str | None) -> float | None:
     if not math.isfinite(interval) or interval < 0:
         raise ValueError("OMD_SWEEP_INTERVAL must be 0 or a positive finite number")
     return interval or None
-
-
-def _parse_admission_queue_capacity(raw: str | None) -> int:
-    """Parse a bounded repository wait capacity before opening the DB."""
-    if raw is None or not raw.strip():
-        return DEFAULT_SERVER_ADMISSION_QUEUE_CAPACITY
-    try:
-        capacity = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "OMD_ADMISSION_QUEUE_CAPACITY must be a non-negative integer"
-        ) from exc
-    if capacity < 0:
-        raise ValueError(
-            "OMD_ADMISSION_QUEUE_CAPACITY must be a non-negative integer"
-        )
-    return capacity
 
 
 async def _leader_heartbeat_loop(omd: Coordinator) -> None:
@@ -153,6 +140,12 @@ def build_server(db_path: str = "omd.db"):
     _capacity = _parse_admission_queue_capacity(
         os.environ.get("OMD_ADMISSION_QUEUE_CAPACITY")
     )
+    _aging_quantum = _parse_admission_aging_quantum(
+        os.environ.get("OMD_ADMISSION_AGING_QUANTUM_SECONDS")
+    )
+    _max_age_boost = _parse_admission_max_age_boost(
+        os.environ.get("OMD_ADMISSION_MAX_AGE_BOOST")
+    )
     # Q6 observability: env OMD_EVENT_LOG=<path> 주면 모든 OMD 동사 이벤트를 append-only JSONL
     # 로 durable 기록(OpenObserve/vector 가 tail→ship). 미설정=NOOP(기존동작). fail-soft.
     _evlog = os.environ.get("OMD_EVENT_LOG")
@@ -162,6 +155,8 @@ def build_server(db_path: str = "omd.db"):
         enforce_single_coordinator=False,
         events=_events,
         admission_queue_capacity=_capacity,
+        admission_aging_quantum=_aging_quantum,
+        admission_max_age_boost=_max_age_boost,
     )
     mcp = FastMCP(
         "omd",

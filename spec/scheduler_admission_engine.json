@@ -1,7 +1,7 @@
 {
   "schema_version": "engine-spec/v1",
   "name": "omd-orbit-admission",
-  "purpose": "Own deterministic, starvation-bounded admission of overlapping path leases while preserving OMD fencing and disjoint-write safety.",
+  "purpose": "Own deterministic, deadline-bounded admission of overlapping path leases while preserving OMD fencing and disjoint-write safety.",
   "decision": {
     "verdict": "engine",
     "current_consumers": [
@@ -82,13 +82,13 @@
       "write/write": "incompatible",
       "write/shared": "incompatible"
     },
-    "rank": "effective_priority descending, then durable queue_seq ascending; rank is compared only among exact conflicting PENDING requests",
+    "rank": "For the active v2 policy, age=max(0, observed_at-enqueued_at), boost=min(max_age_boost, floor(age/aging_quantum)), and effective_priority=base_priority+boost; new v2 base priority must leave signed-64 headroom for the configured ceiling. Rank is effective_priority descending then durable queue_seq ascending. Legacy v1 rows receive boost zero, and rank is compared only among exact conflicting PENDING requests.",
     "grant": "No incompatible exact HELD blocker and no higher-ranked exact conflicting PENDING predecessor exist.",
     "queue": "At least one blocker exists, capacity is available, the wait deadline is valid, and inserting reservation edges does not close a cycle.",
     "deny": "The request is valid but policy or reservation-cycle safety forbids admission.",
     "reject": "The request identity, mode, pathspec, TTL, deadline, or capacity envelope is invalid before a live wait is exposed.",
-    "output_identity": "Every decision binds the complete request identity, decision_id, authority_snapshot_hash, policy_version, and the queue or grant context committed by that decision."
-    ,"decision_id": "SHA-256 of the canonical admission_decision/v1 envelope: event type, the complete nine-field request identity, authority_snapshot_hash, and the decision-specific grant, queue, denial, rejection, or blocker fields. Exact replay is idempotent; same id with a different envelope is a rejected security conflict; uniqueness scope is repository_id/request_id/request_generation."
+    "output_identity": "Every decision binds the complete request identity, decision_id, authority_snapshot_hash, policy_version, base_priority, effective_priority, observed_at, and the queue or grant context committed by that decision."
+    ,"decision_id": "SHA-256 of the canonical admission_decision/v2 envelope: event type, the complete nine-field request identity, authority_snapshot_hash, base_priority, effective_priority, observed_at, and the decision-specific grant, queue, denial, rejection, or blocker fields. Exact replay is idempotent; same id with a different envelope is a rejected security conflict; uniqueness scope is repository_id/request_id/request_generation."
   },
   "protocol": {
     "commands": [
@@ -126,6 +126,7 @@
     "Queue precedence is defined only between conflicting requests; unrelated PENDING work never blocks a disjoint request.",
     "The candidate index returns a superset of every exact overlap; uncertainty falls back to the full active set.",
     "A queue insertion that would close the combined HELD-plus-reservation wait-for cycle is denied before exposure.",
+    "Because aging can change reservation precedence after insertion, every reconciliation recomputes the combined graph at one observed time and deterministically denies the newest participating queue ticket until it is acyclic.",
     "Every live lease has a unique monotonic fence and only its current owner, fence, and bail epoch may renew or release it.",
     "Every admission and promotion decision binds the canonical nine-field request identity (repository, request, orbit, generation, owner, bail epoch, mode, pathspec digest, policy version), decision-specific output fields, decision_id, and a fresh authority snapshot; lifecycle maintenance facts bind the applicable owner/fence/deadline tuple. An event for another identity or generation cannot advance this lifecycle.",
     "Owner reclaim of a HELD request requires the current owner, fence, bail epoch, request generation, and authority snapshot; reclaim of a PENDING request requires the current owner, bail epoch, request generation, and authority snapshot.",
@@ -143,14 +144,14 @@
     "TelemetrySink"
   ],
   "runtime": {
-    "ordering": "Authority mutations are serialized per repository. Queue rank is effective_priority descending then queue_seq ascending, evaluated under a recorded policy version and observed time.",
+    "ordering": "Authority mutations are serialized per repository. Queue rank is effective_priority descending then queue_seq ascending, evaluated under one recorded observed time. The active content-addressed v2 envelope (default 60-second quantum and +10 ceiling, operational rather than proof-derived) is pinned in repository DB metadata; drift or corruption fails before recovery.",
     "concurrency": "Disjoint or mode-compatible requests may become HELD in the same promotion pass and execute concurrently outside the authority transaction.",
     "backpressure": "The current one-repository-per-DB authority pins one durable non-negative queue limit (default 1024; zero is no-wait) and returns a typed QUEUE_FULL receipt with retry_after_at metadata. Cross-repository global and conflict-domain limits remain deferred until their no-bypass accounting is proved.",
     "cancellation": "A PENDING owner may cancel with current identity and bail epoch. Cancellation is idempotent and immediately triggers eligible promotion.",
-    "timeouts": "Wait and lease deadlines are persisted timestamps. External deadline events carry observed time; no lazy status read is the sole liveness mechanism."
+    "timeouts": "Wait and lease deadlines are persisted timestamps. External deadline events carry observed time; no lazy status read is the sole liveness mechanism. The finite aging boost improves precedence but does not prove starvation freedom; wait_deadline is the bounded-resolution authority."
   },
   "durability": {
-    "persistence": "Persist normalized request identity, queue sequence, requested TTL, deadlines, policy version, rank inputs, blockers, state, and fence before reporting a durable result.",
+    "persistence": "Persist normalized request identity, queue sequence, requested TTL, deadlines, content-addressed policy version, rank inputs, decision schema/observed time/effective priority, blockers, state, and fence before reporting a durable result.",
     "atomic_commit": "Commit dedup claim, request state/version, wait-for cycle decision, fence allocation or queue insertion, and notification outbox in one authority transaction.",
     "recovery": "On restart, expire due waits and leases, rebuild or verify the candidate index, then reevaluate PENDING requests with their original queue sequence and policy envelope.",
     "effect_idempotency": "Use request_id, transition kind, request generation, and immutable argument digest; same identity with different intent is a conflict.",
@@ -183,8 +184,11 @@
       "authority_snapshot_hash": "new digest of the authority rows and coordinator epoch used by the decision"
       ,"bail_epoch": "orbits.bail_epoch and the canonical request identity"
       ,"pathspec_digest": "canonical normalized pathspec digest persisted with the request"
-      ,"policy_version": "recorded admission policy version"
-      ,"decision_id": "canonical admission_decision/v1 digest resolving to the atomically persisted decision envelope"
+      ,"policy_version": "content-addressed admission policy version; the active canonical envelope is pinned per repository DB"
+      ,"base_priority": "orbits.priority in the signed-64-bit priority domain"
+      ,"effective_priority": "orbits.decision_effective_priority for the last admission/promotion observation"
+      ,"observed_at": "orbits.decision_observed_at, shared by rank, snapshot and decision within one authority transaction"
+      ,"decision_id": "canonical admission_decision/v2 digest resolving to the atomically persisted decision envelope"
       ,"terminal_reason": "typed denial/rejection/cancellation/timeout projection reason"
     },
     "rule": "Projection is one-way compatibility output. Production conformance compares the semantic lifecycle first and then the legacy projection; legacy state names must not redefine the semantic machine. task_id is non-identity scheduling metadata and is deliberately excluded from the canonical request identity."
@@ -193,13 +197,14 @@
     "Invalid pathspec, mode, TTL, priority, or identity is rejected without state mutation.",
     "Capacity exhaustion returns explicit overload rather than creating an unbounded PENDING row.",
     "Reservation-cycle detection denies the candidate request and preserves prior grants and queue order.",
+    "Unknown pending policy authority blocks fail closed; malformed or drifted active policy metadata prevents startup before recovery.",
     "Index corruption or a failed soundness assertion disables the index and uses a full exact scan.",
     "Stale owner, fence, or bail epoch cannot renew, release, or cancel a current request.",
     "Notification failure leaves an observable outbox entry and does not roll back an accepted lease fact."
   ],
   "observability": {
     "traces": [
-      "request_id, orbit_id, task_id, repository, agent, mode, pathspec digest, queue_seq, base and effective priority, policy version, blocker ids, decision, fence, deadlines, transition, correlation id"
+      "request_id, orbit_id, task_id, repository, agent, mode, pathspec digest, queue_seq, base and effective priority, observed_at, content-addressed policy version, blocker ids, decision, fence, deadlines, transition, correlation id"
     ],
     "metrics": [
       "authority lock wait and hold",
@@ -231,7 +236,8 @@
   "implementation_slices": [
     "M1a: add metrics and a pure compatibility/rank/blocker decision table without changing production outcomes.",
     "M1b (implemented): persist queue_seq, requested TTL, wait deadline, policy version, cancellation, and repository capacity; enforce no-overtaking with the locked gate and return typed overload without a live row.",
-    "M1c: add PENDING reservation edges to cycle detection and restart/property tests.",
+    "M1c (implemented): add PENDING reservation edges plus deterministic dynamic-cycle resolution, a content-addressed saturating-aging v2 policy, one-clock decision evidence, schema migration, and restart/property tests.",
+    "M1d: persist a transactional notification outbox and prove crash/replay delivery without changing accepted lease facts.",
     "M2a: add a conservative candidate prefilter and deadline-driven sweep, retaining exact glob verification and full-scan fallback.",
     "M2b: move all Git effects out of the authority transaction before reconsidering RLock or SQLite replacement."
   ],
