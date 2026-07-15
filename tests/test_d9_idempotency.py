@@ -232,8 +232,12 @@ def test_partial_index_upgrade_renumbers_history_and_keeps_live_request_latest(t
         (second["orbit_id"], 1, "RELEASED"),
         (live["orbit_id"], 2, "HELD"),
     ]
-    assert rows[0]["decision_id"] is not None
-    assert rows[0]["decision_type"] == "ADMISSION_GRANTED"
+    # The oldest terminal row keeps its latest semantic lifecycle projection.
+    # RELEASE is not an admission decision envelope, so it deliberately clears
+    # decision_id while recording the event type.  Only the rows whose request
+    # generation changed are marked as migration-rewritten.
+    assert rows[0]["decision_id"] is None
+    assert rows[0]["decision_type"] == "RELEASE"
     assert all(row["decision_id"] is None for row in rows[1:])
     assert all(row["decision_type"] == "MIGRATION_RENUMBERED" for row in rows[1:])
 

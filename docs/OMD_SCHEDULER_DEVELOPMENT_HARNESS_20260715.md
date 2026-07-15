@@ -5,13 +5,16 @@ Initial claim and promotion now share one pure compatibility/rank/blocker
 kernel, persist durable `queue_seq` and original TTL, prevent conflicting
 PENDING overtaking, reject reservation-edge cycles, and bind canonical typed
 decision payloads to the semantic admission FSM before projecting legacy Orbit
-state. Finite deadlines and sweep/restart `WAIT_TIMEOUT` delivery are now in
-the slice. Cancelling a task now atomically maps its associated PENDING row to
-semantic `CANCEL` and its HELD row to semantic `RELEASE`, with restart repair
-for legacy orphan rows. Default autonomous deadline delivery, a standalone
-admission-wait cancel API, queue capacity/aging, notification outbox, candidate
-indexing, the prepared Connect pipeline, and protected-ref control plane remain
-unimplemented. Do not
+state. Finite deadlines, sweep/restart `WAIT_TIMEOUT` delivery, and the full
+implemented admission-lease lifecycle (`RENEW`, `RELEASE`, `LEASE_EXPIRED`,
+plus PENDING and HELD owner reclaim) now pass through the typed reducer before legacy
+mutation. A standalone authenticated wait-cancel operation is available, and
+cancelling a task atomically maps its associated PENDING row to semantic
+`CANCEL` and its HELD row to semantic `RELEASE`, with restart repair for legacy
+orphan rows. The MCP server owns a default autonomous sweep; embedded
+coordinators remain opt-in. Queue capacity/aging, notification outbox,
+candidate indexing, the prepared Connect pipeline, and protected-ref control
+plane remain unimplemented. Do not
 describe this slice as the complete durable waiter, an optimized scheduler, a
 production rollout, or a scientific progress result.
 
@@ -461,10 +464,10 @@ PENDING/HELD rows.
 Item 9 has no
 candidate index to prove yet (the runtime uses the sound full exact scan).
 Policy-denial generation rollover is implemented; explicit non-denial rollover
-and public maintenance events `RENEW`, `RELEASE` and reclaim are not yet routed
-through the semantic reducer. Standalone wait cancellation and the task-bound
-cancel path are the narrow exceptions: they project `CANCEL` (and task-bound
-`RELEASE`) before legacy mutation. The attempt fencing above hardens the existing Connect
+remains open. Public `RENEW`/`RELEASE`, due lease expiry, PENDING-owner reclaim,
+HELD-owner reclaim, standalone wait cancellation and the task-bound cancel path
+all pass through the semantic reducer before legacy mutation. The attempt
+fencing above hardens the existing Connect
 implementation; it does not implement the prepared
 `ConnectAttempt`/expected-old protected-ref publication pipeline.
 
@@ -624,9 +627,8 @@ slice is ready to commit only when:
 
 Landing those files makes the **M1 fairness implementation slice** durable. It
 does not make full M1 or the development cycle `CLOSED`: embedded-runtime
-autonomous delivery, overload/aging, candidate-index soundness,
-maintenance-event reducer binding, an independent scripted progress judgment
-and finalization receipts remain future work.
+default delivery, overload/aging, candidate-index soundness, an independent
+scripted progress judgment and finalization receipts remain future work.
 
 ## 14. Known limitations and promotion blockers
 
@@ -634,17 +636,17 @@ and finalization receipts remain future work.
    abstract structural coverage. Admission decisions now have a separate real
    payload reducer/conformance suite, but Connect receipt and finalization guards
    do not.
-2. Admission payload guards cover decision events and production projection.
-   The remaining lifecycle maintenance events, Connect same-tree/wrong-commit,
-   authorization and finalization receipts are not yet executable end to end.
+2. Admission payload guards cover decision and lifecycle events plus production
+   projection. Connect same-tree/wrong-commit, authorization and finalization
+   receipts are not yet executable end to end.
 3. No repository cross-contract validator currently proves engine, admission
    FSM, connect FSM, both loop projections and production reducer conformance.
    Individual schema validators are necessary but insufficient.
-4. Production admission/grant/queue/promotion/denial, due-timeout and standalone
-   wait-cancellation decisions are bound to the JSON semantic reducer. MCP
-   timeout delivery is autonomous by default; embedded-runtime delivery,
-   overload, aging, notification outbox and the
-   remaining maintenance-event bindings remain the open M1 front. Task-bound
+4. Production admission/grant/queue/promotion/denial, due-timeout, standalone
+   wait cancellation, renew/release, lease expiry and both owner-reclaim paths
+   are bound to the JSON semantic reducer. MCP timeout delivery is autonomous
+   by default; embedded-runtime default delivery, overload, aging, notification
+   outbox and candidate-index soundness remain the open M1 front. Task-bound
    `CANCEL`/`RELEASE` projection is also implemented.
 5. The prepared candidate, expected-old ref CAS, independent ref reader and
    finalization protocol are contracts, not the current runtime path.

@@ -52,8 +52,8 @@ CREATE TABLE IF NOT EXISTS orbits (
   request_generation INTEGER NOT NULL DEFAULT 0,
   bail_epoch INTEGER NOT NULL DEFAULT 0,
   authority_snapshot_hash TEXT,         -- 판정이 읽은 authority facts digest
-  decision_id TEXT,                     -- 마지막 canonical admission decision digest
-  decision_type TEXT,                   -- decision_id가 해석하는 ADMISSION_/PROMOTION_ event
+  decision_id TEXT,                     -- canonical admission decision digest; lifecycle-only event면 NULL
+  decision_type TEXT,                   -- 마지막 reducer event(ADMISSION_/PROMOTION_ 또는 lifecycle)
   blocker_ids TEXT NOT NULL DEFAULT '[]',
   enqueued_at REAL,
   wait_deadline REAL,

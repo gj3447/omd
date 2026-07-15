@@ -651,6 +651,60 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             )
         return reduced
 
+    def _reduce_orbit_lifecycle(self, orbit, event_type, **variant):
+        """Bind a runtime maintenance event to the semantic OrbitRequest FSM."""
+        expected = {
+            "RENEW": ("HELD", "HELD"),
+            "RELEASE": ("RELEASED", "RELEASED"),
+            "LEASE_EXPIRED": ("EXPIRED", "EXPIRED"),
+            "WAIT_OWNER_RECLAIMED": ("CANCELLED", "DENIED"),
+            "LEASE_OWNER_RECLAIMED": ("EXPIRED", "EXPIRED"),
+        }
+        if event_type not in expected:
+            raise ValueError(f"unsupported orbit lifecycle event: {event_type}")
+        snapshot_hash = authority_snapshot_hash(
+            self.store.held_orbits(),
+            self.store.pending_orbits(),
+            coordinator_epoch=self.leader_epoch,
+        )
+        identity = self._admission_identity(orbit)
+        payload = {
+            "repository_id": identity["repository_id"],
+            "request_id": identity["request_id"],
+            "orbit_id": identity["orbit_id"],
+            "request_generation": identity["request_generation"],
+            "actor": self.coordinator_id,
+            "authority_snapshot_hash": snapshot_hash,
+            "event_id": f"evt-{uuid.uuid4().hex}",
+        }
+        if event_type in {
+            "RENEW", "RELEASE", "WAIT_OWNER_RECLAIMED", "LEASE_OWNER_RECLAIMED"
+        }:
+            payload.update(
+                owner_agent=identity["owner_agent"],
+                bail_epoch=identity["bail_epoch"],
+            )
+        if event_type in {
+            "RENEW", "RELEASE", "LEASE_EXPIRED", "LEASE_OWNER_RECLAIMED"
+        }:
+            payload["fence"] = orbit["fence"]
+        payload.update(variant)
+        context = {**identity, "state": orbit["state"]}
+        if orbit["fence"] is not None:
+            context["fence"] = orbit["fence"]
+        if event_type == "LEASE_EXPIRED":
+            context["lease_deadline"] = orbit["expires_at"]
+        semantic_state, legacy_state = expected[event_type]
+        reduced = self._assert_admission_projection(
+            context, event_type, payload, snapshot_hash, legacy_state
+        )
+        if reduced.context["state"] != semantic_state:
+            raise RuntimeError(
+                f"admission lifecycle mismatch: event={event_type} "
+                f"semantic={reduced.context['state']} expected={semantic_state}"
+            )
+        return snapshot_hash, payload, reduced
+
     def _pending_owner_fresh(self, orbit, now):
         """Fail closed when a queued request no longer has a live owner."""
         agent = self.store.get_agent(orbit["agent_id"])
@@ -791,10 +845,17 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         """
         now = time.time() if now is None else now
         for orbit in self.store.due_orbits(now):
+            snapshot_hash, _, _ = self._reduce_orbit_lifecycle(
+                orbit, "LEASE_EXPIRED", observed_at=now
+            )
             self.store.set_orbit(
                 orbit["orbit_id"],
                 state=fsm.advance("orbit", "HELD", "expire"),
                 released_at=now,
+                authority_snapshot_hash=snapshot_hash,
+                decision_id=None,
+                decision_type="LEASE_EXPIRED",
+                terminal_reason="lease_expired",
             )
             self._emit("orbit_expired", orbit["agent_id"], orbit_id=orbit["orbit_id"])
         if reclaim and self.agent_ttl:
@@ -993,9 +1054,30 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
             self.store.set_sem_waiter(w["waiter_id"], state="CANCELLED")
         for o in self.store.orbits_owned_by_agent(agent_id, ("HELD", "PENDING")):
             trig = "expire" if o["state"] == "HELD" else "deny"  # HELD→EXPIRED, PENDING→DENIED
+            if o["state"] == "HELD":
+                decision_type = "LEASE_OWNER_RECLAIMED"
+                terminal_reason = "lease_owner_reclaimed"
+                snapshot_hash, _, _ = self._reduce_orbit_lifecycle(
+                    o, decision_type
+                )
+            else:
+                decision_type = "WAIT_OWNER_RECLAIMED"
+                terminal_reason = "wait_owner_reclaimed"
+                snapshot_hash, _, _ = self._reduce_orbit_lifecycle(
+                    o, decision_type, no_lease_fence=0
+                )
             # merging pin은 회수와 함께 해제(§E pin은 유계 — 보유자 사망도 한 경계).
-            self.store.set_orbit(o["orbit_id"], state=fsm.advance("orbit", o["state"], trig),
-                                 merging=0)
+            self.store.set_orbit(
+                o["orbit_id"],
+                state=fsm.advance("orbit", o["state"], trig),
+                released_at=time.time(),
+                merging=0,
+                authority_snapshot_hash=snapshot_hash,
+                decision_id=None,
+                decision_type=decision_type,
+                blocker_ids=[],
+                terminal_reason=terminal_reason,
+            )
             # §D12: 회수되는 read-궤도의 stale 신호 플래그도 청산(LIVE 누수 방지). 보유자가
             # 죽었으므로 connect 차단은 어차피 부활차단(bail_epoch)이 맡는다.
             if o["mode"] == "read":
@@ -1981,9 +2063,17 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         """task의 HELD write-orbit 전부 해제 + unpin(merge_sha 기록 *후* 호출 — P0-6 순서)."""
         for o in self.store.orbits_for_task(task_id):
             if o["mode"] in WRITE_MODES and o["state"] == "HELD":
-                self.store.set_orbit(o["orbit_id"],
-                                     state=fsm.advance("orbit", "HELD", "release"),
-                                     released_at=time.time(), merging=0, merge_deadline=None)
+                snapshot_hash, _, _ = self._reduce_orbit_lifecycle(o, "RELEASE")
+                self.store.set_orbit(
+                    o["orbit_id"],
+                    state=fsm.advance("orbit", "HELD", "release"),
+                    released_at=time.time(),
+                    merging=0,
+                    merge_deadline=None,
+                    authority_snapshot_hash=snapshot_hash,
+                    decision_id=None,
+                    decision_type="RELEASE",
+                )
 
     # ---- D12 read-set 코히런스 (§D12, 유령 읽기) ----
     def _merged_write_globs(self, task_id) -> list[str]:
@@ -2631,6 +2721,12 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
     def renew(self, orbit_id, agent_id, fence, ttl=600.0, *, request_id=None,
               bail_epoch=None):
         """궤도 lease 갱신(keepalive). 소유+fence 일치해야 — 오추방된 좀비는 FENCED_OUT."""
+        try:
+            ttl = float(ttl)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "invalid ttl"}
+        if not math.isfinite(ttl) or ttl <= 0:
+            return {"ok": False, "reason": "invalid ttl"}
         with self._cs():
             with self._idem(request_id, agent_id, "renew",
                             [orbit_id, fence, ttl]) as cache:
@@ -2639,6 +2735,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 dead = self._check_alive(agent_id, bail_epoch)
                 if dead:
                     return cache.set(dead)
+                self.store.upsert_agent(agent_id)
                 o = self.store.get_orbit(orbit_id)
                 if not o:
                     return cache.set({"ok": False, "reason": "no such orbit"})
@@ -2648,8 +2745,18 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 bad = self._check_owner(o, agent_id, fence)
                 if bad:
                     return cache.set(bad)
-                self.store.set_orbit(orbit_id, state=fsm.advance("orbit", "HELD", "renew"),
-                                     expires_at=time.time() + ttl)
+                lease_deadline = time.time() + ttl
+                snapshot_hash, _, _ = self._reduce_orbit_lifecycle(
+                    o, "RENEW", lease_deadline=lease_deadline
+                )
+                self.store.set_orbit(
+                    orbit_id,
+                    state=fsm.advance("orbit", "HELD", "renew"),
+                    expires_at=lease_deadline,
+                    authority_snapshot_hash=snapshot_hash,
+                    decision_id=None,
+                    decision_type="RENEW",
+                )
                 self._emit("orbit_renewed", agent_id, orbit_id=orbit_id)
                 return cache.set({"ok": True, "expires_in": ttl})
 
@@ -2687,8 +2794,15 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                 bad = self._check_owner(o, agent_id, fence)
                 if bad:
                     return cache.set(bad)
-                self.store.set_orbit(orbit_id, state=fsm.advance("orbit", "HELD", "release"),
-                                     released_at=time.time())
+                snapshot_hash, _, _ = self._reduce_orbit_lifecycle(o, "RELEASE")
+                self.store.set_orbit(
+                    orbit_id,
+                    state=fsm.advance("orbit", "HELD", "release"),
+                    released_at=time.time(),
+                    authority_snapshot_hash=snapshot_hash,
+                    decision_id=None,
+                    decision_type="RELEASE",
+                )
                 self._emit("orbit_released", agent_id, orbit_id=orbit_id)
                 self._reconcile_admission()
                 return cache.set({"ok": True})

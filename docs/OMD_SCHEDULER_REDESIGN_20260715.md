@@ -10,7 +10,9 @@ request generation and bail epoch, then atomically projects semantic CANCELLED
 to legacy DENIED and reconciles promotion. Task cancellation terminalizes
 associated PENDING/HELD admission rows and repairs legacy orphans on restart.
 The MCP server delivers deadlines with a default 1-second lifespan-owned sweep;
-embedded coordinators remain opt-in. Overload/aging, candidate
+embedded coordinators remain opt-in. Public renew/release, due lease expiry and
+both PENDING/HELD owner-reclaim paths now pass through the typed lifecycle
+reducer before legacy mutation. Overload/aging, candidate
 indexing, notification outbox and the prepared Connect pipeline remain
 implementation fronts. Do not describe this branch as the complete
 durable waiter, an optimized scheduler, a production rollout or a scientific
@@ -373,11 +375,10 @@ The materialized M1 receipt is `arrived` evidence from one in-memory
 producer/readback backend. It explicitly records no separate oracle and awaits
 independent judgment; it is not promoted to `external_verdict`.
 
-Still open before full M1: embedded-runtime autonomous wait-deadline delivery,
+Still open before full M1: embedded-runtime default wait-deadline delivery,
 capacity/overload, saturating aging, notification outbox,
 candidate-index soundness, explicit non-denial request-generation rollover,
-semantic binding for the remaining maintenance events, independent judgment
-and finalization. The current exact full scan is sound but is not an implemented
+independent judgment and finalization. The current exact full scan is sound but is not an implemented
 candidate index. The existing Connect path now has process-tree effect fencing,
 durable attempt generations and exact Git proof, but the prepared
 `ConnectAttempt`/expected-old protected-ref pipeline remains open.
@@ -597,11 +598,13 @@ SHA-256 is
   decision projection; Connect payload guards remain abstract.
 - A repository-wide cross-contract validator and full Connect
   model-to-production differential replay remain promotion blockers.
-- Admission decisions, including due `WAIT_TIMEOUT` and standalone wait
-  `CANCEL`, are bound to current runtime code. MCP deadline delivery is default-on;
-  embedded-runtime delivery, overload, aging, outbox and the remaining maintenance-event semantic
-  bindings remain open; task-bound `CANCEL`/`RELEASE` projection is also
-  implemented. The prepared Connect pipeline is still contract-only.
+- Admission decisions and every implemented lifecycle path, including due
+  `WAIT_TIMEOUT`, standalone wait `CANCEL`, renew/release, lease expiry and both
+  owner-reclaim variants, are bound to current runtime code. MCP deadline
+  delivery is default-on; embedded-runtime default delivery, overload, aging,
+  outbox and candidate-index soundness remain open. Task-bound
+  `CANCEL`/`RELEASE` projection is also implemented. The prepared Connect
+  pipeline is still contract-only.
 - M0's measured numbers and LakatoTree `partial` verdict describe reproducible
   evidence machinery only. They do not establish a fairness fix, throughput
   improvement, near-linear scaling, optimality or novel discovery.

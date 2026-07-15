@@ -159,7 +159,7 @@
     "compatibility_rule": "The typed reducer must accept the transition and projection before the enclosing authority transaction updates the legacy row. The current runtime persists decision metadata, not the complete semantic context or an outbox."
   },
   "conformance": {
-    "implementation_step": "Bind lifecycle events and context_updates to a production reducer; bind the separate admission decision table to the same compatibility, predecessor, rank, cycle, and capacity contract used by initial admission and promotion; then verify the explicit legacy runtime projection.",
+    "implementation_step": "Lifecycle events and context_updates are bound to the production reducer before legacy mutation. Next bind capacity/overload and durable outbox behavior, then prove candidate-index soundness against the current exact compatibility, predecessor, rank and cycle scan.",
     "model_trace_runner": "SYMPOSIUM SKILLS/fsm-design/scripts/run_fsm_traces.py validates abstract lifecycle coverage.",
     "contract_tests": "Run every transition, every guard true and false, one-field mutations of owner_agent, bail_epoch, mode and authority snapshot for admission and promotion, exact decision replay, same-id/different-envelope conflict, invalid and cross-request events, deadline equality boundary, renewal deadline update, fenced owner reclaim, cancellation, restart, legacy projection, and release-plus-promotion interleaving against both model and production code. Durable outbox delivery and replay-ledger conformance remain a later slice."
   }
