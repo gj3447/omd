@@ -763,8 +763,11 @@ finalization receipts also remain future work.
    claiming a persistent or sublinear database index. Default embedded deadline
    ticks, explicit opt-out, server lifespan deferral, CLI one-shot behavior and
    authority/outbox timer separation are runtime-tested. Heartbeat-before-sweep,
-   constructor rollback, terminal close/start linearization and immediate
-   context-manager handoff are also runtime-tested. Task-bound
+   transient-error recovery, bounded consecutive-failure stop, constructor
+   rollback, terminal close/start linearization and immediate context-manager
+   handoff are also runtime-tested. Reclaim counts survive schema migration and
+   restart; cap exhaustion reaches a non-revivable `POISONED` task terminal and
+   its outbox receipt distinguishes poisoned from requeued tasks. Task-bound
    `CANCEL`/`RELEASE` projection and explicit fenced non-policy terminal
    generation rollover are also implemented. Ordinary non-policy terminal claim
    replay does not roll forward, policy denial keeps its existing automatic retry,

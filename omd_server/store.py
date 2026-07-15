@@ -20,11 +20,12 @@ from contextlib import contextmanager
 
 from .admission import LEGACY_ADMISSION_POLICY_VERSION, pathspec_digest
 
-SCHEMA_VERSION = "omd/2026-07-16-m1-outbox"
+SCHEMA_VERSION = "omd/2026-07-16-m1-outbox-reclaims"
 MIGRATABLE_SCHEMA_VERSIONS = frozenset({
     None,
     "omd/2026-07-15-m1",
     "omd/2026-07-16-m1-aging",
+    "omd/2026-07-16-m1-outbox",
 })
 
 
@@ -99,7 +100,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- /read_refresh 시 현 integration_gen 으로 박힌다. connect 때 이 gen 이후의 merge 가 이 task 의
   -- 선언 reads 와 겹치면 = 유령 읽기(옛 base 위 빌드) → connect 거부. read-궤도 release 후에도
   -- 유지되므로(궤도 생명과 분리) read↔write 배타성을 안 깨고 코히런스를 추적한다.
-  read_synced_gen INTEGER
+  read_synced_gen INTEGER,
+  -- Bounded zombie recovery: durable across coordinator restart so a poison
+  -- task cannot reset its retry budget by reopening the database.
+  reclaims INTEGER NOT NULL DEFAULT 0
 );
 -- 증분9(§D12): 응결 로그 — gen 마다 통합에 추가/변경된 write-globs. consumer connect 가
 -- read_synced_gen 이후 merge 들 중 자기 reads 와 겹치는 게 있는지 본다(유령 읽기 판정).
@@ -288,6 +292,9 @@ _MIGRATIONS = [
     # P2 shared 레인: hot 공유파일 glob 선언(배타 writes 와 분리 — next_task 가 shared HELD
     # 와의 겹침은 허용, connect 응결은 3-way).
     ("tasks", "shared", "TEXT NOT NULL DEFAULT '[]'"),
+    # GAP-1: per-task 좀비회수/bail 재큐 카운터. _reclaim_agent_inline 이 abort→requeue 마다
+    # 단조 증가시키고, max_reclaims 초과 시 POISONED(영구 terminal)로 종결(무한 flapping 차단).
+    ("tasks", "reclaims", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -822,7 +829,7 @@ class Store:
                  connect_owner_generation=..., connect_token_id=...,
                  connect_request_id=..., connect_arg_hash=...,
                  connect_repo_bound=...,
-                 read_synced_gen=...):
+                 read_synced_gen=..., reclaims=...):
         sets, args = [], []
         for col, val in (("state", state), ("agent_id", agent_id),
                          ("worktree", worktree), ("branch", branch),
@@ -838,7 +845,8 @@ class Store:
                          ("connect_arg_hash", connect_arg_hash),
                          ("connect_repo_bound", connect_repo_bound),
                          ("merge_sha", merge_sha), ("merged_at", merged_at),
-                         ("read_synced_gen", read_synced_gen)):
+                         ("read_synced_gen", read_synced_gen),
+                         ("reclaims", reclaims)):
             if val is not ...:
                 sets.append(f"{col}=?"); args.append(val)
         if not sets:

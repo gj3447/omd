@@ -114,7 +114,8 @@ def test_connect_audit_git_failure_is_fail_closed_before_authority_mutation(
     result = omd.connect("A")
 
     assert result["ok"] is False
-    assert result["reason"] == "writeset_audit_unavailable"
+    assert result["reason"] == "writeset_audit_error"
+    assert "audit_error" in result
     assert omd.store.get_task("A") == task_before
     assert omd.store.get_orbit(claimed["orbit_id"]) == orbit_before
     assert omd.store.all_held_merge_tokens() == []
@@ -142,7 +143,8 @@ def test_barrier_audit_git_failure_is_fail_closed_before_authority_mutation(
     result = omd._barrier_connect_phase_a("A", claimed["fence"])
 
     assert result["ok"] is False
-    assert result["reason"] == "writeset_audit_unavailable"
+    assert result["reason"] == "writeset_audit_error"
+    assert "audit_error" in result
     assert omd.store.get_task("A") == task_before
     assert omd.store.get_orbit(claimed["orbit_id"]) == orbit_before
     assert omd.store.all_held_merge_tokens() == []
@@ -396,7 +398,10 @@ def test_mutation_disabling_audit_lets_split_through(tmp_path, monkeypatch):
     (여기선 우회 후 *머지가 통과함*을 직접 보여 게이트의 이빨을 확인.)"""
     _init_repo(tmp_path / "repo")
     omd = _mk(tmp_path)
-    monkeypatch.setattr(omd, "_writeset_audit", lambda *a, **k: [])   # 감사 무력화
+    from omd_server.core import WritesetAudit, WritesetVerdict
+    # 감사 무력화 = 항상 CLEAN(궤도 밖 경로 0) 판정을 강제 → 궤도 밖 쓰기가 통과해버림.
+    monkeypatch.setattr(omd, "_writeset_audit",
+                        lambda *a, **k: WritesetAudit(WritesetVerdict.CLEAN))
     omd.declare("A", writes=["a/**"])
     omd.next_task("agA")
     omd.claim("agA", ["a/**"], task_id="A")

@@ -29,5 +29,11 @@ verify = "warn"     # 관측은 보고만(빌드 verdict를 뒤집지 않음)
 [tool.setuptools]
 packages = ["omd_server"]
 
+[tool.pytest.ini_options]
+# benchmarks/ · scripts/ are repository tooling directories rather than
+# installed packages.  Keep both the pytest console script and `python -m
+# pytest` able to import their M0 harness helpers from the repository root.
+pythonpath = ["."]
+
 [tool.setuptools.package-data]
 omd_server = ["scheduler_admission_fsm.json"]

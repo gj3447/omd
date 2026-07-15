@@ -74,10 +74,10 @@
       "file": "omd_server/core.py",
       "symbol": "_reclaim_agent_inline",
       "kind": "function",
-      "line_hint": 1431,
+      "line_hint": 2403,
       "sha256": "14fbbc6d54e6b4f4",
       "layer": "domain-policy",
-      "frege_sinn": "긴급탈출(bail)/좀비회수 단일 회수 루틴 — 동일 observed time으로 궤도해제+requeue+worktree정리+RETIRE, 멱등(§D2)"
+      "frege_sinn": "긴급탈출(bail)/좀비회수 단일 회수 루틴 — durable reclaims 상한 아래 재큐하고 초과 시 POISONED 영구 종단, 궤도해제·worktree정리·RETIRE·typed outbox 영수증을 같은 authority cut에 묶음(§D2/GAP-1)"
     },
     {
       "sourceId": "core._break_ephemeral_flags_for_lease",
@@ -164,7 +164,7 @@
       "file": "omd_server/core.py",
       "symbol": "_writeset_audit",
       "kind": "function",
-      "line_hint": 1894,
+      "line_hint": 3451,
       "sha256": "b15fd7f809276060",
       "layer": "domain-policy",
       "frege_sinn": "고정된 candidate/base SHA의 변경경로 중 claimed write-globs 밖(분열위험) 검출; Git 권위 읽기 실패는 fail-closed(P0-11/§D10)"
@@ -356,10 +356,10 @@
       "file": "omd_server/core.py",
       "symbol": "_periodic_heartbeat_loop",
       "kind": "method",
-      "line_hint": 846,
-      "sha256": "316ff6f29fb27f7a",
+      "line_hint": 908,
+      "sha256": "2dad4b157e3c8e0b",
       "layer": "infrastructure",
-      "frege_sinn": "별도 lifecycle worker가 느린 sweep/effect join과 독립적으로 enforced leader lease를 ttl/3 갱신; owner 수거·takeover fence-out·안전 handoff에서 종결"
+      "frege_sinn": "별도 lifecycle worker가 느린 sweep/effect join과 독립적으로 enforced leader lease를 ttl/3 갱신; 성공 시 실패 streak을 리셋하고 transient 오류는 관측·백오프 재시도하되 상한 또는 takeover fence-out에서 유계 종결(GAP-3)"
     },
     {
       "sourceId": "events.Emitter.emit",

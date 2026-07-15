@@ -191,6 +191,81 @@ def test_default_worker_heartbeats_before_a_slower_authority_sweep(monkeypatch):
         omd.resign()
 
 
+def test_heartbeat_loop_survives_transient_errors_and_resets_failure_streak():
+    class NeverStop:
+        def __init__(self):
+            self.waits = []
+
+        def wait(self, timeout):
+            self.waits.append(timeout)
+            return False
+
+    class ScriptedCoordinator:
+        coordinator_id = "heartbeat-script"
+
+        def __init__(self):
+            self.events = []
+            self.calls = 0
+            self.script = [
+                RuntimeError("db busy"), RuntimeError("db busy"), None,
+                RuntimeError("db busy"), RuntimeError("db busy"),
+                CoordinatorConflict("lost leadership"),
+            ]
+
+        def coordinator_heartbeat(self):
+            step = self.script[self.calls]
+            self.calls += 1
+            if step is not None:
+                raise step
+
+        def _emit(self, event, actor, **fields):
+            self.events.append((event, actor, fields))
+
+    coordinator = ScriptedCoordinator()
+    stop = NeverStop()
+    Coordinator._periodic_heartbeat_loop(
+        weakref.ref(coordinator), stop, 0.01, max_consecutive_failures=3
+    )
+
+    assert coordinator.calls == len(coordinator.script)
+    errors = [fields for event, _, fields in coordinator.events
+              if event == "heartbeat_error"]
+    assert [fields["consecutive_failures"] for fields in errors] == [1, 2, 1, 2]
+    assert coordinator.events[-1][0] == "heartbeat_stopped"
+    assert coordinator.events[-1][2]["reason"] == "not_leader"
+
+
+def test_heartbeat_loop_stops_after_bounded_consecutive_failures():
+    class NeverStop:
+        def wait(self, timeout):
+            return False
+
+    class BrokenCoordinator:
+        coordinator_id = "heartbeat-broken"
+
+        def __init__(self):
+            self.calls = 0
+            self.events = []
+
+        def coordinator_heartbeat(self):
+            self.calls += 1
+            raise RuntimeError("permanent storage failure")
+
+        def _emit(self, event, actor, **fields):
+            self.events.append((event, actor, fields))
+
+    coordinator = BrokenCoordinator()
+    Coordinator._periodic_heartbeat_loop(
+        weakref.ref(coordinator), NeverStop(), 0.01,
+        max_consecutive_failures=3,
+    )
+
+    assert coordinator.calls == 3
+    assert coordinator.events[-1][0] == "heartbeat_stopped"
+    assert coordinator.events[-1][2]["reason"] == "max_consecutive_failures"
+    assert coordinator.events[-1][2]["consecutive_failures"] == 3
+
+
 @pytest.mark.parametrize("failed_worker", ["omd-heartbeat-", "omd-sweep-"])
 def test_default_worker_start_failure_rolls_back_leader_lease(
     tmp_path, monkeypatch, failed_worker

@@ -38,12 +38,12 @@ class BarrierMixin:
     def _party_alive(self, party) -> bool:
         """참가 task 가 아직 응결 가능한 살아있는 상태인가(도착 전/후 사망 판정, §D5).
         참가자 생존 = lease(write-orbit) 생존(소유물=lease 라는 §0 모델). 죽음 =
-          (a) task 가 없어졌거나 ABORTED(reclaim 이 abort→requeue 했으면 새 PENDING 행이지만
-              agent_id=None — lease 도 함께 해제됨), 또는
+          (a) task 가 없어졌거나 ABORTED/POISONED(reclaim 이 abort→requeue 했으면 새 PENDING
+              행이지만 agent_id=None — lease 도 함께 해제됨. 상한 초과면 POISONED 영구 terminal), 또는
           (b) write-orbit 이 HELD 가 아님(lease 만료/해제 = 보유자 사망/탈출, MERGED 제외), 또는
           (c) 도착했었는데 현재 write fence 가 도착 시점과 달라짐(ABA — 만료 후 타인에게 재부여)."""
         t = self.store.get_task(party["task_id"])
-        if t is None or t["state"] == "ABORTED":
+        if t is None or t["state"] in ("ABORTED", "POISONED"):
             return False
         if t["state"] == "MERGED":
             return True  # 이미 응결 — trip 멱등(plan 에서 제외됨)
@@ -468,23 +468,29 @@ class BarrierMixin:
                         "stale": stale}
             write_globs = self._claimed_write_globs(task_id, writes)
             try:
-                branch_tip, integration_base, offending = \
+                branch_tip, integration_base, audit = \
                     self._snapshot_connect_candidate(
                         task_id, t["branch"], write_globs
                     )
             except GitError as exc:
                 self._emit(
                     "connect_rejected", task_id,
-                    reason="writeset_audit_unavailable", error=str(exc),
+                    reason="writeset_audit_error", error=str(exc),
                     via="barrier",
                 )
                 return {
-                    "ok": False, "reason": "writeset_audit_unavailable",
-                    "retryable": True, "error": str(exc), "task_id": task_id,
+                    "ok": False, "reason": "writeset_audit_error",
+                    "retryable": True, "audit_error": str(exc),
+                    "task_id": task_id,
                 }
-            if offending:
-                return {"ok": False, "reason": "writeset_violation",
-                        "offending": offending, "task_id": task_id}
+            if audit.blocks:
+                out = {
+                    "ok": False, "reason": audit.reason,
+                    "offending": list(audit.offending), "task_id": task_id,
+                }
+                if audit.error is not None:
+                    out["audit_error"] = audit.error
+                return out
             owner = t["agent_id"] or f"barrier:{task_id}"
             attempt_id = f"connect-{uuid.uuid4().hex}"
             owner_generation = int(t.get("connect_owner_generation") or 0) + 1

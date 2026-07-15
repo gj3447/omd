@@ -409,6 +409,14 @@ Implemented fairness slice:
   the same-DB effect fence and a real leader generation, while unknown/future
   markers fail without mutation. Reused coordinator labels and resigned
   instances cannot bypass the instance/epoch fence;
+- reclaim/bail now increments a durable per-task retry counter. Attempts beyond
+  `max_reclaims` enter the permanent `POISONED` terminal, stay excluded from
+  dispatch/barrier liveness, and are reported separately from requeued tasks in
+  the durable coordination receipt; the preceding outbox schema migrates the
+  new counter before using it;
+- the lifecycle heartbeat tolerates observable transient failures and resets
+  its streak after success, but emits a typed stop and exits after five
+  consecutive failures rather than spinning or dying silently;
 - task cancel invalidates stale claim replay, and barrier trip revalidates its
   generation and `TRIPPING` state before every effect and final success;
 - the unchanged frozen gate is green normally, RED under a test-only pure
