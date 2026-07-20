@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import math
 import os
+import sys
+import threading
+import time
 
 from .admission_config import (
     parse_admission_aging_quantum as _parse_admission_aging_quantum,
@@ -63,11 +66,21 @@ Call about() any time to re-read this orientation. Full design: README.md / CONC
 try:
     from fastmcp import FastMCP
     from fastmcp.server.lifespan import lifespan
+    from fastmcp.server.middleware import Middleware as _McpMiddleware
 except ImportError:  # 서버 extra 미설치
     FastMCP = None
+    _McpMiddleware = object
 
 
 DEFAULT_SERVER_SWEEP_INTERVAL = 1.0
+
+# 부모 사망 watchdog(2026-07-19 orphan 사고 수리: 죽은 클라이언트가 남긴 omd_server 들이
+# SQLite lock 경합으로 신규 호출을 hang 시킴). 기본 ON, 정확한 OMD_WATCHDOG=0 만 opt-out.
+DEFAULT_WATCHDOG_POLL = 5.0
+# Watchdog 종료 전 in-flight connect(fenced merge)를 기다려주는 상한. 초과 시에도 종료는
+# 안전하다 — 근거는 _watchdog_shutdown docstring 참조(durable CONNECTING + kernel-release
+# flock + 재기동 복구 rollback, tests/test_m1_connect_effect_process.py 가 SIGKILL 로 증명).
+WATCHDOG_EFFECT_GRACE = 30.0
 
 
 def _parse_server_sweep_interval(raw: str | None) -> float | None:
@@ -85,9 +98,162 @@ def _parse_server_sweep_interval(raw: str | None) -> float | None:
     return interval or None
 
 
-def _coordinator_lifespan(omd: Coordinator, *, sweep_interval: float | None = None):
+def _parse_watchdog_enabled(raw: str | None) -> bool:
+    """부모 사망 watchdog 은 기본 ON — 정확한 "0" 만 opt-out (OMD_SWEEP_INTERVAL 관습)."""
+    if raw is None or not raw.strip():
+        return True
+    return raw.strip() != "0"
+
+
+def _parse_watchdog_poll(raw: str | None) -> float:
+    if raw is None or not raw.strip():
+        return DEFAULT_WATCHDOG_POLL
+    try:
+        poll = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "OMD_WATCHDOG_POLL must be a positive finite number"
+        ) from exc
+    if not math.isfinite(poll) or poll <= 0:
+        raise ValueError("OMD_WATCHDOG_POLL must be a positive finite number")
+    return poll
+
+
+def _parse_idle_timeout(raw: str | None) -> float:
+    """OMD_IDLE_TIMEOUT 초. 기본 0=off — 산 인터랙티브 세션 오폭 방지가 기본값의 이유."""
+    if raw is None or not raw.strip():
+        return 0.0
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "OMD_IDLE_TIMEOUT must be 0 or a positive finite number"
+        ) from exc
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("OMD_IDLE_TIMEOUT must be 0 or a positive finite number")
+    return timeout
+
+
+class LifecycleWatchdog:
+    """부모 사망(reparent) + idle 판정 로직 — clock/getppid 주입으로 결정론 테스트 가능.
+
+    parent_death: 시작 시 os.getppid() 를 기록하고, 이후 ppid 가 바뀌거나 1이 되면
+    (stdio 클라이언트 사망 → init/launchd 로 reparent) 트리거. 시작 시 이미 ppid==1 인
+    비정상 기동(스포너가 build 전에 죽음)도 즉시 트리거한다 — 의도적 데몬화는
+    OMD_WATCHDOG=0 으로 opt-out 할 것.
+
+    idle: 마지막 MCP tool 호출(touch) 이후 idle_timeout 초 경과 시 트리거. 0=off.
+    """
+
+    def __init__(self, *, parent_death: bool = True, idle_timeout: float = 0.0,
+                 clock=time.monotonic, getppid=os.getppid):
+        self._parent_death = parent_death
+        self._idle_timeout = idle_timeout
+        self._clock = clock
+        self._getppid = getppid
+        self._initial_ppid = getppid() if parent_death else None
+        self._last_activity = clock()
+
+    @property
+    def armed(self) -> bool:
+        return self._parent_death or self._idle_timeout > 0
+
+    def touch(self) -> None:
+        self._last_activity = self._clock()
+
+    def check(self) -> str | None:
+        """트리거 사유("parent_death" | "idle_timeout") 또는 None."""
+        if self._parent_death:
+            ppid = self._getppid()
+            if ppid == 1 or ppid != self._initial_ppid:
+                return "parent_death"
+        if self._idle_timeout > 0 and (
+            self._clock() - self._last_activity
+        ) >= self._idle_timeout:
+            return "idle_timeout"
+        return None
+
+
+class _ActivityMiddleware(_McpMiddleware):
+    """모든 MCP tool 호출에서 idle timestamp 를 갱신 — 툴 등록 경로(@mcp.tool) 무변경
+    최소침습. 호출 전후 양쪽 touch: 긴 tool(예: connect merge) 실행 시간이 idle 로
+    오산되지 않게 한다."""
+
+    def __init__(self, touch):
+        self._touch = touch
+
+    async def on_call_tool(self, context, call_next):
+        self._touch()
+        try:
+            return await call_next(context)
+        finally:
+            self._touch()
+
+
+def _watchdog_shutdown(omd: Coordinator, reason: str, *,
+                       effect_grace: float = WATCHDOG_EFFECT_GRACE,
+                       _exit=os._exit, clock=time.monotonic, sleep=time.sleep):
+    """Watchdog 트리거 시 graceful 종료 — lifespan finally 경로(close → resign)를 재현.
+
+    in-flight connect 보호: 기존 close() 는 background worker 만 join 하고 진행중
+    tool-call 스레드(connect Phase A~C)는 확인하지 않는다. 그래서 여기서 직접
+    _connect_effect 의 프로세스 수준 락(_effect_process_locks — connect 가 Phase A~C
+    스코프 내내 보유)을 bounded 폴링으로 획득해 "이 프로세스의 진행중 fenced merge
+    없음"을 확인한다. 획득한 락은 해제하지 않는다(프로세스가 곧 죽고, 새 connect
+    진입도 차단 — TOCTOU 없음). 모든 내부 call site 는 blocking=False 라 sweep 등
+    background 스레드가 이 락에 블록되는 일도 없다(스킵 후 재시도 설계).
+
+    grace 초과(비정상적으로 긴 merge) 시 그냥 종료해도 안전한 근거:
+      (a) Phase A 가 CONNECTING 상태 + merge intent 를 durable 커밋했고,
+      (b) flock 은 kernel-release — 프로세스(와 pass_fds 자식)의 마지막 fd 가 닫힐 때
+          커널이 해제하므로 죽은 보유자가 락을 영구 점유할 수 없고,
+      (c) 재기동 복구(_recover/_recover_under_effect)가 dangling merge 를 abort 하고
+          CONNECTING→DONE rollback + idempotency RETRYABLE 로 조정한다 —
+          tests/test_m1_connect_effect_process.py 가 SIGKILL 사례로 증명.
+    """
+    exit_code = 0
+    deadline = clock() + effect_grace
+    for lock in getattr(omd, "_effect_process_locks", ()):
+        while not lock.acquire(blocking=False):
+            if clock() >= deadline:
+                break
+            sleep(0.05)
+    try:
+        omd.close()
+    except BaseException as exc:  # noqa: BLE001 — 부모 사망: 어떤 실패든 종료는 해야 함
+        print(f"omd: watchdog shutdown ({reason}): close failed: {exc!r}",
+              file=sys.stderr, flush=True)
+        exit_code = 1
+    if omd.enforce_single_coordinator:
+        try:
+            omd.resign()
+        except BaseException as exc:  # noqa: BLE001
+            print(f"omd: watchdog shutdown ({reason}): resign failed: {exc!r}",
+                  file=sys.stderr, flush=True)
+            exit_code = 1
+    print(f"omd: watchdog exit ({reason})", file=sys.stderr, flush=True)
+    # 비메인 스레드에서 asyncio stdio 루프를 안전하게 깨울 표준 경로가 없어 os._exit.
+    # lifespan finally 는 실행되지 않지만 그 경로(close→resign)를 위에서 재현했다.
+    _exit(exit_code)
+
+
+def _watchdog_loop(watchdog: LifecycleWatchdog, stop_event: threading.Event,
+                   poll_interval: float, shutdown) -> None:
+    """주기 폴링(Event.wait 로 자므로 정상 종료 시 즉시 반응 — sweep loop 관습)."""
+    while not stop_event.wait(poll_interval):
+        reason = watchdog.check()
+        if reason is not None:
+            shutdown(reason)
+            return
+
+
+def _coordinator_lifespan(omd: Coordinator, *, sweep_interval: float | None = None,
+                          watchdog: LifecycleWatchdog | None = None,
+                          watchdog_poll: float = DEFAULT_WATCHDOG_POLL):
     @lifespan
     async def coordinator_lifespan(server):
+        watchdog_stop = threading.Event()
+        watchdog_thread = None
         try:
             # Constructor-time recovery is synchronous, but no background
             # writer/notifier effect starts until lifespan owns its shutdown.
@@ -97,8 +263,27 @@ def _coordinator_lifespan(omd: Coordinator, *, sweep_interval: float | None = No
                 # its lease through synchronous close/effect joins.
                 heartbeat=omd.enforce_single_coordinator,
             )
+            if watchdog is not None and watchdog.armed:
+                # stdio 서버의 tool 은 anyio worker thread 에서 도는 sync 함수라
+                # 폴러도 daemon thread 로 통일(기존 sweep/heartbeat worker 관습).
+                watchdog_thread = threading.Thread(
+                    target=_watchdog_loop,
+                    args=(
+                        watchdog,
+                        watchdog_stop,
+                        watchdog_poll,
+                        lambda reason: _watchdog_shutdown(omd, reason),
+                    ),
+                    name="omd-lifecycle-watchdog",
+                    daemon=True,
+                )
+                watchdog_thread.start()
             yield {"omd": omd}
         finally:
+            # 정상 종료(클라이언트 EOF)면 watchdog 을 먼저 내리고 기존 경로로 handoff.
+            watchdog_stop.set()
+            if watchdog_thread is not None and watchdog_thread.is_alive():
+                watchdog_thread.join(timeout=5.0)
             # Stop and join the periodic writer before handing leadership off.
             # close() fails loudly rather than resigning with a live old writer.
             omd.close()
@@ -117,6 +302,15 @@ def build_server(db_path: str = "omd.db"):
     # §D3/D4 백그라운드 sweep: MCP는 기본 1초. 빈 값/미설정도 default, 정확한 0만 opt-out,
     # 양의 finite 값은 override다. 파싱은 Coordinator/DB 생성 전에 fail loud한다.
     _swp = _parse_server_sweep_interval(os.environ.get("OMD_SWEEP_INTERVAL"))
+    # W1 lifecycle: 부모 사망 watchdog(기본 ON, OMD_WATCHDOG=0 만 off) + idle timeout
+    # (OMD_IDLE_TIMEOUT 초, 기본 0=off). 파싱은 DB 생성 전에 fail loud.
+    _wd_enabled = _parse_watchdog_enabled(os.environ.get("OMD_WATCHDOG"))
+    _wd_poll = _parse_watchdog_poll(os.environ.get("OMD_WATCHDOG_POLL"))
+    _idle_timeout = _parse_idle_timeout(os.environ.get("OMD_IDLE_TIMEOUT"))
+    # ppid 기록은 느린 DB init/recovery *전* — 스포너가 그 사이 죽는 창을 최소화.
+    watchdog = LifecycleWatchdog(
+        parent_death=_wd_enabled, idle_timeout=_idle_timeout
+    )
     _capacity = _parse_admission_queue_capacity(
         os.environ.get("OMD_ADMISSION_QUEUE_CAPACITY")
     )
@@ -145,7 +339,14 @@ def build_server(db_path: str = "omd.db"):
     mcp = FastMCP(
         "omd",
         instructions=OMD_INSTRUCTIONS,
-        lifespan=_coordinator_lifespan(omd, sweep_interval=_swp),
+        lifespan=_coordinator_lifespan(
+            omd,
+            sweep_interval=_swp,
+            watchdog=watchdog if watchdog.armed else None,
+            watchdog_poll=_wd_poll,
+        ),
+        # idle timestamp 갱신 — 툴 30여 개의 @mcp.tool 등록부 무변경(최소침습).
+        middleware=[_ActivityMiddleware(watchdog.touch)],
     )
 
     @mcp.tool()

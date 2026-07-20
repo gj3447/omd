@@ -13,6 +13,7 @@ dev = ["pytest>=8", "hypothesis>=6.100", "ooptdd>=0.4"]
 
 [project.scripts]
 omd = "omd_server.cli:main"
+omd-merge = "omd_server.merge_cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
