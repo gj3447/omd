@@ -74,10 +74,10 @@
       "file": "omd_server/core.py",
       "symbol": "_reclaim_agent_inline",
       "kind": "function",
-      "line_hint": 367,
-      "sha256": "c6d87d801247f674",
+      "line_hint": 2403,
+      "sha256": "14fbbc6d54e6b4f4",
       "layer": "domain-policy",
-      "frege_sinn": "긴급탈출(bail)/좀비회수 단일 회수 루틴 — 궤도해제+requeue+worktree정리+RETIRE, 멱등(§D2)"
+      "frege_sinn": "긴급탈출(bail)/좀비회수 단일 회수 루틴 — durable reclaims 상한 아래 재큐하고 초과 시 POISONED 영구 종단, 궤도해제·worktree정리·RETIRE·typed outbox 영수증을 같은 authority cut에 묶음(§D2/GAP-1)"
     },
     {
       "sourceId": "core._break_ephemeral_flags_for_lease",
@@ -164,20 +164,21 @@
       "file": "omd_server/core.py",
       "symbol": "_writeset_audit",
       "kind": "function",
-      "line_hint": 882,
-      "sha256": "310922de468ff2e0",
+      "line_hint": 3451,
+      "sha256": "b15fd7f809276060",
       "layer": "domain-policy",
-      "frege_sinn": "branch 변경경로 중 claimed write-globs 밖(분열위험) 검출 — typed WritesetAudit(fail-closed) pre-connect 감사(P0-11/§D10, GAP-2)"
+      "frege_sinn": "고정된 candidate/base SHA의 변경경로 중 claimed write-globs 밖(분열위험) 검출; Git 권위 읽기 실패는 fail-closed(P0-11/§D10)"
     },
     {
       "sourceId": "core._connect_phase_a",
       "file": "omd_server/core.py",
       "symbol": "_connect_phase_a",
       "kind": "function",
-      "line_hint": 1200,
-      "sha256": "98e3a769da0b85a9",
+      "line_hint": 2912,
+      "sha256": "d904964e33b02d94",
       "layer": "domain-policy",
-      "frege_sinn": "split-phase Phase A(임계구역): fence 재검증+merge_token 획득+intent 영속+pin+→CONNECTING"
+      "frege_sinn": "split-phase Phase A(임계구역): fence 재검증+attempt/owner generation+merge_token+idempotency envelope를 동일 세대로 결속하고 pin+→CONNECTING",
+      "note": "[re-baseline 2026-07-15: multi-Coordinator split-effect attempt fencing parameters added]"
     },
     {
       "sourceId": "core._connect_phase_b",
@@ -351,14 +352,14 @@
       "frege_sinn": "재기동 시 pre-merge HEAD/no MERGE_HEAD/clean tracked tree를 증명하는 fail-stop rollback seam"
     },
     {
-      "sourceId": "server._leader_heartbeat_loop",
-      "file": "omd_server/server.py",
-      "symbol": "_leader_heartbeat_loop",
-      "kind": "function",
-      "line_hint": 74,
-      "sha256": "d13677f58513476f",
+      "sourceId": "core.Coordinator._periodic_heartbeat_loop",
+      "file": "omd_server/core.py",
+      "symbol": "_periodic_heartbeat_loop",
+      "kind": "method",
+      "line_hint": 908,
+      "sha256": "2dad4b157e3c8e0b",
       "layer": "infrastructure",
-      "frege_sinn": "leader lease enforced 서버만 ttl/3 heartbeat; 비-enforced stdio는 no-op, takeover fence-out이면 종결; 기타 예외는 로그+백오프 유계 재시도 후 typed 탈출(GAP-3)"
+      "frege_sinn": "별도 lifecycle worker가 느린 sweep/effect join과 독립적으로 enforced leader lease를 ttl/3 갱신; 성공 시 실패 streak을 리셋하고 transient 오류는 관측·백오프 재시도하되 상한 또는 takeover fence-out에서 유계 종결(GAP-3)"
     },
     {
       "sourceId": "events.Emitter.emit",
@@ -369,6 +370,16 @@
       "sha256": "69b0520200a01695",
       "layer": "infrastructure",
       "frege_sinn": "단일 관측 sink 실패도 coordination을 막지 않는 fail-soft 이벤트 방출 seam"
+    },
+    {
+      "sourceId": "core.Coordinator.rollover_claim",
+      "file": "omd_server/core.py",
+      "symbol": "rollover_claim",
+      "kind": "method",
+      "line_hint": 4122,
+      "sha256": "66ff733a211be2b1",
+      "layer": "domain-policy",
+      "frege_sinn": "최신 지원 비정책 종단 OrbitRequest를 orbit/owner/generation/bail epoch로 fencing한 뒤 immutable intent의 새 N+1 머신을 최대 한 번 생성; idem_ttl 내 receipt replay와 GC 후 latest-predecessor fence, 정책 DENIED/owner-reclaim/row-less overload 경계를 보존"
     }
   ]
 }

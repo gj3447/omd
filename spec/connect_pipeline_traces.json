@@ -1,15 +1,18 @@
 {
+  "limitations": "These abstract traces prove structural transition and guard-outcome coverage. M0.5 must add payload-driven guard evaluation and model-to-production differential replay.",
   "cases": [
     {
-      "id": "happy-path",
+      "id": "happy-path-independent-readback",
       "machine": "connect_attempt",
       "steps": [
         {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
         {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
         {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
-        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
-        {"event": "REF_CAS_SUCCEEDED", "guard_results": {"published_tree_matches_receipt": true}, "expected_state": "PUBLISHED", "expected_effects": ["RecordPublished"]},
-        {"event": "FINALIZE_COMMITTED", "guard_results": {}, "expected_state": "FINALIZED", "expected_effects": ["EnqueuePostPublishEffects"]}
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_SUCCESS", "guard_results": {"cas_report_matches_intent": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_NEW", "guard_results": {"readback_matches_receipt": true}, "expected_state": "FINALIZING", "expected_effects": ["FinalizePublishedAttempt"]},
+        {"event": "FINALIZE_COMMITTED", "guard_results": {"finalization_matches_publication": true}, "expected_state": "FINALIZED", "expected_effects": ["EnqueuePostPublishEffects"]}
       ]
     },
     {
@@ -30,7 +33,7 @@
       ]
     },
     {
-      "id": "validation-failed",
+      "id": "validation-infrastructure-failed",
       "machine": "connect_attempt",
       "steps": [
         {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
@@ -39,7 +42,133 @@
       ]
     },
     {
-      "id": "receipt-mismatch-rejected",
+      "id": "fresh-authority-rejected",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "AUTHORITY_REJECTED", "guard_results": {}, "expected_state": "FAILED", "expected_effects": ["RecordFailure"]}
+      ]
+    },
+    {
+      "id": "stale-publisher-claim-requires-readback",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_STALE", "guard_results": {"cas_report_matches_intent": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_OTHER", "guard_results": {"readback_is_other_for_effect": true}, "expected_state": "NEEDS_REPAIR", "expected_effects": ["RecordFailure"]}
+      ]
+    },
+    {
+      "id": "unknown-cas-readback-old-reauthorizes",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_UNKNOWN", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_OLD", "guard_results": {"readback_is_expected_old": true}, "expected_state": "VALIDATED", "expected_effects": ["InvalidateAuthorization"]},
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]}
+      ]
+    },
+    {
+      "id": "readback-other-needs-repair",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_SUCCESS", "guard_results": {"cas_report_matches_intent": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_OTHER", "guard_results": {"readback_is_other_for_effect": true}, "expected_state": "NEEDS_REPAIR", "expected_effects": ["RecordFailure"]}
+      ]
+    },
+    {
+      "id": "bounded-unknown-then-new-finalize-fails",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_UNKNOWN", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_UNKNOWN", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "UNKNOWN_OUTCOME", "expected_effects": ["ScheduleReconciliation"]},
+        {"event": "REF_READ_UNKNOWN", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "UNKNOWN_OUTCOME", "expected_effects": ["ScheduleReconciliation"]},
+        {"event": "REF_READ_NEW", "guard_results": {"readback_matches_receipt": true}, "expected_state": "FINALIZING", "expected_effects": ["FinalizePublishedAttempt"]},
+        {"event": "FINALIZE_FAILED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "NEEDS_REPAIR", "expected_effects": ["RecordFailure"]}
+      ]
+    },
+    {
+      "id": "unknown-outcome-readback-old",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_UNKNOWN", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_UNKNOWN", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "UNKNOWN_OUTCOME", "expected_effects": ["ScheduleReconciliation"]},
+        {"event": "REF_READ_OLD", "guard_results": {"readback_is_expected_old": true}, "expected_state": "VALIDATED", "expected_effects": ["InvalidateAuthorization"]}
+      ]
+    },
+    {
+      "id": "unknown-outcome-readback-other",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_UNKNOWN", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_UNKNOWN", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "UNKNOWN_OUTCOME", "expected_effects": ["ScheduleReconciliation"]},
+        {"event": "REF_READ_OTHER", "guard_results": {"readback_is_other_for_effect": true}, "expected_state": "NEEDS_REPAIR", "expected_effects": ["RecordFailure"]}
+      ]
+    },
+    {
+      "id": "critical-interrupts-are-deferred",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTERRUPT_RECORDED", "guard_results": {"pending_interrupt_accepted": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPendingInterrupt"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "INTERRUPT_RECORDED", "guard_results": {"pending_interrupt_accepted": true}, "expected_state": "PUBLISHING", "expected_effects": ["RecordPendingInterrupt"]},
+        {"event": "CAS_REPORTED_UNKNOWN", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "INTERRUPT_RECORDED", "guard_results": {"pending_interrupt_accepted": true}, "expected_state": "RECONCILING", "expected_effects": ["RecordPendingInterrupt"]},
+        {"event": "REF_READ_UNKNOWN", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "UNKNOWN_OUTCOME", "expected_effects": ["ScheduleReconciliation"]},
+        {"event": "INTERRUPT_RECORDED", "guard_results": {"pending_interrupt_accepted": true}, "expected_state": "UNKNOWN_OUTCOME", "expected_effects": ["RecordPendingInterrupt"]},
+        {"event": "REF_READ_NEW", "guard_results": {"readback_matches_receipt": true}, "expected_state": "FINALIZING", "expected_effects": ["FinalizePublishedAttempt"]},
+        {"event": "INTERRUPT_RECORDED", "guard_results": {"pending_interrupt_accepted": true}, "expected_state": "FINALIZING", "expected_effects": ["RecordPendingInterrupt"]},
+        {"event": "FINALIZE_COMMITTED_AFTER_CANCEL", "guard_results": {"finalization_after_cancel_matches_publication": true}, "expected_state": "FINALIZED_CANCELED", "expected_effects": ["EnqueuePostPublishEffects"]}
+      ]
+    },
+    {"id": "cancel-queued", "machine": "connect_attempt", "steps": [{"event": "CANCEL", "guard_results": {}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancelled"]}]},
+    {"id": "cancel-preparing", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "CANCEL", "guard_results": {}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancelled"]}]},
+    {"id": "cancel-validating", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]}, {"event": "CANCEL", "guard_results": {}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancelled"]}]},
+    {"id": "cancel-validated", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]}, {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]}, {"event": "CANCEL", "guard_results": {}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancelled"]}]},
+    {"id": "timeout-queued", "machine": "connect_attempt", "steps": [{"event": "TIMEOUT", "guard_results": {"attempt_timeout_due": true}, "expected_state": "TIMED_OUT", "expected_effects": ["RecordTimeout"]}]},
+    {"id": "timeout-preparing", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "TIMEOUT", "guard_results": {"attempt_timeout_due": true}, "expected_state": "TIMED_OUT", "expected_effects": ["RecordTimeout"]}]},
+    {"id": "timeout-validating", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]}, {"event": "TIMEOUT", "guard_results": {"attempt_timeout_due": true}, "expected_state": "TIMED_OUT", "expected_effects": ["RecordTimeout"]}]},
+    {"id": "timeout-validated", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]}, {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]}, {"event": "TIMEOUT", "guard_results": {"attempt_timeout_due": true}, "expected_state": "TIMED_OUT", "expected_effects": ["RecordTimeout"]}]},
+    {"id": "budget-queued", "machine": "connect_attempt", "steps": [{"event": "BUDGET_EXHAUSTED", "guard_results": {}, "expected_state": "BUDGET_EXHAUSTED", "expected_effects": ["RecordBudgetExhaustion"]}]},
+    {"id": "budget-preparing", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "BUDGET_EXHAUSTED", "guard_results": {}, "expected_state": "BUDGET_EXHAUSTED", "expected_effects": ["RecordBudgetExhaustion"]}]},
+    {"id": "budget-validating", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]}, {"event": "BUDGET_EXHAUSTED", "guard_results": {}, "expected_state": "BUDGET_EXHAUSTED", "expected_effects": ["RecordBudgetExhaustion"]}]},
+    {"id": "budget-validated", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]}, {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]}, {"event": "BUDGET_EXHAUSTED", "guard_results": {}, "expected_state": "BUDGET_EXHAUSTED", "expected_effects": ["RecordBudgetExhaustion"]}]},
+    {
+      "id": "receipt-full-identity-mismatch-rejected",
       "machine": "connect_attempt",
       "steps": [
         {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
@@ -48,90 +177,153 @@
       ]
     },
     {
-      "id": "stale-authority-rejected",
+      "id": "authorization-replay-rejected",
       "machine": "connect_attempt",
       "steps": [
         {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
         {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
         {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
-        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": false}, "expected_state": "VALIDATED", "expected_effects": ["AuditInvalidTransition"]}
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": false}, "expected_state": "VALIDATED", "expected_effects": ["AuditInvalidTransition"]}
       ]
     },
     {
-      "id": "published-tree-mismatch-rejected",
+      "id": "same-tree-wrong-commit-readback-rejected",
       "machine": "connect_attempt",
       "steps": [
         {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
         {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
         {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
-        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
-        {"event": "REF_CAS_SUCCEEDED", "guard_results": {"published_tree_matches_receipt": false}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["AuditInvalidTransition"]}
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_SUCCESS", "guard_results": {"cas_report_matches_intent": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_NEW", "guard_results": {"readback_matches_receipt": false}, "expected_state": "RECONCILING", "expected_effects": ["AuditInvalidTransition"]}
       ]
     },
     {
-      "id": "cas-stale",
+      "id": "wrong-old-readback-rejected",
       "machine": "connect_attempt",
       "steps": [
         {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
         {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
         {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
-        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
-        {"event": "REF_CAS_STALE", "guard_results": {}, "expected_state": "STALE", "expected_effects": ["RecordStale"]}
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_UNKNOWN", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_OLD", "guard_results": {"readback_is_expected_old": false}, "expected_state": "RECONCILING", "expected_effects": ["AuditInvalidTransition"]}
       ]
     },
     {
-      "id": "unknown-cas-reconciles-new",
+      "id": "finalization-receipt-mismatch-rejected",
       "machine": "connect_attempt",
       "steps": [
         {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
         {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
         {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
-        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
-        {"event": "REF_CAS_UNKNOWN", "guard_results": {}, "expected_state": "RECONCILING", "expected_effects": ["ReconcileRef"]},
-        {"event": "RECOVER_REF_NEW", "guard_results": {}, "expected_state": "PUBLISHED", "expected_effects": ["RecordPublished"]},
-        {"event": "FINALIZE_COMMITTED", "guard_results": {}, "expected_state": "FINALIZED", "expected_effects": ["EnqueuePostPublishEffects"]}
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_SUCCESS", "guard_results": {"cas_report_matches_intent": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_NEW", "guard_results": {"readback_matches_receipt": true}, "expected_state": "FINALIZING", "expected_effects": ["FinalizePublishedAttempt"]},
+        {"event": "FINALIZE_COMMITTED", "guard_results": {"finalization_matches_publication": false}, "expected_state": "FINALIZING", "expected_effects": ["AuditInvalidTransition"]}
       ]
     },
     {
-      "id": "unknown-cas-reconciles-old",
+      "id": "interrupted-finalization-receipt-mismatch-rejected",
       "machine": "connect_attempt",
       "steps": [
         {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
         {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
         {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
-        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
-        {"event": "REF_CAS_UNKNOWN", "guard_results": {}, "expected_state": "RECONCILING", "expected_effects": ["ReconcileRef"]},
-        {"event": "RECOVER_REF_OLD", "guard_results": {}, "expected_state": "VALIDATED", "expected_effects": ["RecordRetry"]}
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_SUCCESS", "guard_results": {"cas_report_matches_intent": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_NEW", "guard_results": {"readback_matches_receipt": true}, "expected_state": "FINALIZING", "expected_effects": ["FinalizePublishedAttempt"]},
+        {"event": "FINALIZE_COMMITTED_AFTER_CANCEL", "guard_results": {"finalization_after_cancel_matches_publication": false}, "expected_state": "FINALIZING", "expected_effects": ["AuditInvalidTransition"]}
       ]
     },
     {
-      "id": "unknown-cas-requires-repair",
+      "id": "post-publish-timeout-is-typed",
       "machine": "connect_attempt",
       "steps": [
         {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
         {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
         {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
-        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
-        {"event": "REF_CAS_UNKNOWN", "guard_results": {}, "expected_state": "RECONCILING", "expected_effects": ["ReconcileRef"]},
-        {"event": "RECOVER_REF_OTHER", "guard_results": {}, "expected_state": "NEEDS_REPAIR", "expected_effects": ["RecordFailure"]}
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_SUCCESS", "guard_results": {"cas_report_matches_intent": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_NEW", "guard_results": {"readback_matches_receipt": true}, "expected_state": "FINALIZING", "expected_effects": ["FinalizePublishedAttempt"]},
+        {"event": "INTERRUPT_RECORDED", "guard_results": {"pending_interrupt_accepted": true}, "expected_state": "FINALIZING", "expected_effects": ["RecordPendingInterrupt"]},
+        {"event": "FINALIZE_COMMITTED_AFTER_TIMEOUT", "guard_results": {"finalization_after_timeout_matches_publication": true}, "expected_state": "FINALIZED_TIMED_OUT", "expected_effects": ["EnqueuePostPublishEffects"]}
       ]
     },
     {
-      "id": "finalize-failed-after-publish",
+      "id": "post-publish-budget-exhaustion-is-typed",
       "machine": "connect_attempt",
       "steps": [
         {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
         {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
         {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
-        {"event": "REQUEST_PUBLISH", "guard_results": {"authority_current": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["PersistPublishIntent"]},
-        {"event": "REF_CAS_SUCCEEDED", "guard_results": {"published_tree_matches_receipt": true}, "expected_state": "PUBLISHED", "expected_effects": ["RecordPublished"]},
-        {"event": "FINALIZE_FAILED", "guard_results": {}, "expected_state": "NEEDS_REPAIR", "expected_effects": ["RecordFailure"]}
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_SUCCESS", "guard_results": {"cas_report_matches_intent": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_NEW", "guard_results": {"readback_matches_receipt": true}, "expected_state": "FINALIZING", "expected_effects": ["FinalizePublishedAttempt"]},
+        {"event": "INTERRUPT_RECORDED", "guard_results": {"pending_interrupt_accepted": true}, "expected_state": "FINALIZING", "expected_effects": ["RecordPendingInterrupt"]},
+        {"event": "FINALIZE_COMMITTED_AFTER_BUDGET_EXHAUSTED", "guard_results": {"finalization_after_budget_matches_publication": true}, "expected_state": "FINALIZED_BUDGET_EXHAUSTED", "expected_effects": ["EnqueuePostPublishEffects"]}
       ]
     },
-    {"id": "cancel-queued", "machine": "connect_attempt", "steps": [{"event": "CANCEL", "guard_results": {}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancelled"]}]},
-    {"id": "cancel-preparing", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "CANCEL", "guard_results": {}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancelled"]}]},
-    {"id": "cancel-validating", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]}, {"event": "CANCEL", "guard_results": {}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancelled"]}]},
-    {"id": "cancel-validated", "machine": "connect_attempt", "steps": [{"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]}, {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]}, {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]}, {"event": "CANCEL", "guard_results": {}, "expected_state": "CANCELLED", "expected_effects": ["RecordCancelled"]}]},
+    {
+      "id": "retry-exhaustion-preparing-boundary",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "RETRIES_EXHAUSTED", "guard_results": {"retry_exhaustion_due": false}, "expected_state": "PREPARING", "expected_effects": ["AuditInvalidTransition"]},
+        {"event": "RETRIES_EXHAUSTED", "guard_results": {"retry_exhaustion_due": true}, "expected_state": "RETRY_EXHAUSTED", "expected_effects": ["RecordRetryExhaustion"]}
+      ]
+    },
+    {
+      "id": "retry-exhaustion-validating",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "RETRIES_EXHAUSTED", "guard_results": {"retry_exhaustion_due": true}, "expected_state": "RETRY_EXHAUSTED", "expected_effects": ["RecordRetryExhaustion"]}
+      ]
+    },
+    {
+      "id": "unknown-outcome-reconciliation-exhausted",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_UNKNOWN", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_UNKNOWN", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "UNKNOWN_OUTCOME", "expected_effects": ["ScheduleReconciliation"]},
+        {"event": "RETRIES_EXHAUSTED", "guard_results": {"retry_exhaustion_due": true}, "expected_state": "NEEDS_REPAIR", "expected_effects": ["RecordRetryExhaustion"]}
+      ]
+    },
+    {
+      "id": "effect-correlation-and-interrupt-negative-matrix",
+      "machine": "connect_attempt",
+      "steps": [
+        {"event": "DEQUEUE", "guard_results": {}, "expected_state": "PREPARING", "expected_effects": ["PrepareCandidate"]},
+        {"event": "CANDIDATE_READY", "guard_results": {}, "expected_state": "VALIDATING", "expected_effects": ["RunValidation"]},
+        {"event": "VALIDATION_GREEN", "guard_results": {"receipt_matches_candidate": true}, "expected_state": "VALIDATED", "expected_effects": ["RecordValidationReceipt"]},
+        {"event": "PUBLISH_AUTHORIZED", "guard_results": {"authorization_matches_attempt": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPublishAuthorization"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": false}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["AuditInvalidTransition"]},
+        {"event": "INTERRUPT_RECORDED", "guard_results": {"pending_interrupt_accepted": true}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["RecordPendingInterrupt"]},
+        {"event": "INTERRUPT_RECORDED", "guard_results": {"pending_interrupt_accepted": false}, "expected_state": "PUBLISH_INTENT", "expected_effects": ["AuditInvalidTransition"]},
+        {"event": "INTENT_COMMITTED", "guard_results": {"publish_effect_matches_authorization": true}, "expected_state": "PUBLISHING", "expected_effects": ["ApplyExpectedOldRefCAS"]},
+        {"event": "CAS_REPORTED_SUCCESS", "guard_results": {"cas_report_matches_intent": false}, "expected_state": "PUBLISHING", "expected_effects": ["AuditInvalidTransition"]},
+        {"event": "CAS_REPORTED_SUCCESS", "guard_results": {"cas_report_matches_intent": true}, "expected_state": "RECONCILING", "expected_effects": ["ReadAuthoritativeIntegrationRef"]},
+        {"event": "REF_READ_OTHER", "guard_results": {"readback_is_other_for_effect": false}, "expected_state": "RECONCILING", "expected_effects": ["AuditInvalidTransition"]},
+        {"event": "REF_READ_NEW", "guard_results": {"readback_matches_receipt": true}, "expected_state": "FINALIZING", "expected_effects": ["FinalizePublishedAttempt"]},
+        {"event": "FINALIZE_COMMITTED_AFTER_TIMEOUT", "guard_results": {"finalization_after_timeout_matches_publication": false}, "expected_state": "FINALIZING", "expected_effects": ["AuditInvalidTransition"]},
+        {"event": "FINALIZE_COMMITTED_AFTER_BUDGET_EXHAUSTED", "guard_results": {"finalization_after_budget_matches_publication": false}, "expected_state": "FINALIZING", "expected_effects": ["AuditInvalidTransition"]},
+        {"event": "FINALIZE_COMMITTED", "guard_results": {"finalization_matches_publication": true}, "expected_state": "FINALIZED", "expected_effects": ["EnqueuePostPublishEffects"]}
+      ]
+    },
+    {"id": "timeout-before-deadline-rejected", "machine": "connect_attempt", "steps": [{"event": "TIMEOUT", "guard_results": {"attempt_timeout_due": false}, "expected_state": "QUEUED", "expected_effects": ["AuditInvalidTransition"]}]},
     {"id": "invalid-finalize-from-queued", "machine": "connect_attempt", "steps": [{"event": "FINALIZE_COMMITTED", "guard_results": {}, "expected_state": "QUEUED", "expected_effects": ["AuditInvalidTransition"]}]}
   ]
 }

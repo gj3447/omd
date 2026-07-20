@@ -96,6 +96,7 @@ def test_restart_forward_completes_fully_merged_trip(tmp_path, monkeypatch):
     assert omd.store.get_task("B")["state"] == "MERGED"
     assert omd.store.barrier_by_name("rc")["state"] == "TRIPPING", "크래시 잔해"
 
+    omd.resign()
     omd2 = _mk(tmp_path)                                         # 재기동(같은 db/coordinator_id)
     st = omd2.barrier_status("rc")
     assert st["state"] == "TRIPPED", (
@@ -107,29 +108,31 @@ def test_restart_forward_completes_fully_merged_trip(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_restart_breaks_partially_tripped_barrier_fail_loud(tmp_path, monkeypatch):
+def test_restart_breaks_partially_tripped_barrier_fail_loud(tmp_path):
     omd = _mk(tmp_path)
     fa, fb = _arm_two(omd)
 
-    # 크래시 주입: plan 의 1번째 task 응결 후, 2번째 응결 *직전* 사망.
-    real = omd._barrier_connect_one
-    calls = {"n": 0}
-
-    def dying(task_id, expected_fence):
-        calls["n"] += 1
-        if calls["n"] >= 2:
-            raise _Crash("process died mid-plan")
-        return real(task_id, expected_fence)
-
-    monkeypatch.setattr(omd, "_barrier_connect_one", dying)
+    # 진짜 process cut 은 예외 handler 자체도 실행하지 않는다. 마지막 도착의
+    # 영속 Phase A(TRIPPING)와 plan 첫 효과만 직접 수행한 뒤 호출 스택을 버려
+    # 두 번째 효과 직전 강제종료 잔해를 정확히 만든다.
     omd.barrier_arrive("rc", "agA", "A", fence=fa)
-    with pytest.raises(_Crash):
-        omd.barrier_arrive("rc", "agB", "B", fence=fb)
+    with omd._cs():
+        barrier = omd.store.barrier_by_name("rc")
+        omd.store.set_barrier_party(
+            barrier["barrier_id"], barrier["generation"], "B",
+            arrived=1, arrive_fence=fb, agent_id="agB",
+        )
+        plan = omd._barrier_eval(barrier["barrier_id"], can_trip=True)
+    assert len(plan) == 2
+    assert omd._barrier_connect_one(
+        plan[0]["task_id"], plan[0]["expected_fence"]
+    )["ok"] is True
 
     merged = [t for t in ("A", "B") if omd.store.get_task(t)["state"] == "MERGED"]
     assert len(merged) == 1, f"정확히 한 task 만 응결된 반쪽 상태여야: {merged}"
     assert omd.store.barrier_by_name("rc")["state"] == "TRIPPING"
 
+    omd.resign()
     omd2 = _mk(tmp_path)                                         # 재기동
     st = omd2.barrier_status("rc")
     assert st["state"] == "BROKEN", (
@@ -151,6 +154,7 @@ def test_restart_leaves_healthy_armed_barrier_untouched(tmp_path):
     fa, _fb = _arm_two(omd)
     omd.barrier_arrive("rc", "agA", "A", fence=fa)               # 부분 도착(대기중)
 
+    omd.resign()
     omd2 = _mk(tmp_path)                                         # 재기동
     st = omd2.barrier_status("rc")
     assert st["state"] == "ARMED" and st["arrived"] == 1 and st["parties"] == 2, st

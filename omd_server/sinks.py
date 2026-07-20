@@ -49,3 +49,21 @@ class MultiSink:
                 s.ship(envelopes)
             except Exception:  # noqa: BLE001 — 관측이 운행을 볼모로 잡지 않는다(fail-soft)
                 pass
+
+    def ship_strict(self, envelopes) -> None:
+        """Outbox ACK port: attempt every sink, then report any failure."""
+        if not self.sinks:
+            raise RuntimeError("strict notification fan-out has no configured sinks")
+        errors = []
+        for sink in self.sinks:
+            try:
+                ship = getattr(sink, "ship_strict", None)
+                if ship is None:
+                    ship = sink.ship
+                ship(envelopes)
+            except BaseException as exc:  # noqa: BLE001 — strict child effect.
+                errors.append(exc)
+        if errors:
+            raise RuntimeError(
+                f"{len(errors)} notification sink(s) failed"
+            ) from errors[0]

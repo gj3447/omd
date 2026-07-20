@@ -72,6 +72,12 @@ def test_bail_trace_arrives(tmp_path):
     omd.claim("omd-bail-demo", ["a/**"], "write")
     omd.bail("omd-bail-demo")
 
-    res = evaluate(backend, load_gate(os.path.join(GATES, "bail.yaml")))
+    deadline = time.monotonic() + 2.0
+    while True:
+        res = evaluate(backend, load_gate(os.path.join(GATES, "bail.yaml")))
+        if res["ok"] or time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
     assert res["ok"], res
     assert evidence_tier(res) == "arrived"
+    omd.close()

@@ -33,7 +33,12 @@ TASK_TRANSITIONS = [
     # D8/P0-6: split-phase connect 가 Phase B(락밖 merge)에서 실패하거나, 재기동 복구가
     # git상 미머지로 판정하면 CONNECTING→DONE 으로 되돌린다(connect 재호출 가능 = 재시도가능).
     {"trigger": "rollback", "source": "CONNECTING", "dest": "DONE"},
-    {"trigger": "abort", "source": "*", "dest": "ABORTED"},
+    # POISONED is a permanent terminal.  Preserve the historical broad abort
+    # surface for every other state without synthesizing POISONED→ABORTED.
+    {"trigger": "abort", "source": [
+        "PENDING", "BLOCKED", "READY", "CLAIMED", "IN_ORBIT",
+        "DONE", "CONNECTING", "MERGED", "ABORTED",
+    ], "dest": "ABORTED"},
     {"trigger": "requeue", "source": "ABORTED", "dest": "PENDING"},
     # GAP-1: 좀비회수/bail 이 무한 abort→requeue 로 flapping/poison 태스크를 영구 재순환시키는
     # 것을 막는 **영구 terminal**. per-task reclaims 카운터가 max_reclaims 를 초과하면 requeue

@@ -76,18 +76,24 @@ def drive_real_coordinator(work: dict[str, list[str]]) -> dict:
     omd = Coordinator(db_path=os.path.join(d, "omd.db"), events=Emitter(col), agent_ttl=None)
     for key, globs in work.items():
         omd.claim(key, globs, mode="write")
+    # Durable notification delivery is asynchronous; make the receipt boundary
+    # explicit so timer scheduling cannot undercount accepted work.
+    omd.flush_admission_outbox()
     granted = sum(1 for e in col.evs if e["event"] == "orbit_granted")
     pending = sum(1 for e in col.evs if e["event"] == "orbit_pending")
     fences = sorted(e["fence"] for e in col.evs if e["event"] == "orbit_granted")
     # 합성 overlap: 두 작업이 같은 서브트리(omd/spec/**) → 둘째는 직렬(pending)
     omd.claim("overlap-A", ["omd/spec/**"], mode="write")
     omd.claim("overlap-B", ["omd/spec/omd_concurrency_ooptdd.yaml"], mode="write")
+    omd.flush_admission_outbox()
     ov_pending = sum(1 for e in col.evs if e["event"] == "orbit_pending" and e["cid"] == "overlap-B")
-    return {
+    result = {
         "claimed": len(work), "granted": granted, "pending": pending,
         "unique_fences": len(set(fences)) == granted, "fences": fences,
         "synthetic_overlap_serialized": ov_pending >= 1,
     }
+    omd.close()
+    return result
 
 
 def receipt() -> dict:

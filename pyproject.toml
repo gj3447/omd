@@ -30,8 +30,10 @@ verify = "warn"     # 관측은 보고만(빌드 verdict를 뒤집지 않음)
 packages = ["omd_server"]
 
 [tool.pytest.ini_options]
-# benchmarks/ · scripts/ 는 top-level 툴링 디렉터리(패키지 설치 대상 아님).
-# 리포 루트를 sys.path 에 넣어 `pytest` 콘솔스크립트(cwd 미포함)와 `python -m pytest`(cwd 포함)
-# 양쪽에서 tests/test_scheduler_m0_harness.py 의 `from benchmarks...`/`from scripts...` import 가
-# 동작하게 한다 (M0 병합 회귀 봉합 — CI 는 `pytest` 콘솔스크립트로 실행).
+# benchmarks/ · scripts/ are repository tooling directories rather than
+# installed packages.  Keep both the pytest console script and `python -m
+# pytest` able to import their M0 harness helpers from the repository root.
 pythonpath = ["."]
+
+[tool.setuptools.package-data]
+omd_server = ["scheduler_admission_fsm.json"]

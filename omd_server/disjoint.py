@@ -42,6 +42,18 @@ def _norm(g: str) -> str:
     return g
 
 
+def glob_segments(g: str) -> tuple[str, ...]:
+    """Return the exact normalized segments used by the overlap oracle.
+
+    Candidate selection must share normalization with :func:`globs_overlap`;
+    otherwise a faster prefilter could silently disagree with the authority
+    oracle.  Keep this small public seam instead of copying ``_norm`` rules.
+    """
+    if not isinstance(g, str):
+        raise TypeError("glob must be a string")
+    return tuple(_norm(g).split("/"))
+
+
 def _seg_intersect(a: str, b: str) -> bool:
     """단일 세그먼트 두 glob 패턴(*,?,literal)이 공통 문자열을 갖는가."""
     if "[" in a or "[" in b:
@@ -87,7 +99,7 @@ def globs_overlap(g1: str, g2: str) -> bool:
     """두 glob이 공통 경로를 매칭할 수 있으면 True."""
     if g1 == g2:
         return True
-    return _path_intersect(tuple(_norm(g1).split("/")), tuple(_norm(g2).split("/")))
+    return _path_intersect(glob_segments(g1), glob_segments(g2))
 
 
 def sets_overlap(s1, s2) -> bool:
@@ -114,7 +126,7 @@ def _seg_match(pat: str, seg: str) -> bool:
 def path_matches_glob(glob: str, path: str) -> bool:
     """구체 경로 `path`가 glob `glob`에 매칭하나(정확). `**`=0+ 세그먼트, `*`/`?`/`[...]`=한
     세그먼트 내. write-set 감사용 — soundness: 와일드카드 없는 경로엔 false-positive 없음."""
-    G = tuple(_norm(glob).split("/"))
+    G = glob_segments(glob)
     P = tuple(path.strip().lstrip("./").split("/"))
 
     @lru_cache(None)

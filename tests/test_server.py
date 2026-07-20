@@ -1,117 +1,12 @@
 """FastMCP 서버 빌드 스모크 — fastmcp 설치 시 툴 스키마가 유효하게 구성되는지."""
 
+import json
 import sys
 import sqlite3
+import time
 from datetime import timedelta
-from types import SimpleNamespace
 
 import pytest
-
-
-def test_leader_heartbeat_loop_is_noop_without_singleton_enforcement():
-    anyio = pytest.importorskip("anyio")
-    pytest.importorskip("fastmcp")
-    from omd_server.server import _leader_heartbeat_loop
-
-    class _NonEnforcedCoordinator:
-        enforce_single_coordinator = False
-
-        def coordinator_heartbeat(self):
-            raise AssertionError("non-enforced coordinator has no leader lease")
-
-    anyio.run(_leader_heartbeat_loop, _NonEnforcedCoordinator())
-
-
-def test_leader_heartbeat_loop_stops_when_leadership_is_lost(monkeypatch):
-    anyio = pytest.importorskip("anyio")
-    pytest.importorskip("fastmcp")
-    from omd_server.core import CoordinatorConflict
-    from omd_server import server as server_module
-
-    calls = []
-
-    async def no_wait(_interval):
-        return None
-
-    def fenced_heartbeat():
-        calls.append("heartbeat")
-        raise CoordinatorConflict("lost leadership")
-
-    monkeypatch.setattr(server_module.anyio, "sleep", no_wait)
-    omd = SimpleNamespace(
-        enforce_single_coordinator=True,
-        leader_ttl=30.0,
-        coordinator_heartbeat=fenced_heartbeat,
-    )
-    anyio.run(server_module._leader_heartbeat_loop, omd)
-    assert calls == ["heartbeat"]
-
-
-def test_leader_heartbeat_loop_survives_transient_error_then_stops_on_conflict(monkeypatch):
-    """GAP-3: CoordinatorConflict 외의 예외(일시적 오류)가 루프를 *조용히 죽이지* 않는다 —
-    로그+백오프 후 재시도로 생존하고, 성공하면 연속-실패 카운터를 리셋한다. sweep 데몬 가드 미러."""
-    anyio = pytest.importorskip("anyio")
-    pytest.importorskip("fastmcp")
-    from omd_server.core import CoordinatorConflict
-    from omd_server import server as server_module
-
-    calls = []
-    # 2회 일시적 오류(생존해야) → 1회 성공(카운터 리셋) → 2회 일시적 오류 → takeover 로 typed 종결.
-    script = [RuntimeError("db busy"), RuntimeError("db busy"), None,
-              RuntimeError("db busy"), RuntimeError("db busy"),
-              CoordinatorConflict("lost leadership")]
-
-    async def no_wait(_interval):
-        return None
-
-    def scripted_heartbeat():
-        calls.append("hb")
-        step = script[len(calls) - 1]
-        if step is not None:
-            raise step
-
-    monkeypatch.setattr(server_module.anyio, "sleep", no_wait)
-    omd = SimpleNamespace(
-        enforce_single_coordinator=True,
-        leader_ttl=30.0,
-        coordinator_heartbeat=scripted_heartbeat,
-    )
-    # max=3 인데도 카운터 리셋 덕에 3 연속에 도달 못 함 → 전 스크립트 소진(takeover 에서 종결).
-    async def _drive():
-        await server_module._leader_heartbeat_loop(omd, max_consecutive_failures=3)
-
-    anyio.run(_drive)
-    assert len(calls) == len(script)   # 일시 오류 4회 생존 + 성공 리셋 후 conflict 에서 종결
-
-
-def test_leader_heartbeat_loop_exits_bounded_after_repeated_failures(monkeypatch):
-    """GAP-3: 연속 실패가 상한을 넘으면 typed 로 탈출 — 무한 에러 루프 금지(유계 stop)."""
-    anyio = pytest.importorskip("anyio")
-    pytest.importorskip("fastmcp")
-    from omd_server import server as server_module
-
-    calls = []
-
-    async def no_wait(_interval):
-        return None
-
-    def always_fails():
-        calls.append("hb")
-        raise RuntimeError("permanent programming error")
-
-    monkeypatch.setattr(server_module.anyio, "sleep", no_wait)
-    omd = SimpleNamespace(
-        enforce_single_coordinator=True,
-        leader_ttl=30.0,
-        coordinator_heartbeat=always_fails,
-    )
-
-    async def _drive():
-        await server_module._leader_heartbeat_loop(omd, max_consecutive_failures=3)
-
-    anyio.run(_drive)
-    # 정확히 상한 횟수만 시도하고 종료(무한루프 아님).
-    assert len(calls) == 3
 
 
 def test_coordinator_lifespan_resigns_only_when_singleton_enforced():
@@ -125,13 +20,24 @@ def test_coordinator_lifespan_resigns_only_when_singleton_enforced():
         def __init__(self, enforced):
             self.enforce_single_coordinator = enforced
             self.resign_calls = 0
+            self.calls = []
 
         def coordinator_heartbeat(self):
             return {"ok": True}
 
         def resign(self):
+            self.calls.append("resign")
             self.resign_calls += 1
             return {"ok": True}
+
+        def start_background_workers(self, *, sweep_interval, heartbeat):
+            self.calls.append(
+                ("start_background_workers", sweep_interval, heartbeat)
+            )
+            return {"ok": True}
+
+        def close(self):
+            self.calls.append("close")
 
     async def enter_and_exit(omd):
         async with _coordinator_lifespan(omd)(None) as state:
@@ -140,10 +46,283 @@ def test_coordinator_lifespan_resigns_only_when_singleton_enforced():
     non_enforced = _Coordinator(False)
     anyio.run(enter_and_exit, non_enforced)
     assert non_enforced.resign_calls == 0
+    assert non_enforced.calls == [
+        ("start_background_workers", None, False),
+        "close",
+    ]
 
     enforced = _Coordinator(True)
     anyio.run(enter_and_exit, enforced)
     assert enforced.resign_calls == 1
+    assert enforced.calls[0] == ("start_background_workers", None, True)
+    assert enforced.calls[-2:] == ["close", "resign"]
+
+    swept = _Coordinator(True)
+
+    async def enter_swept():
+        async with _coordinator_lifespan(swept, sweep_interval=0.25)(None):
+            assert swept.calls == [
+                ("start_background_workers", 0.25, True)
+            ]
+
+    anyio.run(enter_swept)
+    assert swept.calls[-2:] == ["close", "resign"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 1.0),
+        ("", 1.0),
+        ("  ", 1.0),
+        ("0", None),
+        ("0.0", None),
+        ("0.25", 0.25),
+        ("5", 5.0),
+    ],
+)
+def test_server_sweep_interval_contract(raw, expected):
+    from omd_server.server import _parse_server_sweep_interval
+
+    assert _parse_server_sweep_interval(raw) == expected
+
+
+def test_build_server_defers_background_workers_until_lifespan(tmp_path, monkeypatch):
+    pytest.importorskip("fastmcp")
+    from omd_server import server as server_module
+
+    created = []
+
+    class SpyCoordinator:
+        def __init__(self, *args, **kwargs):
+            created.append((args, kwargs))
+
+    class FakeMCP:
+        def __init__(self, *args, **kwargs):
+            self.lifespan = kwargs["lifespan"]
+
+        def tool(self):
+            return lambda function: function
+
+    monkeypatch.setattr(server_module, "Coordinator", SpyCoordinator)
+    monkeypatch.setattr(server_module, "FastMCP", FakeMCP)
+    server_module.build_server(str(tmp_path / "deferred.db"))
+    assert len(created) == 1
+    assert created[0][1]["sweep_interval"] is None
+    assert created[0][1]["autostart_background_workers"] is False
+
+
+def test_build_server_defers_pending_outbox_effect_until_lifespan(
+    tmp_path, monkeypatch
+):
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server import server as server_module
+    from omd_server.core import Coordinator
+
+    db = tmp_path / "deferred-outbox.db"
+    event_log = tmp_path / "events.jsonl"
+    seed = Coordinator(
+        str(db),
+        agent_ttl=None,
+        enforce_single_coordinator=False,
+        sweep_interval=None,
+        autostart_background_workers=False,
+    )
+    seed.claim("agent", ["src/**"], request_id="deferred-notification")
+    seed.close()
+
+    class FakeMCP:
+        def __init__(self, *args, **kwargs):
+            self.lifespan = kwargs["lifespan"]
+
+        def tool(self):
+            return lambda function: function
+
+    def outbox_state():
+        with sqlite3.connect(db) as conn:
+            return conn.execute(
+                "SELECT state FROM admission_outbox WHERE request_id=?",
+                ("deferred-notification",),
+            ).fetchone()[0]
+
+    monkeypatch.setenv("OMD_EVENT_LOG", str(event_log))
+    monkeypatch.setattr(server_module, "FastMCP", FakeMCP)
+    mcp = server_module.build_server(str(db))
+    time.sleep(0.10)
+    assert outbox_state() == "PENDING"
+    if event_log.exists():
+        assert "admission_notification/v1" not in event_log.read_text()
+
+    async def enter_lifespan():
+        async with mcp.lifespan(None):
+            with anyio.fail_after(2.0):
+                while outbox_state() != "DELIVERED":
+                    await anyio.sleep(0.01)
+
+    anyio.run(enter_lifespan)
+    assert outbox_state() == "DELIVERED"
+    events = [json.loads(line) for line in event_log.read_text().splitlines()]
+    assert any(
+        event.get("notification_schema") == "admission_notification/v1"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize("raw", ["-1", "nan", "inf", "-inf", "not-a-number"])
+def test_invalid_server_sweep_interval_fails_before_db_creation(
+    tmp_path, monkeypatch, raw
+):
+    pytest.importorskip("fastmcp")
+    from omd_server.server import build_server
+
+    db = tmp_path / "invalid-sweep.db"
+    monkeypatch.setenv("OMD_SWEEP_INTERVAL", raw)
+    with pytest.raises(ValueError, match="OMD_SWEEP_INTERVAL"):
+        build_server(str(db))
+    assert not db.exists()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 1024), ("", 1024), ("  ", 1024), ("0", 0), ("1", 1), ("4096", 4096)],
+)
+def test_server_admission_queue_capacity_contract(raw, expected):
+    from omd_server.server import _parse_admission_queue_capacity
+
+    assert _parse_admission_queue_capacity(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "1.5", "nan", "inf", "not-a-number"])
+def test_invalid_server_queue_capacity_fails_before_db_creation(
+    tmp_path, monkeypatch, raw
+):
+    pytest.importorskip("fastmcp")
+    from omd_server.server import build_server
+
+    db = tmp_path / "invalid-capacity.db"
+    monkeypatch.setenv("OMD_ADMISSION_QUEUE_CAPACITY", raw)
+    with pytest.raises(ValueError, match="OMD_ADMISSION_QUEUE_CAPACITY"):
+        build_server(str(db))
+    assert not db.exists()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 60.0), ("", 60.0), ("  ", 60.0), ("0.5", 0.5), ("120", 120.0)],
+)
+def test_server_admission_aging_quantum_contract(raw, expected):
+    from omd_server.server import _parse_admission_aging_quantum
+
+    assert _parse_admission_aging_quantum(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "not-a-number"])
+def test_invalid_server_aging_quantum_fails_before_db_creation(
+    tmp_path, monkeypatch, raw
+):
+    pytest.importorskip("fastmcp")
+    from omd_server.server import build_server
+
+    db = tmp_path / "invalid-aging-quantum.db"
+    monkeypatch.setenv("OMD_ADMISSION_AGING_QUANTUM_SECONDS", raw)
+    with pytest.raises(ValueError, match="OMD_ADMISSION_AGING_QUANTUM_SECONDS"):
+        build_server(str(db))
+    assert not db.exists()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 10), ("", 10), ("  ", 10), ("0", 0), ("25", 25)],
+)
+def test_server_admission_max_age_boost_contract(raw, expected):
+    from omd_server.server import _parse_admission_max_age_boost
+
+    assert _parse_admission_max_age_boost(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw", ["-1", "1.5", "nan", "inf", "not-a-number", str(1 << 63)]
+)
+def test_invalid_server_max_age_boost_fails_before_db_creation(
+    tmp_path, monkeypatch, raw
+):
+    pytest.importorskip("fastmcp")
+    from omd_server.server import build_server
+
+    db = tmp_path / "invalid-max-age-boost.db"
+    monkeypatch.setenv("OMD_ADMISSION_MAX_AGE_BOOST", raw)
+    with pytest.raises(ValueError, match="OMD_ADMISSION_MAX_AGE_BOOST"):
+        build_server(str(db))
+    assert not db.exists()
+
+
+def test_server_lifespan_sweep_delivers_idle_wait_deadline(tmp_path):
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server.core import Coordinator
+    from omd_server.server import _coordinator_lifespan
+
+    omd = Coordinator(
+        str(tmp_path / "idle-deadline.db"),
+        agent_ttl=None,
+        admission_wait_timeout=0.04,
+        enforce_single_coordinator=False,
+        sweep_interval=None,
+    )
+    omd.claim("holder", ["a/**"])
+    waiting = omd.claim("waiter", ["a/**"], request_id="idle-wait")
+
+    async def wait_for_timeout():
+        async with _coordinator_lifespan(omd, sweep_interval=0.01)(None):
+            with anyio.fail_after(2.0):
+                while omd.store.get_orbit(waiting["orbit_id"])["state"] == "PENDING":
+                    await anyio.sleep(0.01)
+
+    anyio.run(wait_for_timeout)
+    row = omd.store.get_orbit(waiting["orbit_id"])
+    assert row["state"] == "DENIED"
+    assert row["decision_type"] == "WAIT_TIMEOUT"
+    assert omd._sweep_thread is None
+
+
+def test_server_lifespan_keeps_enforced_lease_when_sweep_is_opted_out(tmp_path):
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server.core import Coordinator, CoordinatorConflict
+    from omd_server.server import _coordinator_lifespan
+
+    db = str(tmp_path / "heartbeat-only-lifespan.db")
+    omd = Coordinator(
+        db,
+        agent_ttl=None,
+        leader_ttl=0.06,
+        sweep_interval=None,
+        autostart_background_workers=False,
+    )
+
+    async def hold_lifespan():
+        async with _coordinator_lifespan(omd, sweep_interval=None)(None):
+            await anyio.sleep(0.10)
+            with pytest.raises(
+                CoordinatorConflict, match="another live coordinator"
+            ):
+                Coordinator(
+                    db,
+                    agent_ttl=None,
+                    coordinator_id="lifespan-takeover-probe",
+                    leader_ttl=0.06,
+                    sweep_interval=None,
+                )
+
+    anyio.run(hold_lifespan)
+    with Coordinator(
+        db,
+        agent_ttl=None,
+        coordinator_id="lifespan-next-owner",
+        sweep_interval=None,
+    ) as reopened:
+        assert reopened.leader_epoch == 2
 
 
 def test_begin_tool_exposes_and_forwards_liveness_ttl(tmp_path, monkeypatch):
@@ -169,6 +348,102 @@ def test_begin_tool_exposes_and_forwards_liveness_ttl(tmp_path, monkeypatch):
 
     anyio.run(inspect_and_call)
     assert observed["liveness_ttl"] == 90.0
+
+
+def test_cancel_wait_tool_exposes_and_forwards_authority_tuple(tmp_path, monkeypatch):
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server.core import Coordinator
+    from omd_server.server import build_server
+
+    mcp = build_server(str(tmp_path / "cancel-wait.db"))
+    observed = {}
+
+    def fake_cancel_wait(self, orbit_id, agent_id, request_generation, **kwargs):
+        observed.update(
+            orbit_id=orbit_id,
+            agent_id=agent_id,
+            request_generation=request_generation,
+            **kwargs,
+        )
+        return {"ok": True, "state": "CANCELLED"}
+
+    monkeypatch.setattr(Coordinator, "cancel_wait", fake_cancel_wait)
+
+    async def inspect_and_call():
+        tool = next(t for t in await mcp.list_tools() if t.name == "cancel_wait")
+        assert {"orbit_id", "agent", "request_generation", "bail_epoch", "request_id"} <= set(
+            tool.parameters["properties"]
+        )
+        assert {"orbit_id", "agent", "request_generation", "bail_epoch"} <= set(
+            tool.parameters["required"]
+        )
+        result = tool.fn(
+            orbit_id="orb-1",
+            agent="worker",
+            request_generation=4,
+            bail_epoch=2,
+            request_id="cancel-op",
+        )
+        assert result == {"ok": True, "state": "CANCELLED"}
+
+    anyio.run(inspect_and_call)
+    assert observed == {
+        "orbit_id": "orb-1",
+        "agent_id": "worker",
+        "request_generation": 4,
+        "bail_epoch": 2,
+        "request_id": "cancel-op",
+    }
+
+
+def test_rollover_claim_tool_requires_and_forwards_fenced_predecessor(
+    tmp_path, monkeypatch
+):
+    anyio = pytest.importorskip("anyio")
+    pytest.importorskip("fastmcp")
+    from omd_server.core import Coordinator
+    from omd_server.server import build_server
+
+    mcp = build_server(str(tmp_path / "rollover-claim.db"))
+    observed = {}
+
+    def fake_rollover(self, prior_orbit_id, agent_id, expected_generation, **kwargs):
+        observed.update(
+            prior_orbit_id=prior_orbit_id,
+            agent_id=agent_id,
+            expected_generation=expected_generation,
+            **kwargs,
+        )
+        return {"ok": True, "request_generation": expected_generation + 1}
+
+    monkeypatch.setattr(Coordinator, "rollover_claim", fake_rollover)
+
+    async def inspect_and_call():
+        tool = next(t for t in await mcp.list_tools() if t.name == "rollover_claim")
+        required = {
+            "prior_orbit_id", "agent", "expected_generation", "bail_epoch",
+            "request_id",
+        }
+        assert required <= set(tool.parameters["properties"])
+        assert required <= set(tool.parameters["required"])
+        result = tool.fn(
+            prior_orbit_id="orb-1",
+            agent="worker",
+            expected_generation=4,
+            bail_epoch=2,
+            request_id="rollover-op",
+        )
+        assert result == {"ok": True, "request_generation": 5}
+
+    anyio.run(inspect_and_call)
+    assert observed == {
+        "prior_orbit_id": "orb-1",
+        "agent_id": "worker",
+        "expected_generation": 4,
+        "bail_epoch": 2,
+        "request_id": "rollover-op",
+    }
 
 
 def test_server_builds(tmp_path):
@@ -202,7 +477,7 @@ def test_server_stdio_initializes_and_lists_tools(tmp_path):
                 assert init.serverInfo.name == "omd"
                 tools = await session.list_tools()
                 names = {tool.name for tool in tools.tools}
-                assert {"claim", "release", "status"} <= names
+                assert {"claim", "release", "cancel_wait", "status"} <= names
 
     anyio.run(run_smoke)
 
@@ -288,7 +563,10 @@ def test_server_stdio_does_not_take_singleton_leader(tmp_path):
 
     con = sqlite3.connect(db)
     raw = con.execute("SELECT value FROM meta WHERE key='leader_lease'").fetchone()
-    assert raw is None
+    # Fresh-schema migration briefly takes a fenced leader generation even in
+    # stdio mode, then immediately resigns before serving concurrent clients.
+    assert raw is not None
+    assert json.loads(raw[0])["last_heartbeat"] == 0
 
 
 def test_server_stdio_allows_concurrent_clients_on_same_db(tmp_path):

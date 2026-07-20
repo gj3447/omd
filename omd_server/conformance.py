@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -20,6 +21,39 @@ ROOT = Path(__file__).resolve().parent.parent
 def _src(root: Path, rel: str) -> str:
     p = root / rel
     return p.read_text(encoding="utf-8") if p.exists() else ""
+
+
+def _admission_contract_probe(root: Path) -> bool:
+    """Execute a real typed decision, reducer step, and legacy projection."""
+    script = r'''
+from omd_server.admission import ADMISSION_POLICY_VERSION
+from omd_server.admission_contract import bind_decision_id, project_legacy, step
+snapshot = "a" * 64
+context = {
+    "state": "REQUESTED", "repository_id": "repo", "request_id": "request",
+    "orbit_id": "orbit", "request_generation": 0, "owner_agent": "owner",
+    "bail_epoch": 0, "mode": "write", "pathspec_digest": "b" * 64,
+    "policy_version": ADMISSION_POLICY_VERSION,
+}
+payload = bind_decision_id("ADMISSION_GRANTED", {
+    **{key: value for key, value in context.items() if key != "state"},
+    "actor": "authority", "event_id": "event",
+    "authority_snapshot_hash": snapshot, "fence": 1, "lease_deadline": 2.0,
+    "base_priority": 0, "effective_priority": 0, "observed_at": 1.0,
+})
+result = step(context, "ADMISSION_GRANTED", payload,
+              trusted_authority_snapshot_hash=snapshot)
+assert result.accepted and result.context["state"] == "HELD"
+assert project_legacy(result.context["state"], result.context).state == "HELD"
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    return completed.returncode == 0
 
 
 @dataclass
@@ -68,7 +102,7 @@ CHECKS = [
           and "GitMergeConflict" in _src(r, "omd_server/gitio.py")
           and "def enable_rerere" in _src(r, "omd_server/gitio.py")),
     # ---- 알려진 잔여 GAP(must=False, 정직히 리포트) ----
-    Check("periodic_sweep", "주기적 백그라운드 sweep(§D3/D4: opt-in sweep_interval, 유휴 spike 해소 + clean join)", True,
+    Check("periodic_sweep", "주기적 백그라운드 sweep(§D3/D4: embedded default-on, 명시 opt-out, heartbeat + terminal clean join)", True,
           lambda r: "def _periodic_sweep_loop" in _src(r, "omd_server/core.py")
           and "def close" in _src(r, "omd_server/core.py")
           and "sweep_interval" in _src(r, "omd_server/core.py")),
@@ -83,6 +117,9 @@ CHECKS = [
           lambda r: "def _recover" in _src(r, "omd_server/core.py")
           and (r / "tests" / "test_git_splitphase_stateful.py").exists()
           and (r / "tests" / "test_stateful_persistent.py").exists()),
+    Check("admission_payload_contract",
+          "M1 typed admission identity guard + semantic reducer + legacy projection",
+          True, _admission_contract_probe),
     Check("durable_engine", "durable 실행 엔진(DBOS 체크포인트/resume) — 의도적 미채택(부채 아님)", False,
           lambda r: "dbos" in _src(r, "omd_server/core.py").lower(),
           "의도적 미채택 = 설계 결정(SERVER_SPEC §183 / CONCURRENCY §805), 미완성 부채 아님. "

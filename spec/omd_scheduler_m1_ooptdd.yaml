@@ -1,0 +1,62 @@
+# M1 live behavior contract.  The gate itself is the frozen M0-preregistered
+# gates/scheduler_fairness.yaml; this spec binds the real producer and negative.
+name: omd-scheduler-m1-fair-admission-ooptdd
+
+methodology:
+  name: OOPTDD_methodology_v1
+  enforce: true
+
+target:
+  mode: in_process
+  callable: benchmarks.omd_scheduler_m1:run_ooptdd
+  backend: memory
+  root: .
+
+contracts:
+  - id: MC-ADMISSION-QUEUED
+    kind: message_contract
+    description: LeaseAuthority reports the durable PENDING admission outcome.
+    role: LeaseAuthority
+    sender: LeaseAuthority
+    receiver: OrbitRequest
+    message: orbit_pending
+    status: accepted
+    source_req: REQ-M1-NO-OVERTAKING
+    integration_backstop: REQ-M1-NO-OVERTAKING
+    is_domain_message: true
+  - id: INV-M1-NO-OVERTAKING
+    kind: state_invariant
+    description: >
+      A conflicting lower-ranked request cannot enter HELD while an older or
+      higher-ranked conflicting PENDING predecessor remains live.
+    status: accepted
+    source_req: REQ-M1-NO-OVERTAKING
+    invariant: >
+      not (higher_ranked_conflicting_predecessor_pending and
+      candidate_state == HELD)
+
+requirements:
+  - id: REQ-M1-NO-OVERTAKING
+    kind: feature
+    description: >
+      A later narrow claimant emits PENDING while an older higher-ranked broad
+      conflicting reservation remains PENDING.
+    covers: [MC-ADMISSION-QUEUED, INV-M1-NO-OVERTAKING]
+    gate:
+      - {event: orbit_requested, op: "==", count: 1}
+      - {event: orbit_pending, op: "==", count: 1}
+      - {must_order: [orbit_requested, orbit_pending]}
+    longinus:
+      kg_anchor: ref_site:omd:coordinator:claim:orbit_pending
+      source: omd_server/core.py
+      symbol: claim
+      must_emit: orbit_pending
+
+frozen_gate:
+  path: gates/scheduler_fairness.yaml
+  sha256: 7e249d738e941c2a56e6d8846ddc2d5b6489c95a0238d5471301c63bea19c4d1
+  mutation_rule: The implementation must satisfy this unchanged gate.
+
+negative_control:
+  mechanism: test-only replacement of the pure pending-predecessor decision input
+  expected: Same frozen gate is RED because the newer claimant is HELD.

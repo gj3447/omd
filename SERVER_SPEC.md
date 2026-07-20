@@ -71,7 +71,7 @@ PENDING orbit → 그 경로를 HELD 중인 orbit 들로 엣지. 사이클 = 데
                         ▼                     ├── release ──► RELEASED
                      PENDING ──grant(충돌해소)─┘                │
                         │                     └── expire(TTL) ─► EXPIRED
-                  --no-wait │ or queue-timeout                  │
+       cancel_wait/--no-wait │ or queue-timeout                 │
                         ▼                          (RELEASED/EXPIRED 시
                      DENIED                         PENDING 큐 재평가)
 ```
@@ -82,19 +82,25 @@ PENDING orbit → 그 경로를 HELD 중인 orbit 들로 엣지. 사이클 = 데
 | `HELD` | 궤도 점유 중(활성 lease) |
 | `RELEASED` | 정상 반납 |
 | `EXPIRED` | TTL 만료 → 자동 회수 |
-| `DENIED` | `--no-wait`거나 큐 타임아웃 |
+| `DENIED` | `--no-wait`, 큐 타임아웃, 또는 semantic `CANCELLED`의 legacy projection |
 
 | 이벤트 | 전이 | Guard | Side-effect |
 |---|---|---|---|
 | `request` | new→HELD | **disjoint(pathspec, mode) vs 모든 HELD** | expires_at=now+ttl |
 | `request` | new→PENDING | 충돌 존재 & wait 허용 | wait-for 엣지 추가; **사이클이면 DENIED** |
 | `grant` | PENDING→HELD | 충돌 해소됨(선행 release/expire) | FIFO+우선순위로 승격 |
+| `cancel_wait` | PENDING→DENIED | owner + request generation + bail epoch 일치 | semantic CANCELLED 기록 + 큐 재평가 |
+| `rollover_claim` | 종단 predecessor 보존 + 새 N+1 머신 생성 | 최신 RELEASED/LEASE_EXPIRED/CANCEL/WAIT_TIMEOUT + owner/generation/current bail epoch 일치 | immutable claim intent로 새 admission 수행 |
 | `renew` | HELD→HELD | 소유 agent 일치 | expires_at 갱신 |
 | `release` | HELD→RELEASED | 소유 agent 일치 | **PENDING 큐 재평가** |
 | `expire` | HELD→EXPIRED | now ≥ expires_at & renew 없음 | 회수 + 큐 재평가 + agent ZOMBIE 의심 |
 
 > **disjoint 규칙**: write↔write 겹침 = 충돌. write↔read 겹침 = 충돌. read↔read = 공존 OK.
 > 겹침 = glob 교집합(§4). 이 Guard가 SINGULON 불변식의 실집행 지점.
+
+`rollover_claim`은 위 종단 상태를 다시 여는 전이가 아니라 새로운 OrbitRequest를 시작하는
+별도 명령이다. owner-reclaim/policy denial/row-less overload는 이 경로의 predecessor가 아니며,
+동일 predecessor에서는 latest-generation fence가 successor를 최대 한 번만 만든다.
 
 ### 2.2 Task FSM
 

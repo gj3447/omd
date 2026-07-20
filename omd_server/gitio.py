@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -112,12 +113,41 @@ class GitRepo:
 
     def __init__(self, root: str):
         self.root = str(Path(root).resolve())
+        self._inherited_fds = threading.local()
+
+    @contextmanager
+    def inherit_effect_lock(self, fd: int | Sequence[int] | None):
+        """Keep the coordinator effect lock alive in spawned Git/check children.
+
+        A coordinator can die while ``subprocess.run`` is waiting.  Without an
+        inherited descriptor, another process could acquire the advisory lock
+        and start recovery while the orphaned Git child is still mutating the
+        integration worktree.  ``pass_fds`` keeps the fence until each spawned
+        external-effect child has closed or exited.
+        """
+        previous = getattr(self._inherited_fds, "value", ())
+        if fd is None:
+            inherited = ()
+        elif isinstance(fd, int):
+            inherited = (fd,)
+        else:
+            inherited = tuple(fd)
+        current = (*previous, *inherited)
+        self._inherited_fds.value = current
+        try:
+            yield
+        finally:
+            self._inherited_fds.value = previous
+
+    def _effect_pass_fds(self) -> tuple[int, ...]:
+        return tuple(dict.fromkeys(getattr(self._inherited_fds, "value", ())))
 
     def _git(self, *args, cwd=None, timeout=None) -> str:
         try:
             r = subprocess.run(
                 ["git", *args], cwd=cwd or self.root,
                 capture_output=True, text=True, timeout=timeout,
+                pass_fds=self._effect_pass_fds(),
             )
         except subprocess.TimeoutExpired:
             raise GitTimeout(f"git {' '.join(args)} → timeout after {timeout}s")
@@ -127,6 +157,27 @@ class GitRepo:
 
     def current_branch(self, cwd=None) -> str:
         return self._git("rev-parse", "--abbrev-ref", "HEAD", cwd=cwd)
+
+    def common_dir(self) -> str:
+        """Return the canonical repository authority shared by all worktrees.
+
+        ``realpath(root)`` is insufficient because a main worktree and one of
+        its linked worktrees have different roots while sharing refs, objects,
+        and integration-branch mutation authority.  Split-effect locks must be
+        keyed by Git's common directory so those aliases cannot race.
+        """
+        try:
+            value = self._git(
+                "rev-parse", "--path-format=absolute", "--git-common-dir"
+            )
+        except GitError:
+            # Compatibility with Git versions predating --path-format.  Git
+            # documents the legacy result as relative to the current worktree.
+            value = self._git("rev-parse", "--git-common-dir")
+        path = Path(value)
+        if not path.is_absolute():
+            path = Path(self.root, path)
+        return str(path.resolve())
 
     def add_worktree(self, branch: str, path: str, base: str = "HEAD") -> str:
         """base에서 새 branch를 만들어 path에 linked worktree로 체크아웃."""
@@ -173,10 +224,12 @@ class GitRepo:
         self._git(*self._IDENT, "commit", "-m", msg, cwd=worktree)
         return self._git("rev-parse", "HEAD", cwd=worktree)
 
-    def branch_tip(self, branch: str) -> str | None:
+    def branch_tip(self, branch: str, *, strict: bool = False) -> str | None:
         try:
             return self._git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
         except GitError:
+            if strict:
+                raise
             return None
 
     def changed_paths(self, branch: str, base: str) -> list[str]:
@@ -192,12 +245,22 @@ class GitRepo:
                         "--no-renames", f"{base}...{branch}")
         return [ln for ln in out.splitlines() if ln.strip()]
 
+    def assert_ancestor(self, ancestor: str, descendant: str, *, cwd=None) -> None:
+        """Fail closed unless ``ancestor`` is contained in ``descendant``.
+
+        Connect trailers prove that an attempt wrote an integration commit;
+        this separate graph proof binds that commit to the exact candidate SHA
+        audited in Phase A.  Exit status 1 (not an ancestor) and repository
+        read errors are both unsafe here, so both remain :class:`GitError`.
+        """
+        self._git("merge-base", "--is-ancestor", ancestor, descendant, cwd=cwd)
+
     def merge_into(self, integration_worktree: str, integration_branch: str,
                    branch: str, msg: str, *, timeout: float | None = None,
                    check_argv: Sequence[str] | None = None,
                    check_timeout: float = 300.0,
                    check_output_limit: int = 16_384) -> str:
-        """전용 통합 worktree에서 integration_branch에 branch를 --no-ff merge(§D11).
+        """전용 통합 worktree에서 integration_branch에 branch/ref를 --no-ff merge(§D11).
         Phase B 본체 — **락 밖**에서 호출된다. 충돌/타임아웃이면 `merge --abort` 후 raise.
         msg에 고유 trailer를 넣어 두면 복구가 통합 브랜치에서 머지 여부를 trailer-probe 한다."""
         if check_argv is not None:
@@ -372,8 +435,7 @@ class GitRepo:
             raise ValueError("check_output_limit must be positive")
         return tuple(check_argv)
 
-    @staticmethod
-    def _run_operator_check(argv: Sequence[str], cwd: str, *, timeout: float,
+    def _run_operator_check(self, argv: Sequence[str], cwd: str, *, timeout: float,
                             output_limit: int) -> tuple[int, str, str, bool]:
         """argv를 shell=False로 실행하고 각 stream을 bounded buffer로 계속 drain한다."""
 
@@ -402,6 +464,7 @@ class GitRepo:
         process = subprocess.Popen(
             list(argv), cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             shell=False, start_new_session=True,
+            pass_fds=self._effect_pass_fds(),
         )
         stdout_buf, stderr_buf = _Bounded(output_limit), _Bounded(output_limit)
 
@@ -555,8 +618,18 @@ class GitRepo:
         wt = str(Path(integration_worktree).resolve())
         self._git("push", remote, integration_branch, cwd=wt, timeout=timeout)
 
+    def commit_empty_integration(self, integration_worktree: str, msg: str) -> str:
+        """Record an exact effect trailer when Git reports already-up-to-date.
+
+        A no-op merge has no merge commit, so crash recovery otherwise cannot
+        distinguish this attempt from an unrelated integration HEAD.
+        """
+        wt = str(Path(integration_worktree).resolve())
+        self._git(*self._IDENT, "commit", "--allow-empty", "-m", msg, cwd=wt)
+        return self._git("rev-parse", "HEAD", cwd=wt)
+
     def branch_in_integration(self, integration_worktree: str, integration_branch: str,
-                              trailer: str) -> str | None:
+                              trailer: str, *, strict: bool = False) -> str | None:
         """통합 브랜치에 주어진 trailer를 가진 머지 커밋이 있으면 그 sha를 반환(없으면 None).
         git=병합의 진실(§D8): `--is-ancestor`가 아니라 trailer-probe로 '이 응결이 실제 일어났나'를 본다.
         trailer는 줄 단위로 정확히 일치(`^…$`)해야 — 'A'가 'AB' 같은 prefix에 오탐되지 않게."""
@@ -567,6 +640,8 @@ class GitRepo:
             out = self._git("log", integration_branch, f"--grep={pat}", "-E",
                             "--format=%H", "-n", "1", cwd=wt)
         except GitError:
+            if strict:
+                raise
             return None
         return out or None
 

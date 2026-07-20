@@ -7,9 +7,15 @@
 (POISONED, 영구 terminal). sweep/next 가 절대 다시 집지 않는다(무한루프 0). typed 종단 + 감사 이벤트.
 """
 
+import json
+import sqlite3
 import time
 
-from omd_server import Coordinator, Emitter
+import pytest
+from transitions.core import MachineError
+
+from omd_server import Coordinator, Emitter, fsm
+from omd_server.store import SCHEMA_VERSION
 
 
 class _Capture:
@@ -130,3 +136,99 @@ def test_involuntary_zombie_reclaim_also_poisons(tmp_path):
     assert out["reclaimed"] == ["ag1"], out     # 회수된 agent id 목록
     # 자발 bail 과 동일 루틴(_reclaim_agent_inline)이라 상한 적용 → 태스크 POISONED.
     assert omd.store.get_task("T")["state"] == "POISONED"
+
+
+def test_reclaim_budget_survives_coordinator_restart(tmp_path):
+    db = str(tmp_path / "omd.db")
+    first = Coordinator(db_path=db, max_reclaims=1, sweep_interval=None)
+    first.declare("T", writes=["a/**"])
+    _run_one_cycle(first, "T", "ag1")
+    assert first.store.get_task("T")["reclaims"] == 1
+    first.close()
+    first.resign()
+
+    reopened = Coordinator(db_path=db, max_reclaims=1, sweep_interval=None)
+    try:
+        assert reopened.store.get_task("T")["reclaims"] == 1
+        result = _run_one_cycle(reopened, "T", "ag2")
+        assert result["tasks"] == [] and result["poisoned"] == ["T"]
+    finally:
+        reopened.close()
+        reopened.resign()
+
+
+def test_previous_outbox_schema_migrates_reclaims_column(tmp_path):
+    db = str(tmp_path / "omd.db")
+    first = Coordinator(db_path=db, sweep_interval=None)
+    first.declare("T", writes=["a/**"])
+    first.close()
+    first.resign()
+
+    raw = sqlite3.connect(db)
+    raw.execute("ALTER TABLE tasks DROP COLUMN reclaims")
+    raw.execute(
+        "UPDATE meta SET value=? WHERE key='schema_version'",
+        ("omd/2026-07-16-m1-outbox",),
+    )
+    raw.commit()
+    raw.close()
+
+    migrated = Coordinator(db_path=db, sweep_interval=None)
+    try:
+        columns = {
+            row[1] for row in migrated.store.db.execute("PRAGMA table_info(tasks)")
+        }
+        assert "reclaims" in columns
+        assert migrated.store.get_task("T")["reclaims"] == 0
+        assert migrated.store.get_meta("schema_version") == SCHEMA_VERSION
+    finally:
+        migrated.close()
+        migrated.resign()
+
+
+def test_poisoned_is_a_permanent_fsm_terminal():
+    with pytest.raises(MachineError):
+        fsm.advance("task", "POISONED", "abort")
+    with pytest.raises(MachineError):
+        fsm.advance("task", "POISONED", "requeue")
+
+
+def test_poisoned_barrier_party_is_dead_even_with_stale_held_orbit(tmp_path):
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"), sweep_interval=None)
+    omd.declare("T", writes=["a/**"])
+    omd.next_task("ag")
+    claim = omd.claim("ag", ["a/**"], task_id="T")
+    omd.start("T", "ag")
+    omd.store.set_task("T", state="POISONED")
+
+    party = {
+        "task_id": "T", "agent_id": "ag", "arrived": 1,
+        "arrive_fence": claim["fence"],
+    }
+    assert omd.store.get_orbit(claim["orbit_id"])["state"] == "HELD"
+    assert omd._party_alive(party) is False
+
+
+def test_poison_receipt_and_outbox_preserve_typed_counts_and_exact_replay(tmp_path):
+    omd = Coordinator(
+        db_path=str(tmp_path / "omd.db"), max_reclaims=0,
+        sweep_interval=None, autostart_background_workers=False,
+    )
+    omd.declare("T", writes=["a/**"])
+    omd.next_task("ag")
+    omd.claim("ag", ["a/**"], task_id="T", request_id="claim-T")
+    omd.start("T", "ag")
+
+    first = omd.bail("ag", request_id="bail-ag")
+    replay = omd.bail("ag", request_id="bail-ag")
+    assert replay == {**first, "replayed": True}
+    assert first["tasks"] == [] and first["poisoned"] == ["T"]
+
+    row = next(
+        row for row in omd.store.admission_outbox_rows()
+        if row["transition_kind"] == "AGENT_RECLAIMED"
+    )
+    payload = json.loads(row["payload"])
+    assert payload["tasks"] == 0
+    assert payload["poisoned"] == 1
+    assert payload["poisoned_task_ids"] == ["T"]

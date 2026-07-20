@@ -26,12 +26,14 @@ def test_claim_trace_arrives_green(tmp_path):
 
     r = omd.claim(CID, ["src/a/**"], "write")
     assert r["state"] == "HELD" and r["fence"] == 1          # 자기보고(거짓일 수 있음)
+    omd.flush_admission_outbox()
 
     res = evaluate(backend, load_gate(os.path.join(GATES, "claim.yaml")))
     assert res["ok"], res                                     # 진실: 이벤트가 도착했다
     assert res["scope"]["asserts_anything"]                   # 비-vacuous
     assert "value-pinned" in res["scope"]["by_strength"]      # fence 핀 = 존재-only 아님
     assert evidence_tier(res) == "arrived"                    # 사다리: 실제 증거 관측
+    omd.close()
 
 
 def test_claim_gate_red_on_silent_loss(tmp_path):
@@ -46,5 +48,7 @@ def test_claim_gate_red_on_silent_loss(tmp_path):
 
     r = omd.claim(CID, ["src/a/**"], "write")
     assert r["state"] == "HELD"                                # 자기보고는 여전히 "성공"
+    omd.flush_admission_outbox()
     res = evaluate(backend, load_gate(os.path.join(GATES, "claim.yaml")))
     assert not res["ok"]                                       # store는 비어있다 → RED
+    omd.close()

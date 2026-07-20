@@ -74,6 +74,7 @@ def run_session(n_agents: int = 4) -> dict:
     developed = list(mods)
 
     # ── 2) 겹치는 5번째 에이전트 — 이 시점 svc_a 궤도는 아직 HELD(connect 전) → OMD 가 직렬화(PENDING) ──
+    omd.declare("overlap", writes=[f"{mods[0]}/impl.py"])
     overlap = omd.claim("ag-overlap", [f"{mods[0]}/impl.py"], task_id="overlap")
 
     # ── 3) N 에이전트가 *동시* connect → 실 git merge, merge_token 직렬화 ──
@@ -105,9 +106,12 @@ def run_session(n_agents: int = 4) -> dict:
     log = subprocess.run(["git", "log", "--oneline", "main"], cwd=str(repo),
                          capture_output=True, text=True).stdout
     merge_commits = log.count("CLOUD CONNECT")
+    # Finish the asynchronous durable notification stream before reading LTDD
+    # counters or handing the coordinator lifecycle back to the caller.
+    omd.flush_admission_outbox()
     ev = lambda name: sum(1 for e in col.evs if e["event"] == name)
 
-    return {
+    result = {
         "thesis": "실 git 멀티에이전트 병렬-dev — 입체 write-set ⇒ 무충돌 머지(SINGULON Δ분열=0)",
         "agents": n_agents,
         "all_merged": all(r.get("state") == "MERGED" for r in results.values()),
@@ -124,6 +128,8 @@ def run_session(n_agents: int = 4) -> dict:
         "total_events": len(col.evs),
         "repo": str(repo),
     }
+    omd.close()
+    return result
 
 
 if __name__ == "__main__":

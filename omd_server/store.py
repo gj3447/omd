@@ -18,6 +18,20 @@ import time
 import uuid
 from contextlib import contextmanager
 
+from .admission import LEGACY_ADMISSION_POLICY_VERSION, pathspec_digest
+
+SCHEMA_VERSION = "omd/2026-07-16-m1-outbox-reclaims"
+MIGRATABLE_SCHEMA_VERSIONS = frozenset({
+    None,
+    "omd/2026-07-15-m1",
+    "omd/2026-07-16-m1-aging",
+    "omd/2026-07-16-m1-outbox",
+})
+
+
+class UnsupportedSchemaVersion(RuntimeError):
+    """The DB declares a schema generation this binary cannot migrate safely."""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS orbits (
@@ -31,7 +45,28 @@ CREATE TABLE IF NOT EXISTS orbits (
   merging INTEGER NOT NULL DEFAULT 0,  -- 1=connect Phase B 진행중 pin(sweep/reclaim skip, §E)
   merge_deadline REAL,                 -- pin 유계(§E): 이 시각 넘으면 abort 대상
   merge_started_mono REAL,             -- merge_token crash-safe(§D11): dangling merge abort 판정
+  operation_id TEXT,                   -- split effect attempt bound to a merge_token
+  owner_instance TEXT,                 -- process generation that owns the effect
+  owner_generation INTEGER,            -- monotonic task-local connect generation
   intent_key TEXT,                     -- 증분5(§D9): claim 자연 멱등 — hash(agent,paths,mode,task)
+  -- M1 fair admission: created_at은 migration 입력일 뿐 ordering authority가 아니다.
+  queue_seq INTEGER,                    -- 전역 단조 입장 티켓(priority DESC, queue_seq ASC)
+  requested_ttl REAL,                   -- PENDING 뒤 promotion 때 원 요청 lease TTL 복원
+  policy_version TEXT,                  -- 이 요청을 정렬/판정한 admission policy
+  pathspec_digest TEXT,                 -- 정규화 pathspec의 canonical SHA-256
+  request_id TEXT,                      -- transport/admission identity(NULL=서버 내부 요청)
+  request_generation INTEGER NOT NULL DEFAULT 0,
+  bail_epoch INTEGER NOT NULL DEFAULT 0,
+  authority_snapshot_hash TEXT,         -- 판정이 읽은 authority facts digest
+  decision_id TEXT,                     -- canonical admission decision digest; lifecycle-only event면 NULL
+  decision_type TEXT,                   -- 마지막 reducer event(ADMISSION_/PROMOTION_ 또는 lifecycle)
+  decision_schema TEXT,                 -- canonical decision envelope schema
+  decision_observed_at REAL,            -- 마지막 admission/promotion 판정의 단일 clock
+  decision_effective_priority INTEGER,  -- 그 clock에서 계산된 effective rank evidence
+  blocker_ids TEXT NOT NULL DEFAULT '[]',
+  enqueued_at REAL,
+  wait_deadline REAL,
+  terminal_reason TEXT,
   -- 증분9(§D12 read-set 코히런스): read-orbit 이 어느 통합 generation 위에서 분기했는지(read 시점
   -- integration_gen). 응결이 이 read-궤도와 겹치는 경로를 통합에 추가/변경하면(read_gen < 현 gen
   -- 이면서 겹침) consumer 는 옛 base 위에 빌드 중 → stale=1 로 표시 → connect 전 rebase/재독 강제.
@@ -52,13 +87,23 @@ CREATE TABLE IF NOT EXISTS tasks (
   connect_intent_at REAL,       -- intent 영속 타임스탬프(복구가 CONNECTING 식별)
   branch_tip_sha TEXT,          -- merge 직전 task 브랜치 tip(복구 trailer-probe 보조)
   integration_base_sha TEXT,    -- Q11 후보 merge 전 통합 HEAD(rollback proof/recovery 기준)
+  connect_attempt_id TEXT,      -- exact external-effect generation (never reused)
+  connect_owner_instance TEXT,  -- Coordinator process instance, not PID/coordinator label
+  connect_owner_generation INTEGER NOT NULL DEFAULT 0,
+  connect_token_id TEXT,        -- exact merge_token for this attempt
+  connect_request_id TEXT,      -- exact split idempotency envelope, if public connect
+  connect_arg_hash TEXT,
+  connect_repo_bound INTEGER NOT NULL DEFAULT 0,
   merge_sha TEXT,               -- 응결된 merge 커밋(MERGED 증거, P0-6: release 전에 기록)
   merged_at REAL,
   -- 증분9(§D12): consumer 가 자기 read-set 을 마지막으로 통합과 동기화한 generation. claim(read)
   -- /read_refresh 시 현 integration_gen 으로 박힌다. connect 때 이 gen 이후의 merge 가 이 task 의
   -- 선언 reads 와 겹치면 = 유령 읽기(옛 base 위 빌드) → connect 거부. read-궤도 release 후에도
   -- 유지되므로(궤도 생명과 분리) read↔write 배타성을 안 깨고 코히런스를 추적한다.
-  read_synced_gen INTEGER
+  read_synced_gen INTEGER,
+  -- Bounded zombie recovery: durable across coordinator restart so a poison
+  -- task cannot reset its retry budget by reopening the database.
+  reclaims INTEGER NOT NULL DEFAULT 0
 );
 -- 증분9(§D12): 응결 로그 — gen 마다 통합에 추가/변경된 write-globs. consumer connect 가
 -- read_synced_gen 이후 merge 들 중 자기 reads 와 겹치는 게 있는지 본다(유령 읽기 판정).
@@ -116,8 +161,51 @@ CREATE INDEX IF NOT EXISTS idx_sem_waiters_sem ON sem_waiters(sem_id, state);
 -- 두 번째 효과를 일으키지 않게 한다(claim 누수·이중 merge·이중 release 차단).
 CREATE TABLE IF NOT EXISTS idempotency (
   request_id TEXT PRIMARY KEY, agent_id TEXT, verb TEXT, arg_hash TEXT,
-  status TEXT NOT NULL, response TEXT, created_at REAL, completed_at REAL
+  args_json TEXT, status TEXT NOT NULL, response TEXT,
+  created_at REAL, completed_at REAL,
+  operation_id TEXT, owner_instance TEXT, owner_generation INTEGER
 );
+-- M1d admission notification outbox.  The authority transition and this row
+-- commit together; delivery happens only after commit and is at-least-once.
+-- Stable event_id lets consumers deduplicate a crash between ship and ACK.
+CREATE TABLE IF NOT EXISTS admission_outbox (
+  outbox_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL UNIQUE,
+  effect_key TEXT NOT NULL UNIQUE,
+  schema_version TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  request_generation INTEGER NOT NULL,
+  orbit_id TEXT NOT NULL,
+  transition_kind TEXT NOT NULL,
+  correlation_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'PENDING'
+    CHECK(state IN ('PENDING','DELIVERING','DELIVERED')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  available_at REAL NOT NULL,
+  claimed_by TEXT,
+  claim_token TEXT,
+  claim_deadline REAL,
+  created_at REAL NOT NULL,
+  delivered_at REAL,
+  last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_admission_outbox_delivery
+  ON admission_outbox(state, available_at, outbox_seq);
+-- Cross-stream causal barriers.  An auxiliary coordination fact (for example
+-- AGENT_RECLAIMED) is not claimable until every authority transition it
+-- summarizes has been delivered.  Keep this separate from per-request FIFO:
+-- unrelated poisoned streams still make progress unless they are an explicit
+-- predecessor of the summary fact.
+CREATE TABLE IF NOT EXISTS admission_outbox_dependencies (
+  event_id TEXT NOT NULL,
+  predecessor_event_id TEXT NOT NULL,
+  PRIMARY KEY(event_id, predecessor_event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_admission_outbox_dependencies_predecessor
+  ON admission_outbox_dependencies(predecessor_event_id, event_id);
 -- 증분8(§D5): 응결 랑데부 배리어. 세대(generation) 스탬프 + BROKEN 종단. 멤버십은 agent 수가
 -- 아니라 **task 집합**(reclaim 으로 task 가 requeue 되면 N 재계산). 참가자 사망(도착 전/후)·
 -- 타임아웃 → break → 도착해 있던 전원이 BROKEN 으로 기상(영구 hang 0).
@@ -147,15 +235,48 @@ _MIGRATIONS = [
     ("orbits", "merging", "INTEGER NOT NULL DEFAULT 0"),
     ("orbits", "merge_deadline", "REAL"),
     ("orbits", "merge_started_mono", "REAL"),
+    ("orbits", "operation_id", "TEXT"),
+    ("orbits", "owner_instance", "TEXT"),
+    ("orbits", "owner_generation", "INTEGER"),
     ("tasks", "connect_fence", "INTEGER"),
     ("tasks", "connect_intent_at", "REAL"),
     ("tasks", "branch_tip_sha", "TEXT"),
     ("tasks", "integration_base_sha", "TEXT"),
     ("tasks", "merge_sha", "TEXT"),
     ("tasks", "merged_at", "REAL"),
+    ("tasks", "connect_attempt_id", "TEXT"),
+    ("tasks", "connect_owner_instance", "TEXT"),
+    ("tasks", "connect_owner_generation", "INTEGER NOT NULL DEFAULT 0"),
+    ("tasks", "connect_token_id", "TEXT"),
+    ("tasks", "connect_request_id", "TEXT"),
+    ("tasks", "connect_arg_hash", "TEXT"),
+    ("tasks", "connect_repo_bound", "INTEGER NOT NULL DEFAULT 0"),
     # 증분5(§D6/§D9)
     ("agents", "bail_epoch", "INTEGER NOT NULL DEFAULT 0"),
     ("orbits", "intent_key", "TEXT"),
+    # M1 fair admission.  queue_seq backfill/index creation is completed below while the
+    # migration transaction still holds BEGIN IMMEDIATE.
+    ("orbits", "queue_seq", "INTEGER"),
+    ("orbits", "requested_ttl", "REAL"),
+    ("orbits", "policy_version", "TEXT"),
+    ("orbits", "pathspec_digest", "TEXT"),
+    ("orbits", "request_id", "TEXT"),
+    ("orbits", "request_generation", "INTEGER NOT NULL DEFAULT 0"),
+    ("orbits", "bail_epoch", "INTEGER NOT NULL DEFAULT 0"),
+    ("orbits", "authority_snapshot_hash", "TEXT"),
+    ("orbits", "decision_id", "TEXT"),
+    ("orbits", "decision_type", "TEXT"),
+    ("orbits", "decision_schema", "TEXT"),
+    ("orbits", "decision_observed_at", "REAL"),
+    ("orbits", "decision_effective_priority", "INTEGER"),
+    ("orbits", "blocker_ids", "TEXT NOT NULL DEFAULT '[]'"),
+    ("orbits", "enqueued_at", "REAL"),
+    ("orbits", "wait_deadline", "REAL"),
+    ("orbits", "terminal_reason", "TEXT"),
+    ("idempotency", "args_json", "TEXT"),
+    ("idempotency", "operation_id", "TEXT"),
+    ("idempotency", "owner_instance", "TEXT"),
+    ("idempotency", "owner_generation", "INTEGER"),
     # 증분6(§D3 flags): EPHEMERAL/LATCH 분리 + wait register→poll.
     ("flags", "flag_type", "TEXT NOT NULL DEFAULT 'LATCH'"),
     ("flags", "epoch", "INTEGER NOT NULL DEFAULT 0"),
@@ -187,36 +308,211 @@ def _rows(c) -> list[dict]:
 
 
 class Store:
-    def __init__(self, db_path: str = ":memory:"):
+    def __init__(self, db_path: str = ":memory:", *, initialize: bool = False):
         # autocommit 모드: BEGIN을 우리가 명시 발행(tx()). 기본("") 모드는 DML 전 암묵 BEGIN을
         # 끼워넣어 BEGIN IMMEDIATE를 무력화하므로 반드시 None.
         self.db = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
-        # WAL: 동시 reader가 단일 writer를 안 막음 + 멀티프로세스 안전(BEGIN IMMEDIATE 백스톱).
         # busy_timeout: writer 경합 시 즉시 SQLITE_BUSY 대신 블록-재시도. (CONCURRENCY §D1)
-        self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA synchronous=NORMAL")
-        self.db.executescript(_SCHEMA)
-        self._migrate()
         self._txn_depth = 0
+        self._after_commit_hooks = {}
+        # Coordinator가 migration 전에 리더 lease를 획득할 수 있게 하는 최소 bootstrap.
+        # 기존 DB에서는 no-op이며, 실제 domain schema와 data migration은 initialize()만 쓴다.
+        meta_exists = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+        ).fetchone()
+        if meta_exists is None:
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
+            )
+        if initialize:
+            self.initialize()
+
+    def schema_current(self) -> bool:
+        """Pure startup probe used before Coordinator leadership admission."""
+        return self.get_meta("schema_version") == SCHEMA_VERSION
+
+    def schema_requires_migration(self) -> bool:
+        """Return legacy/current state and reject unknown generations read-only."""
+        version = self.get_meta("schema_version")
+        if version in MIGRATABLE_SCHEMA_VERSIONS:
+            return True
+        if version == SCHEMA_VERSION:
+            return False
+        raise UnsupportedSchemaVersion(
+            f"unsupported OMD schema version {version!r}; "
+            f"this binary supports {SCHEMA_VERSION!r}"
+        )
+
+    def initialize(self) -> bool:
+        """Install or migrate the domain schema once; return whether it changed.
+
+        Production Coordinator calls this only after startup authority has been
+        established.  Direct Store users must opt in with ``initialize=True``.
+        The durable version makes a current-schema startup a read-only fast path.
+        """
+        changed = self.schema_requires_migration()
+        if changed:
+            self.db.executescript(_SCHEMA)
+            self._migrate()
+            # WAL activation is intentionally inside the authority-gated
+            # migration path because changing journal mode is persistent.
+            self.db.execute("PRAGMA journal_mode=WAL")
+            # Version is the final completion marker.  A crash before here
+            # leaves the DB explicitly legacy so idempotent migration retries.
+            with self.tx():
+                self.set_meta("schema_version", SCHEMA_VERSION)
+        return changed
 
     def _migrate(self):
-        """멱등 컬럼 추가(증분3) — 기존 DB도 안전하게 신규 컬럼을 얻는다(fresh-DB 친화)."""
-        for table, col, decl in _MIGRATIONS:
-            cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
-            if col not in cols:
-                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        """Additive, crash-safe schema migration including durable queue order.
+
+        M1 may start on a DB containing legacy PENDING rows.  Those rows receive
+        tickets in deterministic ``created_at, orbit_id`` order exactly once.
+        BEGIN IMMEDIATE prevents two coordinator processes from racing the
+        backfill or creating duplicate queue authority.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            added_columns = set()
+            for table, col, decl in _MIGRATIONS:
+                cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+                if col not in cols:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                    added_columns.add((table, col))
+            # The additive column defaults old rows to DB-only.  Recover the
+            # durable mode for legacy Git attempts from fields that only a
+            # repo-bound connect populated; otherwise a repo-less restart could
+            # misclassify a committed external effect as a safe DB rollback.
+            # This is a one-shot interpretation of rows from the schema that
+            # did not have the mode column.  Re-running it on every startup
+            # would overwrite an explicit modern DB-only decision.
+            if ("tasks", "connect_repo_bound") in added_columns:
+                self.db.execute(
+                    "UPDATE tasks SET connect_repo_bound=1 "
+                    "WHERE state IN ('CONNECTING','MERGED') AND connect_repo_bound=0 "
+                    "AND connect_attempt_id IS NULL "
+                    "AND (integration_base_sha IS NOT NULL OR branch_tip_sha IS NOT NULL "
+                    "OR merge_sha IS NOT NULL OR worktree IS NOT NULL OR branch IS NOT NULL)"
+                )
+            max_ticket = self.db.execute(
+                "SELECT MAX(queue_seq) AS n FROM orbits "
+                "WHERE kind='orbit' AND queue_seq IS NOT NULL"
+            ).fetchone()["n"]
+            if max_ticket is not None and self.current_seq() < int(max_ticket):
+                self.set_meta("seq", int(max_ticket))
+            legacy = self.db.execute(
+                "SELECT * FROM orbits WHERE kind='orbit' AND state='PENDING' "
+                "AND (queue_seq IS NULL OR requested_ttl IS NULL "
+                "OR policy_version IS NULL OR pathspec_digest IS NULL "
+                "OR request_id IS NULL OR enqueued_at IS NULL OR wait_deadline IS NULL) "
+                "ORDER BY created_at ASC, orbit_id ASC"
+            ).fetchall()
+            for row in legacy:
+                enqueued_at = (
+                    row["enqueued_at"]
+                    if row["enqueued_at"] is not None
+                    else row["created_at"] if row["created_at"] is not None else time.time()
+                )
+                ticket = row["queue_seq"]
+                if ticket is None:
+                    ticket = self.next_seq()
+                paths = json.loads(row["pathspec"])
+                self.db.execute(
+                    "UPDATE orbits SET queue_seq=?, requested_ttl=?, policy_version=?, "
+                    "pathspec_digest=?, request_id=?, enqueued_at=?, wait_deadline=? "
+                    "WHERE orbit_id=?",
+                    (
+                        ticket,
+                        row["requested_ttl"] if row["requested_ttl"] is not None else 600.0,
+                        row["policy_version"] or LEGACY_ADMISSION_POLICY_VERSION,
+                        row["pathspec_digest"] or pathspec_digest(paths),
+                        row["request_id"] or f"internal:{row['orbit_id']}",
+                        enqueued_at,
+                        row["wait_deadline"]
+                        if row["wait_deadline"] is not None
+                        else enqueued_at + 3600.0,
+                        row["orbit_id"],
+                    ),
+                )
+            self.db.execute(
+                "UPDATE orbits SET decision_schema='admission_decision/v1' "
+                "WHERE decision_id IS NOT NULL AND decision_schema IS NULL"
+            )
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_orbits_queue_seq "
+                "ON orbits(queue_seq) "
+                "WHERE kind='orbit' AND queue_seq IS NOT NULL"
+            )
+            # Older M1 snapshots constrained only live rows and could therefore
+            # leave multiple terminal generation-zero histories.  Within one
+            # duplicated generation, preserve the oldest terminal history and
+            # move later history -- with any current live authority last -- to
+            # fresh generations.  This keeps latest_orbit_by_request() pointed at
+            # HELD/PENDING rather than letting migrated history shadow it.
+            duplicate_generations = self.db.execute(
+                "SELECT request_id,request_generation FROM orbits "
+                "WHERE kind='orbit' AND request_id IS NOT NULL "
+                "GROUP BY request_id,request_generation HAVING COUNT(*)>1 "
+                "ORDER BY request_id,request_generation"
+            ).fetchall()
+            for duplicate in duplicate_generations:
+                request_id = duplicate["request_id"]
+                generation = duplicate["request_generation"]
+                # A successful claim cache embeds request_generation in its
+                # response.  Renumbering would make that response stale, while
+                # the durable orbit can reconstruct the exact replay safely.
+                self.db.execute(
+                    "DELETE FROM idempotency WHERE request_id=? AND verb='claim'",
+                    (request_id,),
+                )
+                rows = self.db.execute(
+                    "SELECT orbit_id,state,created_at FROM orbits "
+                    "WHERE kind='orbit' AND request_id=? AND request_generation=? "
+                    "ORDER BY CASE WHEN state IN ('PENDING','HELD') THEN 1 ELSE 0 END, "
+                    "created_at ASC, orbit_id ASC",
+                    (request_id, generation),
+                ).fetchall()
+                maximum = self.db.execute(
+                    "SELECT MAX(request_generation) AS generation FROM orbits "
+                    "WHERE kind='orbit' AND request_id=?",
+                    (request_id,),
+                ).fetchone()["generation"]
+                next_generation = int(maximum) + 1
+                for row in rows[1:]:
+                    self.db.execute(
+                        "UPDATE orbits SET request_generation=?, "
+                        "authority_snapshot_hash=NULL, decision_id=NULL, "
+                        "decision_type='MIGRATION_RENUMBERED' WHERE orbit_id=?",
+                        (next_generation, row["orbit_id"]),
+                    )
+                    next_generation += 1
+            # A request generation is a lifecycle identity, not merely a live
+            # lease key. Recreate any partial predecessor fail-closed.
+            self.db.execute("DROP INDEX IF EXISTS uq_orbits_request_generation")
+            self.db.execute(
+                "CREATE UNIQUE INDEX uq_orbits_request_generation "
+                "ON orbits(request_id,request_generation) "
+                "WHERE kind='orbit' AND request_id IS NOT NULL"
+            )
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        else:
+            self.db.execute("COMMIT")
 
     # --- 트랜잭션 경계(재진입 가능) ---
     @contextmanager
-    def tx(self):
+    def tx(self, *, committed_hooks=None):
         """BEGIN IMMEDIATE … COMMIT(정상) / ROLLBACK(예외). 깊이 카운터로 재진입 안전:
         중첩 호출은 새 BEGIN을 열지 않고, 최외곽에서만 COMMIT/ROLLBACK 한다.
         예외가 최외곽까지 전파되면 전체를 롤백(부분쓰기 없음); 중간에서 잡혀 정상 종료하면 COMMIT."""
         if self._txn_depth == 0:
             self.db.execute("BEGIN IMMEDIATE")
+            self._after_commit_hooks = {}
         self._txn_depth += 1
         try:
             yield
@@ -224,11 +520,35 @@ class Store:
             self._txn_depth -= 1
             if self._txn_depth == 0:
                 self.db.execute("ROLLBACK")
+                self._after_commit_hooks = {}
             raise
         else:
             self._txn_depth -= 1
             if self._txn_depth == 0:
                 self.db.execute("COMMIT")
+                hooks = list(self._after_commit_hooks.values())
+                self._after_commit_hooks = {}
+                if committed_hooks is not None:
+                    # Coordinator._cs supplies a per-call collector so the
+                    # external notification port is entered only after its
+                    # authority RLock has been released.  The collector belongs
+                    # to the outermost tx; nested tx contexts do not commit and
+                    # therefore leave their own collectors empty.
+                    committed_hooks.extend(hooks)
+                else:
+                    # Direct Store callers have no Coordinator lock to escape.
+                    # Preserve the fail-soft after-commit behavior for them.
+                    for hook in hooks:
+                        try:
+                            hook()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+    def after_commit(self, callback, *, key=None) -> None:
+        """Run one fail-soft callback after the outermost transaction commits."""
+        if self._txn_depth <= 0:
+            raise RuntimeError("after_commit requires an active transaction")
+        self._after_commit_hooks[key if key is not None else id(callback)] = callback
 
     # --- fence: 단조 증가·유일 토큰 (P0-2: 단일문 +1, 읽고-쓰기 갭 제거) ---
     def next_fence(self) -> int:
@@ -247,6 +567,10 @@ class Store:
             "SET value=CAST(value AS INTEGER)+1")
         return int(self.db.execute(
             "SELECT value FROM meta WHERE key='seq'").fetchone()["value"])
+
+    def current_seq(self) -> int:
+        row = self.db.execute("SELECT value FROM meta WHERE key='seq'").fetchone()
+        return int(row["value"]) if row else -1
 
     # --- meta (일반 KV: 증분9 D12 integration_gen / D14 leader_lease) ---
     def get_meta(self, key, default=None):
@@ -325,16 +649,30 @@ class Store:
     def add_orbit(self, *, task_id, agent_id, pathspec, mode, state,
                   fence=None, expires_at=None, reason="", priority=0,
                   kind="orbit", resource_key=None, intent_key=None,
-                  read_gen=None) -> str:
-        oid = "orb-" + uuid.uuid4().hex[:12]
+                  read_gen=None, orbit_id=None, queue_seq=None,
+                  requested_ttl=None, policy_version=None,
+                  pathspec_digest=None, request_id=None, request_generation=0,
+                  bail_epoch=0, authority_snapshot_hash=None, decision_id=None,
+                  decision_type=None, decision_schema=None,
+                  decision_observed_at=None, decision_effective_priority=None,
+                  blocker_ids=None, enqueued_at=None,
+                  wait_deadline=None, terminal_reason=None) -> str:
+        oid = orbit_id or "orb-" + uuid.uuid4().hex[:12]
         self.db.execute(
             "INSERT INTO orbits(orbit_id,task_id,agent_id,pathspec,mode,state,"
             "fence,expires_at,created_at,reason,priority,kind,resource_key,intent_key,"
-            "read_gen) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "read_gen,queue_seq,requested_ttl,policy_version,pathspec_digest,request_id,"
+            "request_generation,bail_epoch,authority_snapshot_hash,decision_id,blocker_ids,"
+            "decision_type,decision_schema,decision_observed_at,"
+            "decision_effective_priority,enqueued_at,wait_deadline,terminal_reason) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (oid, task_id, agent_id, json.dumps(pathspec), mode, state,
              fence, expires_at, time.time(), reason, priority, kind, resource_key,
-             intent_key, read_gen))
+             intent_key, read_gen, queue_seq, requested_ttl, policy_version,
+             pathspec_digest, request_id, request_generation, bail_epoch,
+             authority_snapshot_hash, decision_id, json.dumps(blocker_ids or []),
+             decision_type, decision_schema, decision_observed_at,
+             decision_effective_priority, enqueued_at, wait_deadline, terminal_reason))
         return oid
 
     def orbit_by_intent(self, intent_key) -> dict | None:
@@ -344,18 +682,83 @@ class Store:
             "SELECT * FROM orbits WHERE intent_key=? AND state IN ('HELD','PENDING') "
             "ORDER BY created_at ASC LIMIT 1", (intent_key,)))
 
+    def orbit_by_request(self, request_id, request_generation=None) -> dict | None:
+        if request_id is None:
+            return None
+        if request_generation is None:
+            return _row(self.db.execute(
+                "SELECT * FROM orbits WHERE request_id=? AND kind='orbit' "
+                "ORDER BY request_generation DESC, created_at ASC LIMIT 1",
+                (request_id,),
+            ))
+        return _row(self.db.execute(
+            "SELECT * FROM orbits WHERE request_id=? AND request_generation=? "
+            "AND kind='orbit' "
+            "ORDER BY created_at ASC LIMIT 1",
+            (request_id, request_generation),
+        ))
+
+    def latest_orbit_by_request(self, request_id) -> dict | None:
+        """Latest lifecycle row, including terminal generations."""
+        if request_id is None:
+            return None
+        return _row(self.db.execute(
+            "SELECT * FROM orbits WHERE request_id=? AND kind='orbit' "
+            "ORDER BY request_generation DESC, created_at DESC LIMIT 1",
+            (request_id,),
+        ))
+
+    def next_request_generation(self, request_id) -> int:
+        """Allocate the next durable generation for an explicit request id."""
+        row = self.db.execute(
+            "SELECT MAX(request_generation) AS generation FROM orbits "
+            "WHERE kind='orbit' AND request_id=?",
+            (request_id,),
+        ).fetchone()
+        current = row["generation"] if row else None
+        return 0 if current is None else int(current) + 1
+
     def get_orbit(self, oid) -> dict | None:
         return _row(self.db.execute("SELECT * FROM orbits WHERE orbit_id=?", (oid,)))
 
     def set_orbit(self, oid, *, state=..., expires_at=..., released_at=..., fence=...,
                   merging=..., merge_deadline=..., merge_started_mono=...,
-                  read_gen=..., stale=...):
+                  operation_id=..., owner_instance=..., owner_generation=...,
+                  read_gen=..., stale=..., authority_snapshot_hash=...,
+                  decision_id=..., decision_type=..., decision_schema=...,
+                  decision_observed_at=..., decision_effective_priority=...,
+                  blocker_ids=...,
+                  enqueued_at=..., wait_deadline=..., terminal_reason=...):
+        if decision_id is None:
+            # A lifecycle event replaces the admission decision digest. Clear
+            # its schema/rank evidence in the same update so stale v2 evidence
+            # cannot appear to belong to RENEW/RELEASE/EXPIRE/CANCEL/TIMEOUT.
+            if decision_schema is ...:
+                decision_schema = None
+            if decision_observed_at is ...:
+                decision_observed_at = None
+            if decision_effective_priority is ...:
+                decision_effective_priority = None
         sets, args = [], []
         for col, val in (("state", state), ("expires_at", expires_at),
                          ("released_at", released_at), ("fence", fence),
                          ("merging", merging), ("merge_deadline", merge_deadline),
                          ("merge_started_mono", merge_started_mono),
-                         ("read_gen", read_gen), ("stale", stale)):
+                         ("operation_id", operation_id),
+                         ("owner_instance", owner_instance),
+                         ("owner_generation", owner_generation),
+                         ("read_gen", read_gen), ("stale", stale),
+                         ("authority_snapshot_hash", authority_snapshot_hash),
+                         ("decision_id", decision_id),
+                         ("decision_type", decision_type),
+                         ("decision_schema", decision_schema),
+                         ("decision_observed_at", decision_observed_at),
+                         ("decision_effective_priority", decision_effective_priority),
+                         ("blocker_ids", json.dumps(blocker_ids)
+                          if blocker_ids is not ... else ...),
+                         ("enqueued_at", enqueued_at),
+                         ("wait_deadline", wait_deadline),
+                         ("terminal_reason", terminal_reason)):
             if val is not ...:
                 sets.append(f"{col}=?"); args.append(val)
         if not sets:
@@ -369,10 +772,22 @@ class Store:
             "SELECT * FROM orbits WHERE state='HELD' AND kind='orbit'"))
 
     def pending_orbits(self) -> list[dict]:
-        # 우선순위 DESC → 같으면 FIFO(created_at ASC). 기아 방지 기본. merge_token 제외.
+        # Raw durable order only. Dynamic v2 effective priority is evaluated by
+        # the pure queue policy at one observed_at inside Coordinator authority.
         return _rows(self.db.execute(
             "SELECT * FROM orbits WHERE state='PENDING' AND kind='orbit' "
-            "ORDER BY priority DESC, created_at ASC"))
+            "ORDER BY queue_seq ASC"))
+
+    def pending_queue_stats(self) -> dict:
+        """Repository-authority PENDING depth and earliest automatic relief."""
+        row = self.db.execute(
+            "SELECT COUNT(*) AS depth, MIN(wait_deadline) AS earliest_wait_deadline "
+            "FROM orbits WHERE state='PENDING' AND kind='orbit'"
+        ).fetchone()
+        return {
+            "depth": int(row["depth"] or 0),
+            "earliest_wait_deadline": row["earliest_wait_deadline"],
+        }
 
     def orbits_for_task(self, task_id) -> list[dict]:
         return _rows(self.db.execute(
@@ -383,6 +798,15 @@ class Store:
         return _rows(self.db.execute(
             "SELECT * FROM orbits WHERE state='HELD' AND kind='orbit' AND merging=0 "
             "AND expires_at IS NOT NULL AND expires_at<=?", (now,)))
+
+    def due_pending_orbits(self, now) -> list[dict]:
+        """PENDING requests whose recorded authority deadline is due."""
+        return _rows(self.db.execute(
+            "SELECT * FROM orbits WHERE state='PENDING' AND kind='orbit' "
+            "AND wait_deadline IS NOT NULL AND wait_deadline<=? "
+            "ORDER BY wait_deadline ASC, queue_seq ASC",
+            (now,),
+        ))
 
     # --- tasks ---
     def add_task(self, *, task_id, name, writes, reads, deps, state, priority, shared=None):
@@ -401,6 +825,10 @@ class Store:
     def set_task(self, task_id, *, state=..., agent_id=..., worktree=..., branch=...,
                  connect_fence=..., connect_intent_at=..., branch_tip_sha=...,
                  integration_base_sha=..., merge_sha=..., merged_at=...,
+                 connect_attempt_id=..., connect_owner_instance=...,
+                 connect_owner_generation=..., connect_token_id=...,
+                 connect_request_id=..., connect_arg_hash=...,
+                 connect_repo_bound=...,
                  read_synced_gen=..., reclaims=...):
         sets, args = [], []
         for col, val in (("state", state), ("agent_id", agent_id),
@@ -409,6 +837,13 @@ class Store:
                          ("connect_intent_at", connect_intent_at),
                          ("branch_tip_sha", branch_tip_sha),
                          ("integration_base_sha", integration_base_sha),
+                         ("connect_attempt_id", connect_attempt_id),
+                         ("connect_owner_instance", connect_owner_instance),
+                         ("connect_owner_generation", connect_owner_generation),
+                         ("connect_token_id", connect_token_id),
+                         ("connect_request_id", connect_request_id),
+                         ("connect_arg_hash", connect_arg_hash),
+                         ("connect_repo_bound", connect_repo_bound),
                          ("merge_sha", merge_sha), ("merged_at", merged_at),
                          ("read_synced_gen", read_synced_gen),
                          ("reclaims", reclaims)):
@@ -515,12 +950,19 @@ class Store:
         return _row(self.db.execute(
             "SELECT * FROM idempotency WHERE request_id=?", (request_id,)))
 
-    def begin_idem(self, request_id, agent_id, verb, arg_hash):
+    def begin_idem(self, request_id, agent_id, verb, arg_hash, args=None):
         """request_id를 INFLIGHT로 등록. 이미 있으면 무시(OR IGNORE) — 호출부가 get_idem으로 분기."""
         self.db.execute(
-            "INSERT OR IGNORE INTO idempotency(request_id,agent_id,verb,arg_hash,status,created_at)"
-            " VALUES(?,?,?,?, 'INFLIGHT', ?)",
-            (request_id, agent_id, verb, arg_hash, time.time()))
+            "INSERT OR IGNORE INTO idempotency(request_id,agent_id,verb,arg_hash,args_json,"
+            "status,created_at) VALUES(?,?,?,?,?, 'INFLIGHT', ?)",
+            (
+                request_id,
+                agent_id,
+                verb,
+                arg_hash,
+                json.dumps(args, sort_keys=True, default=str) if args is not None else None,
+                time.time(),
+            ))
 
     def finish_idem(self, request_id, response):
         """성공 종단만 캐시(DONE). 비성공은 clear_idem로 지운다(재시도 가능해야 — §3.C)."""
@@ -528,9 +970,88 @@ class Store:
             "UPDATE idempotency SET status='DONE', response=?, completed_at=? WHERE request_id=?",
             (json.dumps(response), time.time(), request_id))
 
+    def finish_idem_exact(self, request_id, agent_id, verb, arg_hash, response) -> bool:
+        """CAS an INFLIGHT row to DONE only for its original request envelope."""
+        cur = self.db.execute(
+            "UPDATE idempotency SET status='DONE', response=?, completed_at=? "
+            "WHERE request_id=? AND agent_id IS ? AND verb=? AND arg_hash=? "
+            "AND status='INFLIGHT'",
+            (json.dumps(response), time.time(), request_id, agent_id, verb, arg_hash),
+        )
+        return cur.rowcount == 1
+
+    def bind_idem_operation_exact(self, request_id, agent_id, verb, arg_hash, *,
+                                  operation_id, owner_instance,
+                                  owner_generation) -> bool:
+        """Bind an INFLIGHT request to one exact split-effect generation."""
+        cur = self.db.execute(
+            "UPDATE idempotency SET operation_id=?,owner_instance=?,owner_generation=? "
+            "WHERE request_id=? AND agent_id IS ? AND verb=? AND arg_hash=? "
+            "AND status='INFLIGHT' AND operation_id IS NULL",
+            (operation_id, owner_instance, owner_generation, request_id, agent_id,
+             verb, arg_hash),
+        )
+        return cur.rowcount == 1
+
+    def takeover_idem_operation_exact(self, request_id, agent_id, verb, arg_hash, *,
+                                      operation_id, previous_owner,
+                                      previous_generation, owner_instance,
+                                      owner_generation) -> bool:
+        """Recovery CAS for the exact durable operation envelope."""
+        cur = self.db.execute(
+            "UPDATE idempotency SET owner_instance=?,owner_generation=? "
+            "WHERE request_id=? AND agent_id IS ? AND verb=? AND arg_hash=? "
+            "AND status='INFLIGHT' AND operation_id=? "
+            "AND owner_instance IS ? AND owner_generation IS ?",
+            (owner_instance, owner_generation, request_id, agent_id, verb, arg_hash,
+             operation_id, previous_owner, previous_generation),
+        )
+        return cur.rowcount == 1
+
+    def mark_idem_retryable_exact(self, request_id, agent_id, verb, arg_hash) -> bool:
+        """Preserve a recovered request envelope while allowing its exact retry.
+
+        Split-phase recovery uses RETRYABLE only after the authoritative state
+        proves that the effect did not commit.  Keeping the row (rather than
+        deleting it) prevents another envelope from stealing the request id.
+        """
+        cur = self.db.execute(
+            "UPDATE idempotency SET status='RETRYABLE', response=NULL, "
+            "completed_at=NULL WHERE request_id=? AND agent_id IS ? AND verb=? "
+            "AND arg_hash=? AND status='INFLIGHT'",
+            (request_id, agent_id, verb, arg_hash),
+        )
+        return cur.rowcount == 1
+
+    def reopen_idem_exact(self, request_id, agent_id, verb, arg_hash) -> bool:
+        """Atomically reclaim an exact RETRYABLE envelope for a new attempt."""
+        cur = self.db.execute(
+            "UPDATE idempotency SET status='INFLIGHT', created_at=?, response=NULL, "
+            "completed_at=NULL,operation_id=NULL,owner_instance=NULL,owner_generation=NULL "
+            "WHERE request_id=? AND agent_id IS ? AND verb=? "
+            "AND arg_hash=? AND status='RETRYABLE'",
+            (time.time(), request_id, agent_id, verb, arg_hash),
+        )
+        return cur.rowcount == 1
+
     def clear_idem(self, request_id):
         """비성공(DENIED/stale-fence/fenced_out) — INFLIGHT 흔적 제거 → 세상이 바뀌면 재시도 가능."""
         self.db.execute("DELETE FROM idempotency WHERE request_id=?", (request_id,))
+
+    def clear_idem_exact(self, request_id, agent_id, verb, arg_hash) -> bool:
+        """Delete only the caller's matching unfinished envelope."""
+        cur = self.db.execute(
+            "DELETE FROM idempotency WHERE request_id=? AND agent_id IS ? "
+            "AND verb=? AND arg_hash=? AND status='INFLIGHT'",
+            (request_id, agent_id, verb, arg_hash),
+        )
+        return cur.rowcount == 1
+
+    def inflight_idem(self) -> list[dict]:
+        return _rows(self.db.execute(
+            "SELECT * FROM idempotency WHERE status='INFLIGHT' "
+            "ORDER BY created_at,request_id"
+        ))
 
     def gc_idem(self, cutoff: float) -> int:
         """§D9 멱등 캐시 GC: cutoff 이전에 완료된 DONE 행 삭제(무한누적 차단).
@@ -787,9 +1308,243 @@ class Store:
     def tasks_for_agent(self, agent_id) -> list[dict]:
         return _rows(self.db.execute("SELECT * FROM tasks WHERE agent_id=?", (agent_id,)))
 
+    # --- M1d admission notification outbox ---
+    def enqueue_admission_outbox(
+        self,
+        *,
+        event_id,
+        effect_key,
+        schema_version,
+        repository_id,
+        request_id,
+        request_generation,
+        orbit_id,
+        transition_kind,
+        correlation_id,
+        payload,
+        payload_sha256,
+        created_at,
+        predecessor_event_ids=(),
+    ) -> dict:
+        if self._txn_depth <= 0:
+            raise RuntimeError(
+                "admission outbox enqueue requires an active authority transaction"
+            )
+        predecessor_event_ids = tuple(sorted(set(predecessor_event_ids)))
+        if event_id in predecessor_event_ids:
+            raise RuntimeError("admission outbox event cannot depend on itself")
+        existing = self.get_admission_outbox(event_id)
+        effect_existing = _row(self.db.execute(
+            "SELECT * FROM admission_outbox WHERE effect_key=?", (effect_key,)
+        ))
+        if existing is None:
+            existing = effect_existing
+        if existing is not None:
+            if (
+                existing["event_id"] != event_id
+                or existing["effect_key"] != effect_key
+                or existing["schema_version"] != schema_version
+                or existing["repository_id"] != repository_id
+                or existing["request_id"] != request_id
+                or existing["request_generation"] != request_generation
+                or existing["orbit_id"] != orbit_id
+                or existing["transition_kind"] != transition_kind
+                or existing["correlation_id"] != correlation_id
+                or existing["payload"] != payload
+                or existing["payload_sha256"] != payload_sha256
+            ):
+                raise RuntimeError(
+                    f"admission outbox event_id collision: {event_id}"
+                )
+            existing_predecessors = tuple(
+                row["predecessor_event_id"]
+                for row in self.db.execute(
+                    "SELECT predecessor_event_id FROM "
+                    "admission_outbox_dependencies WHERE event_id=? "
+                    "ORDER BY predecessor_event_id",
+                    (event_id,),
+                ).fetchall()
+            )
+            if existing_predecessors != predecessor_event_ids:
+                raise RuntimeError(
+                    f"admission outbox dependency collision: {event_id}"
+                )
+            return existing
+        self.db.execute(
+            "INSERT INTO admission_outbox("
+            "event_id,effect_key,schema_version,repository_id,request_id,"
+            "request_generation,orbit_id,transition_kind,correlation_id,payload,"
+            "payload_sha256,state,attempts,available_at,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,'PENDING',0,?,?)",
+            (
+                event_id,
+                effect_key,
+                schema_version,
+                repository_id,
+                request_id,
+                request_generation,
+                orbit_id,
+                transition_kind,
+                correlation_id,
+                payload,
+                payload_sha256,
+                created_at,
+                created_at,
+            ),
+        )
+        for predecessor_event_id in predecessor_event_ids:
+            if self.get_admission_outbox(predecessor_event_id) is None:
+                raise RuntimeError(
+                    "admission outbox predecessor is missing: "
+                    f"{predecessor_event_id}"
+                )
+            self.db.execute(
+                "INSERT INTO admission_outbox_dependencies("
+                "event_id,predecessor_event_id) VALUES(?,?)",
+                (event_id, predecessor_event_id),
+            )
+        return self.get_admission_outbox(event_id)
+
+    def admission_outbox_predecessors(self, event_id) -> list[str]:
+        return [
+            row["predecessor_event_id"]
+            for row in self.db.execute(
+                "SELECT predecessor_event_id FROM admission_outbox_dependencies "
+                "WHERE event_id=? ORDER BY predecessor_event_id",
+                (event_id,),
+            ).fetchall()
+        ]
+
+    def get_admission_outbox(self, event_id) -> dict | None:
+        return _row(self.db.execute(
+            "SELECT * FROM admission_outbox WHERE event_id=?", (event_id,)
+        ))
+
+    def admission_outbox_rows(self, states=None) -> list[dict]:
+        if states:
+            q = ",".join("?" * len(states))
+            return _rows(self.db.execute(
+                f"SELECT * FROM admission_outbox WHERE state IN ({q}) "
+                "ORDER BY outbox_seq",
+                list(states),
+            ))
+        return _rows(self.db.execute(
+            "SELECT * FROM admission_outbox ORDER BY outbox_seq"
+        ))
+
+    def claim_next_admission_outbox(self, owner, now, *, lease_ttl) -> dict | None:
+        """Claim one due stream head; a poison stream cannot block another."""
+        if self._txn_depth <= 0:
+            raise RuntimeError(
+                "admission outbox claim requires an active authority transaction"
+            )
+        head = _row(self.db.execute(
+            "SELECT o.* FROM admission_outbox o WHERE o.state!='DELIVERED' "
+            "AND ((o.state='PENDING' AND o.available_at<=?) OR "
+            "(o.state='DELIVERING' AND o.claim_deadline IS NOT NULL "
+            "AND o.claim_deadline<=?)) AND NOT EXISTS ("
+            "SELECT 1 FROM admission_outbox p WHERE "
+            "p.repository_id=o.repository_id AND p.request_id=o.request_id AND "
+            "p.request_generation=o.request_generation AND "
+            "p.outbox_seq<o.outbox_seq AND p.state!='DELIVERED') "
+            "AND NOT EXISTS (SELECT 1 FROM admission_outbox_dependencies d "
+            "LEFT JOIN admission_outbox predecessor "
+            "ON predecessor.event_id=d.predecessor_event_id "
+            "WHERE d.event_id=o.event_id AND (predecessor.event_id IS NULL "
+            "OR predecessor.state!='DELIVERED')) "
+            "ORDER BY o.outbox_seq LIMIT 1",
+            (now, now),
+        ))
+        if head is None:
+            return None
+        claim_token = "outbox-claim-" + uuid.uuid4().hex
+        updated = self.db.execute(
+            "UPDATE admission_outbox SET state='DELIVERING', claimed_by=?, "
+            "claim_token=?, claim_deadline=?, attempts=attempts+1, last_error=NULL "
+            "WHERE event_id=? AND ((state='PENDING' AND available_at<=?) OR "
+            "(state='DELIVERING' AND claim_deadline IS NOT NULL "
+            "AND claim_deadline<=?))",
+            (owner, claim_token, now + lease_ttl, head["event_id"], now, now),
+        )
+        if updated.rowcount != 1:
+            return None
+        return self.get_admission_outbox(head["event_id"])
+
+    def ack_admission_outbox(self, event_id, claim_token, delivered_at) -> bool:
+        if self._txn_depth <= 0:
+            raise RuntimeError(
+                "admission outbox ACK requires an active authority transaction"
+            )
+        updated = self.db.execute(
+            "UPDATE admission_outbox SET state='DELIVERED', delivered_at=?, "
+            "claimed_by=NULL, claim_token=NULL, claim_deadline=NULL, last_error=NULL "
+            "WHERE event_id=? AND state='DELIVERING' AND claim_token=?",
+            (delivered_at, event_id, claim_token),
+        )
+        return updated.rowcount == 1
+
+    def retry_admission_outbox(
+        self, event_id, claim_token, available_at, error
+    ) -> bool:
+        if self._txn_depth <= 0:
+            raise RuntimeError(
+                "admission outbox retry requires an active authority transaction"
+            )
+        updated = self.db.execute(
+            "UPDATE admission_outbox SET state='PENDING', available_at=?, "
+            "claimed_by=NULL, claim_token=NULL, claim_deadline=NULL, last_error=? "
+            "WHERE event_id=? AND state='DELIVERING' AND claim_token=?",
+            (available_at, error, event_id, claim_token),
+        )
+        return updated.rowcount == 1
+
+    def admission_outbox_stats(self) -> dict:
+        counts = {
+            row["state"]: int(row["n"])
+            for row in self.db.execute(
+                "SELECT state,COUNT(*) AS n FROM admission_outbox GROUP BY state"
+            ).fetchall()
+        }
+        head = _row(self.db.execute(
+            "SELECT outbox_seq,event_id,state,attempts,available_at,"
+            "claim_deadline,last_error FROM admission_outbox "
+            "WHERE state!='DELIVERED' ORDER BY outbox_seq LIMIT 1"
+        ))
+        return {
+            "pending": counts.get("PENDING", 0),
+            "delivering": counts.get("DELIVERING", 0),
+            "delivered": counts.get("DELIVERED", 0),
+            "head": head,
+        }
+
+    def next_admission_outbox_due_at(self) -> float | None:
+        """Return the earliest due time among per-stream undelivered heads."""
+        row = self.db.execute(
+            "SELECT MIN(CASE WHEN o.state='PENDING' THEN o.available_at "
+            "ELSE o.claim_deadline END) AS due_at FROM admission_outbox o "
+            "WHERE o.state!='DELIVERED' AND NOT EXISTS ("
+            "SELECT 1 FROM admission_outbox p WHERE "
+            "p.repository_id=o.repository_id AND p.request_id=o.request_id AND "
+            "p.request_generation=o.request_generation AND "
+            "p.outbox_seq<o.outbox_seq AND p.state!='DELIVERED') "
+            "AND NOT EXISTS (SELECT 1 FROM admission_outbox_dependencies d "
+            "LEFT JOIN admission_outbox predecessor "
+            "ON predecessor.event_id=d.predecessor_event_id "
+            "WHERE d.event_id=o.event_id AND (predecessor.event_id IS NULL "
+            "OR predecessor.state!='DELIVERED'))"
+        ).fetchone()
+        return None if row is None or row["due_at"] is None else float(row["due_at"])
+
     def snapshot(self) -> dict:
         return {
-            "orbits": _rows(self.db.execute("SELECT orbit_id,task_id,mode,state,fence,expires_at FROM orbits")),
+            "orbits": _rows(self.db.execute(
+                "SELECT orbit_id,task_id,agent_id,mode,state,priority,queue_seq,fence,"
+                "expires_at,requested_ttl,policy_version,decision_id,decision_type,"
+                "decision_schema,decision_observed_at,decision_effective_priority,"
+                "blocker_ids,enqueued_at,wait_deadline "
+                "FROM orbits"
+            )),
             "tasks": _rows(self.db.execute("SELECT task_id,name,state FROM tasks")),
             "flags": _rows(self.db.execute("SELECT key,value FROM flags")),
+            "admission_outbox": self.admission_outbox_stats(),
         }

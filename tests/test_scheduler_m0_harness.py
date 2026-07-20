@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -17,7 +18,6 @@ from benchmarks.omd_scheduler_m0 import (
     parse_workers,
     run_ooptdd,
 )
-from benchmarks.produce_scheduler_m0_receipt import produce
 from scripts.judge_scheduler_m0 import forbidden_key_paths, recompute_obligations
 
 
@@ -81,7 +81,7 @@ def test_cli_stdout_is_machine_readable_json():
         sys.executable,
         str(ROOT / "benchmarks" / "omd_scheduler_m0.py"),
         "--scenarios",
-        "fairness,claims",
+        "claims",
         "--workers",
         "1",
         "--claim-operations",
@@ -101,13 +101,22 @@ def test_cli_stdout_is_machine_readable_json():
     assert payload["harness_failures"] == []
 
 
-def test_locked_ooptdd_gate_can_fail_and_recover(tmp_path):
-    pytest.importorskip("ooptdd")
-    gate = ROOT / "evidence" / "omd_scheduler_m0" / "m0_measurement_gate.yaml"
-    receipt = produce(gate, "omd-scheduler-m0-ooptdd-fresh")
-    assert receipt["positive"]["gate_result"]["ok"] is True
-    assert receipt["negative"]["gate_result"]["ok"] is False
-    assert receipt["restored_positive"]["gate_result"]["ok"] is True
+def test_locked_m0_ooptdd_receipt_remains_a_hash_bound_historical_baseline():
+    """M1 changes live behavior; M0's defect receipt must remain immutable history."""
+    evidence = ROOT / "evidence" / "omd_scheduler_m0"
+    receipt = json.loads((evidence / "ooptdd_receipt.json").read_text())
+    run_path = evidence / "ooptdd_run.json"
+    gate_path = evidence / "m0_measurement_gate.yaml"
+    assert hashlib.sha256(run_path.read_bytes()).hexdigest() == (
+        receipt["positive"]["receipt_sha256"]
+    )
+    assert hashlib.sha256(gate_path.read_bytes()).hexdigest() == receipt["spec"]["sha256"]
+    run = json.loads(run_path.read_text())
+    assert run["positive"]["gate_result"]["ok"] is True
+    assert run["negative"]["gate_result"]["ok"] is False
+    assert run["restored_positive"]["gate_result"]["ok"] is True
+    assert run["positive"]["observation"]["newer_claim_state"] == "HELD"
+    assert run["positive"]["observation"]["no_overtaking_passed"] is False
 
 
 def test_independent_judge_recomputes_obligations_and_rejects_nested_verdicts():

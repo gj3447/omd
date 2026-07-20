@@ -172,3 +172,4 @@ def test_summary_terminal_passthrough():
     # 종료 상태는 그대로 — 관측 rollup 이 authoritative lifecycle 을 뒤엎지 않는다.
     assert task_state.derive_task_phase(_c(deps=True), "MERGED") == "MERGED"
     assert task_state.derive_task_phase(_c(deps=False), "ABORTED") == "ABORTED"
+    assert task_state.derive_task_phase(_c(deps=True, held=True), "POISONED") == "POISONED"

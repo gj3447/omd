@@ -14,6 +14,7 @@
 
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -249,6 +250,97 @@ def test_abort_idempotent(tmp_path):
     omd.barrier_declare("rv", ["A"])
     omd.barrier_abort("rv")
     assert omd.barrier_abort("rv").get("noop")
+
+
+def test_abort_during_trip_stops_remaining_connect_effects(tmp_path):
+    """Abort wins before the next guarded effect: later plan entries never merge."""
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"))
+    fa = _ready(omd, "A", "a")
+    fb = _ready(omd, "B", "b")
+    omd.barrier_declare("rv", ["A", "B"])
+    omd.barrier_arrive("rv", "agA", "A", fence=fa)
+    real_connect_one = omd._barrier_connect_one
+    second_entered = threading.Event()
+    proceed = threading.Event()
+    calls = {"n": 0}
+    result = {}
+
+    def block_before_second(task_id, expected_fence, **trip_guard):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            second_entered.set()
+            assert proceed.wait(5)
+        return real_connect_one(task_id, expected_fence, **trip_guard)
+
+    omd._barrier_connect_one = block_before_second
+
+    def trip():
+        result.update(omd.barrier_arrive(
+            "rv", "agB", "B", fence=fb, request_id="abort-mid-trip"
+        ))
+
+    thread = threading.Thread(target=trip)
+    thread.start()
+    assert second_entered.wait(5)
+    assert omd.store.get_task("A")["state"] == "MERGED"
+    try:
+        aborted = omd.barrier_abort("rv", "agA")
+        assert aborted["ok"] is True and aborted["state"] == "BROKEN"
+    finally:
+        proceed.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+    assert result["ok"] is False and result["state"] == "BROKEN", result
+    assert omd.store.get_task("A")["state"] == "MERGED"
+    assert omd.store.get_task("B")["state"] == "DONE"
+    assert omd.store.get_idem("abort-mid-trip") is None
+    replay = omd.barrier_arrive(
+        "rv", "agB", "B", fence=fb, request_id="abort-mid-trip"
+    )
+    assert replay["ok"] is False and replay["state"] == "BROKEN"
+    assert omd.store.get_idem("abort-mid-trip") is None
+
+
+def test_abort_after_last_effect_never_reports_or_caches_success(tmp_path):
+    """Abort between the last effect and final commit makes the trip response fail."""
+    omd = Coordinator(db_path=str(tmp_path / "omd.db"))
+    fence = _ready(omd, "A", "a")
+    omd.barrier_declare("rv", ["A"])
+    real_connect_one = omd._barrier_connect_one
+    effect_done = threading.Event()
+    proceed = threading.Event()
+    result = {}
+
+    def block_after_effect(task_id, expected_fence, **trip_guard):
+        response = real_connect_one(task_id, expected_fence, **trip_guard)
+        effect_done.set()
+        assert proceed.wait(5)
+        return response
+
+    omd._barrier_connect_one = block_after_effect
+
+    def trip():
+        result.update(omd.barrier_arrive(
+            "rv", "agA", "A", fence=fence, request_id="abort-after-effect"
+        ))
+
+    thread = threading.Thread(target=trip)
+    thread.start()
+    assert effect_done.wait(5)
+    assert omd.store.get_task("A")["state"] == "MERGED"
+    try:
+        aborted = omd.barrier_abort("rv", "agA")
+        assert aborted["ok"] is True and aborted["state"] == "BROKEN"
+    finally:
+        proceed.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+    assert result["ok"] is False and result["state"] == "BROKEN", result
+    assert result["merged"] == ["A"]
+    assert omd.store.barrier_by_name("rv")["state"] == "BROKEN"
+    assert omd.store.get_idem("abort-after-effect") is None
 
 
 # ========== policy: shrink ==========

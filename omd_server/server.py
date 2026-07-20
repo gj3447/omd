@@ -6,7 +6,8 @@ fastmcp 미설치 시 import만 가드 (core/cli/tests는 fastmcp 없이 동작)
 툴 표면:
   about()                                   OMD 가 뭔지/뭐가 아닌지 + 표준 운행 루프 (오리엔테이션)
   claim(agent, paths, mode, ttl, task)      궤도 lease 획득 (입체 검사 → HELD or PENDING)
-  release(orbit_id) / renew(orbit_id, ttl)
+  rollover_claim(prior_orbit_id, generation)  명시적 비정책 종단 N→N+1
+  release(orbit_id) / renew(orbit_id, ttl) / cancel_wait(orbit_id, generation)
   declare(task, name, writes, reads, deps)  write-set(궤도) 선언
   next(agent)                               서로소(입체) READY 작업 추천
   start(task, agent) / finish(task)
@@ -17,21 +18,17 @@ fastmcp 미설치 시 import만 가드 (core/cli/tests는 fastmcp 없이 동작)
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import logging
+import math
 import os
 
-from .core import Coordinator, CoordinatorConflict
+from .admission_config import (
+    parse_admission_aging_quantum as _parse_admission_aging_quantum,
+    parse_admission_max_age_boost as _parse_admission_max_age_boost,
+    parse_admission_queue_capacity as _parse_admission_queue_capacity,
+)
+from .core import Coordinator
 from .events import Emitter
 from .sinks import JsonlSink
-
-_log = logging.getLogger(__name__)
-
-# GAP-3: 리더 heartbeat 루프의 유계 연속-실패 상한. 일시적 오류(DB busy/디스크 히컵)가 리더
-# liveness 를 *조용히* 죽이지 못하게 로그+백오프 후 재시도하되, 연속 실패가 이 값을 넘으면
-# (리스가 사실상 갱신 불가) typed 로 탈출한다 — 무한 에러 루프 금지(sweep 데몬 가드 미러).
-_HEARTBEAT_MAX_CONSECUTIVE_FAILURES = 5
 
 # 첫 접점(MCP `initialize`)에서 클라이언트/에이전트에 그대로 노출되는 자기소개.
 # 비어 있으면 에이전트가 OMD 를 'object-model/스키마/계약 정의물'로 오독한다
@@ -64,72 +61,49 @@ Call about() any time to re-read this orientation. Full design: README.md / CONC
 """
 
 try:
-    import anyio
     from fastmcp import FastMCP
     from fastmcp.server.lifespan import lifespan
 except ImportError:  # 서버 extra 미설치
     FastMCP = None
 
 
-async def _leader_heartbeat_loop(
-    omd: Coordinator,
-    *,
-    max_consecutive_failures: int = _HEARTBEAT_MAX_CONSECUTIVE_FAILURES,
-) -> None:
-    # stdio MCP servers deliberately share one SQLite DB without a process-wide
-    # leader lease. Such coordinators have no lease to refresh, so heartbeat is
-    # not merely unnecessary: coordinator_heartbeat() would fence itself out.
-    if not omd.enforce_single_coordinator:
-        return
-    interval = max(1.0, omd.leader_ttl / 3.0)
-    # GAP-3: sweep 데몬(_periodic_sweep_loop)처럼 per-iteration try/except 로 루프 생존을
-    # 최우선한다. 이전엔 CoordinatorConflict 만 잡아, 다른 어떤 예외 하나가
-    # coordinator_heartbeat() 에서 튀면 background task 가 조용히 죽어 리더 liveness 가
-    # 소멸했다(다른 코디네이터가 takeover 못 함 = 좀비 고착).
-    consecutive_failures = 0
-    while True:
-        await anyio.sleep(interval)
-        try:
-            omd.coordinator_heartbeat()
-            consecutive_failures = 0   # 성공 = 연속-실패 카운터 리셋
-        except CoordinatorConflict:
-            # A takeover permanently fences this coordinator. Do not keep a
-            # noisy background task retrying a lease it can no longer own.
-            return
-        except Exception as exc:  # noqa: BLE001 — 루프 생존 우선(silent kill 금지, 로그+백오프)
-            consecutive_failures += 1
-            _log.warning(
-                "leader heartbeat failed (%d/%d consecutive): %r",
-                consecutive_failures, max_consecutive_failures, exc,
-            )
-            if consecutive_failures >= max_consecutive_failures:
-                # 유계 escalate: 연속 실패가 상한을 넘으면(리스 사실상 갱신 불가) typed 로 탈출.
-                # 무한 에러 루프 금지 — resign()/새 리더 takeover 가 뒤를 잇게 둔다.
-                _log.error(
-                    "leader heartbeat exiting after %d consecutive failures; "
-                    "coordinator liveness abandoned", consecutive_failures,
-                )
-                return
-            # 백오프 후 재시도(연속 실패에 비례, interval 상한). transient 오류에 유계 재시도.
-            await anyio.sleep(min(interval, 0.5 * consecutive_failures))
+DEFAULT_SERVER_SWEEP_INTERVAL = 1.0
 
 
-def _coordinator_lifespan(omd: Coordinator):
+def _parse_server_sweep_interval(raw: str | None) -> float | None:
+    """MCP default is autonomous; exact zero is the operator opt-out."""
+    if raw is None or not raw.strip():
+        return DEFAULT_SERVER_SWEEP_INTERVAL
+    try:
+        interval = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "OMD_SWEEP_INTERVAL must be 0 or a positive finite number"
+        ) from exc
+    if not math.isfinite(interval) or interval < 0:
+        raise ValueError("OMD_SWEEP_INTERVAL must be 0 or a positive finite number")
+    return interval or None
+
+
+def _coordinator_lifespan(omd: Coordinator, *, sweep_interval: float | None = None):
     @lifespan
     async def coordinator_lifespan(server):
-        heartbeat_task = None
-        if omd.enforce_single_coordinator:
-            heartbeat_task = asyncio.create_task(_leader_heartbeat_loop(omd))
         try:
+            # Constructor-time recovery is synchronous, but no background
+            # writer/notifier effect starts until lifespan owns its shutdown.
+            omd.start_background_workers(
+                sweep_interval=sweep_interval,
+                # Even with OMD_SWEEP_INTERVAL=0 an enforced server must retain
+                # its lease through synchronous close/effect joins.
+                heartbeat=omd.enforce_single_coordinator,
+            )
             yield {"omd": omd}
         finally:
-            if heartbeat_task is not None:
-                heartbeat_task.cancel()
-                try:
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await heartbeat_task
-                finally:
-                    omd.resign()
+            # Stop and join the periodic writer before handing leadership off.
+            # close() fails loudly rather than resigning with a live old writer.
+            omd.close()
+            if omd.enforce_single_coordinator:
+                omd.resign()
 
     return coordinator_lifespan
 
@@ -140,19 +114,39 @@ def build_server(db_path: str = "omd.db"):
     # Codex starts stdio MCP servers per client/session. A process-wide singleton
     # leader lease makes concurrent MCP clients fail before initialize; SQLite
     # BEGIN IMMEDIATE still serializes cross-process mutations for this surface.
-    # §D3/D4 백그라운드 sweep: env OMD_SWEEP_INTERVAL(초) 주면 켠다. 미설정=off(inline-only,
-    # 하위호환). 장수 stdio 서버가 유휴하다 처음 불릴 때 만료회수 spike 나던 것을 해소.
-    try:
-        _swp = float(os.environ.get("OMD_SWEEP_INTERVAL") or 0) or None
-    except ValueError:
-        _swp = None
+    # §D3/D4 백그라운드 sweep: MCP는 기본 1초. 빈 값/미설정도 default, 정확한 0만 opt-out,
+    # 양의 finite 값은 override다. 파싱은 Coordinator/DB 생성 전에 fail loud한다.
+    _swp = _parse_server_sweep_interval(os.environ.get("OMD_SWEEP_INTERVAL"))
+    _capacity = _parse_admission_queue_capacity(
+        os.environ.get("OMD_ADMISSION_QUEUE_CAPACITY")
+    )
+    _aging_quantum = _parse_admission_aging_quantum(
+        os.environ.get("OMD_ADMISSION_AGING_QUANTUM_SECONDS")
+    )
+    _max_age_boost = _parse_admission_max_age_boost(
+        os.environ.get("OMD_ADMISSION_MAX_AGE_BOOST")
+    )
     # Q6 observability: env OMD_EVENT_LOG=<path> 주면 모든 OMD 동사 이벤트를 append-only JSONL
     # 로 durable 기록(OpenObserve/vector 가 tail→ship). 미설정=NOOP(기존동작). fail-soft.
     _evlog = os.environ.get("OMD_EVENT_LOG")
     _events = Emitter(JsonlSink(_evlog)) if _evlog else None
-    omd = Coordinator(db_path, enforce_single_coordinator=False,
-                      sweep_interval=_swp, events=_events)
-    mcp = FastMCP("omd", instructions=OMD_INSTRUCTIONS, lifespan=_coordinator_lifespan(omd))
+    omd = Coordinator(
+        db_path,
+        enforce_single_coordinator=False,
+        # build_server() may synchronously initialize/recover durable state, but
+        # must not start a background writer/effect before FastMCP lifespan.
+        sweep_interval=None,
+        autostart_background_workers=False,
+        events=_events,
+        admission_queue_capacity=_capacity,
+        admission_aging_quantum=_aging_quantum,
+        admission_max_age_boost=_max_age_boost,
+    )
+    mcp = FastMCP(
+        "omd",
+        instructions=OMD_INSTRUCTIONS,
+        lifespan=_coordinator_lifespan(omd, sweep_interval=_swp),
+    )
 
     @mcp.tool()
     def about() -> dict:
@@ -197,10 +191,37 @@ def build_server(db_path: str = "omd.db"):
                          request_id=request_id, bail_epoch=bail_epoch)
 
     @mcp.tool()
+    def rollover_claim(prior_orbit_id: str, agent: str, expected_generation: int,
+                       bail_epoch: int, request_id: str) -> dict:
+        """RELEASED/EXPIRED/CANCELLED/TIMED_OUT claim을 명시적으로 N+1 세대로 재입장한다.
+        request_id는 원 claim ID와 다른 rollover 작업 ID다. 보존 기간 안의 exact retry는
+        같은 결과를 재생하며, 이후에도 predecessor fence가 중복 세대 생성을 막는다."""
+        return omd.rollover_claim(
+            prior_orbit_id,
+            agent,
+            expected_generation,
+            bail_epoch=bail_epoch,
+            request_id=request_id,
+        )
+
+    @mcp.tool()
     def release(orbit_id: str, agent: str, fence: int,
                 request_id: str | None = None, bail_epoch: int | None = None) -> dict:
         """궤도 lease 반납. 소유+fence 일치해야(아무나 남의 궤도 해제 불가)."""
         return omd.release(orbit_id, agent, fence, request_id=request_id, bail_epoch=bail_epoch)
+
+    @mcp.tool()
+    def cancel_wait(orbit_id: str, agent: str, request_generation: int, bail_epoch: int,
+                    request_id: str | None = None) -> dict:
+        """PENDING admission wait를 현재 owner+generation+bail_epoch로 인증해 취소한다.
+        request_id는 원래 claim ID와 분리된 취소 작업 ID이며, 성공 재시도는 exactly-once로 재생된다."""
+        return omd.cancel_wait(
+            orbit_id,
+            agent,
+            request_generation,
+            bail_epoch=bail_epoch,
+            request_id=request_id,
+        )
 
     @mcp.tool()
     def cancel(task: str, reason: str = "", request_id: str | None = None) -> dict:

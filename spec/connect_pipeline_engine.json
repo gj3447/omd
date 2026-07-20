@@ -40,6 +40,7 @@
   },
   "state_model": "The versioned ConnectAttempt FSM in spec/connect_pipeline_fsm.json is orthogonal to the existing Task FSM.",
   "protocol": {
+    "scope": "The lists below expose engine boundary commands and environmental outcomes. Lifecycle-only interrupt/audit events and durable record commands remain canonical in spec/connect_pipeline_fsm.json and are not a second protocol.",
     "commands": [
       "SubmitConnect",
       "CancelAttempt",
@@ -50,29 +51,55 @@
       "ReconcileUnknownPublish"
     ],
     "events": [
-      "ConnectQueued",
-      "CandidatePrepared",
-      "ValidationGreen",
-      "ValidationRed",
-      "PublishIntentCommitted",
-      "RefCasSucceeded",
-      "RefCasStale",
-      "PublishReconciled",
-      "ConnectFinalized"
+      "DEQUEUE",
+      "CANDIDATE_READY",
+      "CANDIDATE_FAILED",
+      "VALIDATION_GREEN",
+      "VALIDATION_RED",
+      "VALIDATION_FAILED",
+      "PUBLISH_AUTHORIZED",
+      "AUTHORITY_REJECTED",
+      "INTENT_COMMITTED",
+      "CAS_REPORTED_SUCCESS",
+      "CAS_REPORTED_STALE",
+      "CAS_REPORTED_UNKNOWN",
+      "REF_READ_NEW",
+      "REF_READ_OLD",
+      "REF_READ_OTHER",
+      "REF_READ_UNKNOWN",
+      "FINALIZE_COMMITTED",
+      "FINALIZE_COMMITTED_AFTER_CANCEL",
+      "FINALIZE_COMMITTED_AFTER_TIMEOUT",
+      "FINALIZE_COMMITTED_AFTER_BUDGET_EXHAUSTED",
+      "FINALIZE_FAILED",
+      "RETRIES_EXHAUSTED"
     ],
+    "fsm_control_events": ["CANCEL", "TIMEOUT", "BUDGET_EXHAUSTED", "INTERRUPT_RECORDED"],
     "effects": [
       "PrepareCandidate",
       "RunValidation",
+      "RecordPublishAuthorization",
       "ApplyExpectedOldRefCAS",
-      "PushIntegrationRef",
+      "ReadAuthoritativeIntegrationRef",
+      "ScheduleReconciliation",
+      "FinalizePublishedAttempt",
+      "ReplicatePublishedRef",
       "RemoveWorktree",
       "EmitTelemetry"
     ],
+    "effect_projection": {
+      "fsm_record_and_audit_effects": "Persist in the attempt ledger/outbox and are intentionally summarized rather than duplicated in this engine boundary list.",
+      "EnqueuePostPublishEffects": ["ReplicatePublishedRef", "RemoveWorktree", "EmitTelemetry"],
+      "ReplicatePublishedRef": "Fail-soft replication to an explicitly configured non-authoritative mirror after finalization; it never mutates the authoritative integration ref."
+    },
     "versioning": "Attempt, receipt, event, and snapshot envelopes carry schema versions. Breaking identity or replay changes require a new major version and an explicit migration."
   },
   "invariants": [
     "A published ref points to the exact candidate tree named by a green receipt.",
-    "A receipt is reusable only when base SHA, task tip SHA, candidate tree SHA, write-set digest, fence set, and check-policy digest all match.",
+    "A receipt is reusable only when repo identity, integration ref, base SHA, task tip SHA, candidate commit SHA, candidate tree SHA, write-set digest, fence-set digest, check-policy digest, environment digest, and attempt generation all match.",
+    "A one-time publish_authorization/v1 approval binds generic action, artifact, destination, visibility, scope, actor, expiry, nonce and rationale fields; a development-context digest; the complete receipt identity; owner, bail epoch, coordinator epoch and authority snapshot; expected-old SHA, new commit SHA and publish effect id.",
+    "Every intent, publisher report, independent readback, and finalization receipt correlates to the same publish effect id.",
+    "A connect_finalization_receipt/v1 digest binds Task MERGED, candidate commit and tree, merge log, released fence set, outbox digest and the typed pending interrupt before a final state is accepted.",
     "Integration ref movement uses a sole publisher capability and expected-old-SHA CAS or an equivalent proved primitive.",
     "PUBLISH_INTENT is durable before the external ref update is attempted.",
     "A stale base never reuses a prior green receipt.",
@@ -85,6 +112,8 @@
     "CandidateGit",
     "ValidationRunner",
     "IntegrationRefPublisher",
+    "IndependentRefReader",
+    "ProtectedRefPolicy",
     "Clock",
     "Outbox",
     "TelemetrySink"
@@ -94,25 +123,25 @@
     "concurrency": "Candidate preparation and validation may run concurrently across attempts; final publication remains a short single-ref CAS.",
     "backpressure": "A bounded durable queue rejects or defers admission with an explicit retry-after reason; no 10 ms authoritative busy polling.",
     "cancellation": "Cancellation is accepted before publish intent. During publish intent or reconciliation it is recorded as pending and honored after outcome reconciliation.",
-    "timeouts": "Queue, preparation, validation, CAS, reconciliation, and finalization each have typed deadlines and terminal exhaustion states."
+    "timeouts": "Queue, preparation, validation, CAS, reconciliation, and finalization each have typed deadlines and terminal exhaustion states; repeated unknown readback is bounded by RETRIES_EXHAUSTED."
   },
   "durability": {
     "persistence": "Persist attempt identity and every accepted transition before exposing it as durable.",
     "atomic_commit": "Commit dedup claim, attempt state/version, and outbox intent in one SQLite transaction where a transition requests an effect.",
     "recovery": "If Git ref equals new SHA, repair forward; if it equals expected old SHA, retry from VALIDATED; otherwise enter NEEDS_REPAIR without destructive reset.",
-    "effect_idempotency": "Use attempt_id, effect kind, and attempt generation; same key with different parameters is a conflict.",
+    "effect_idempotency": "Use attempt_id, effect kind, attempt generation, and immutable argument digest; same key with different parameters is a conflict.",
     "migration": "M0 is observation-only. Later slices run legacy and prepared protocols behind a per-repository versioned rollout flag and retain old recovery fixtures."
   },
   "failure_model": [
     "Invalid or stale authority is rejected without Git mutation.",
     "Candidate or validation red leaves the integration ref unchanged.",
-    "CAS base mismatch produces STALE, not an implicit rebase or receipt reuse.",
+    "A publisher stale claim enters independent reconciliation. REF_READ_OLD invalidates the one-time authorization and permits only a fresh token; REF_READ_OTHER enters NEEDS_REPAIR; neither path implicitly rebases or reuses a receipt.",
     "Unknown CAS outcome enters reconciliation and is never blindly retried.",
     "Outbox failures remain observable after publication and do not falsify the published tree."
   ],
   "observability": {
     "traces": [
-      "attempt_id, task_id, repo_id, integration_ref, base_sha, task_tip_sha, candidate_tree_sha, fence set, transition, effect id, and correlation id"
+      "attempt_id, task_id, repo_id, integration_ref, base_sha, task_tip_sha, candidate_commit_sha, candidate_tree_sha, write_set_digest, fence_set_digest, check_policy_digest, environment_digest, attempt_generation, receipt_hash, approval_hash, coordinator_epoch, authority_snapshot_hash, expected_old_sha, new_commit_sha, publish_effect_id, observed_ref_sha, transition, and correlation id"
     ],
     "metrics": [
       "queue depth and age",
@@ -128,7 +157,8 @@
   "security": [
     "Lease, validation, and publication capabilities are explicit and separately scoped.",
     "Validator workers cannot mutate the authoritative integration ref.",
-    "Caller-supplied shell strings are not executed; operator-fixed argv and policy digests bind validation."
+    "Caller-supplied shell strings are not executed; operator-fixed argv and policy digests bind validation.",
+    "The protected-ref authority authenticates its observation time, rejects expired approvals, enforces globally unique nonces, and rejects exact token replay after consumption."
   ],
   "verification": [
     "Validate the machine-readable engine, FSM, trace, and loop contracts.",

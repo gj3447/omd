@@ -77,6 +77,6 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .tla-tools
-          key: tla2tools-latest
+          key: tla2tools-v1.7.4-936a262061c91469
       - name: Model check TLA+ specs
         run: scripts/run_tlc.sh

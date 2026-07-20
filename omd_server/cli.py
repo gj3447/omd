@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
+from .admission_config import (
+    parse_admission_aging_quantum,
+    parse_admission_max_age_boost,
+    parse_admission_queue_capacity,
+)
 from .core import Coordinator
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="omd", description="OMD 입체운행물방울 군단장 CLI")
     p.add_argument("--db", default="omd.db")
+    p.add_argument("--admission-queue-capacity")
+    p.add_argument("--admission-aging-quantum-seconds")
+    p.add_argument("--admission-max-age-boost")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("claim"); c.add_argument("agent"); c.add_argument("paths", nargs="+")
@@ -18,12 +27,24 @@ def main(argv=None):
     c.add_argument("--task"); c.add_argument("--priority", type=int, default=0)
     c.add_argument("--request-id"); c.add_argument("--bail-epoch", type=int)
 
+    rc = sub.add_parser("rollover-claim")
+    rc.add_argument("prior_orbit_id"); rc.add_argument("agent")
+    rc.add_argument("expected_generation", type=int)
+    rc.add_argument("--bail-epoch", type=int, required=True)
+    rc.add_argument("--request-id", required=True)
+
     for verb in ("release", "renew"):
         s = sub.add_parser(verb)
         s.add_argument("orbit_id"); s.add_argument("agent"); s.add_argument("fence", type=int)
         s.add_argument("--request-id"); s.add_argument("--bail-epoch", type=int)
         if verb == "renew":
             s.add_argument("--ttl", type=float, default=600.0)
+
+    cw = sub.add_parser("cancel-wait")
+    cw.add_argument("orbit_id"); cw.add_argument("agent")
+    cw.add_argument("request_generation", type=int)
+    cw.add_argument("--bail-epoch", type=int, required=True)
+    cw.add_argument("--request-id")
 
     # §D12: rebase/재독 후 task 의 read-set 재앵커(유령 읽기 청산).
     rr = sub.add_parser("read-refresh")
@@ -110,17 +131,52 @@ def main(argv=None):
     sub.add_parser("status")
 
     a = p.parse_args(argv)
-    omd = Coordinator(a.db)
+    capacity = parse_admission_queue_capacity(
+        a.admission_queue_capacity
+        if a.admission_queue_capacity is not None
+        else os.environ.get("OMD_ADMISSION_QUEUE_CAPACITY")
+    )
+    aging_quantum = parse_admission_aging_quantum(
+        a.admission_aging_quantum_seconds
+        if a.admission_aging_quantum_seconds is not None
+        else os.environ.get("OMD_ADMISSION_AGING_QUANTUM_SECONDS")
+    )
+    max_age_boost = parse_admission_max_age_boost(
+        a.admission_max_age_boost
+        if a.admission_max_age_boost is not None
+        else os.environ.get("OMD_ADMISSION_MAX_AGE_BOOST")
+    )
+    omd = Coordinator(
+        a.db,
+        # One-shot commands own no background lifecycle. Every verb already
+        # performs inline reconciliation, and cleanup happens before resign.
+        sweep_interval=None,
+        autostart_background_workers=False,
+        admission_queue_capacity=capacity,
+        admission_aging_quantum=aging_quantum,
+        admission_max_age_boost=max_age_boost,
+    )
     rid = lambda: getattr(a, "request_id", None)
     be = lambda: getattr(a, "bail_epoch", None)
     try:
         out = {
             "claim": lambda: omd.claim(a.agent, a.paths, a.mode, ttl=a.ttl, task_id=a.task,
                                        priority=a.priority, request_id=rid(), bail_epoch=be()),
+            "rollover-claim": lambda: omd.rollover_claim(
+                a.prior_orbit_id,
+                a.agent,
+                a.expected_generation,
+                bail_epoch=a.bail_epoch,
+                request_id=a.request_id,
+            ),
             "release": lambda: omd.release(a.orbit_id, a.agent, a.fence,
                                            request_id=rid(), bail_epoch=be()),
             "renew": lambda: omd.renew(a.orbit_id, a.agent, a.fence, a.ttl,
                                        request_id=rid(), bail_epoch=be()),
+            "cancel-wait": lambda: omd.cancel_wait(
+                a.orbit_id, a.agent, a.request_generation,
+                bail_epoch=a.bail_epoch, request_id=rid(),
+            ),
             "read-refresh": lambda: omd.read_refresh(a.task, a.agent, a.fence,
                                                      request_id=rid(), bail_epoch=be()),
             "bail": lambda: omd.bail(a.agent, request_id=rid()),
@@ -183,10 +239,10 @@ def main(argv=None):
         }[a.cmd]()
         print(json.dumps(out, ensure_ascii=False, indent=2))
     finally:
-        try:
-            omd.resign()
-        finally:
-            omd.close()
+        # Join every accepted writer/effect before handing leadership off.
+        # If close fails, resign must not expose the DB to a second writer.
+        omd.close()
+        omd.resign()
 
 
 if __name__ == "__main__":
