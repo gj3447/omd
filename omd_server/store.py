@@ -20,13 +20,22 @@ from contextlib import contextmanager
 
 from .admission import LEGACY_ADMISSION_POLICY_VERSION, pathspec_digest
 
-SCHEMA_VERSION = "omd/2026-07-16-m1-outbox-reclaims"
+SCHEMA_VERSION = "omd/2026-07-20-terminal-gc"
 MIGRATABLE_SCHEMA_VERSIONS = frozenset({
     None,
     "omd/2026-07-15-m1",
     "omd/2026-07-16-m1-aging",
     "omd/2026-07-16-m1-outbox",
+    "omd/2026-07-16-m1-outbox-reclaims",
 })
+
+# W2 terminal GC — fsm.py 실확인 종단(휴면 terminal-at-rest) 상태.
+#  task: MERGED(나가는 전이=abort 뿐), ABORTED(requeue/poison 가능하나 휴면 종단 —
+#        retention 창이 재개 여지를 보존), POISONED(영구 terminal, 나가는 전이 0).
+#        DONE/CONNECTING 은 진행중 워크플로 상태(connect/rollback 경유)라 제외.
+#  orbit: RELEASED/EXPIRED/DENIED — fsm.ORBIT_TRANSITIONS 에 나가는 전이 0.
+TASK_TERMINAL_STATES = ("MERGED", "ABORTED", "POISONED")
+ORBIT_TERMINAL_STATES = ("RELEASED", "EXPIRED", "DENIED")
 
 
 class UnsupportedSchemaVersion(RuntimeError):
@@ -71,7 +80,9 @@ CREATE TABLE IF NOT EXISTS orbits (
   -- integration_gen). 응결이 이 read-궤도와 겹치는 경로를 통합에 추가/변경하면(read_gen < 현 gen
   -- 이면서 겹침) consumer 는 옛 base 위에 빌드 중 → stale=1 로 표시 → connect 전 rebase/재독 강제.
   read_gen INTEGER,
-  stale INTEGER NOT NULL DEFAULT 0     -- 1=read-궤도가 낡음(겹치는 응결이 일어남). connect 차단.
+  stale INTEGER NOT NULL DEFAULT 0,    -- 1=read-궤도가 낡음(겹치는 응결이 일어남). connect 차단.
+  -- W2 terminal GC: terminal(RELEASED/EXPIRED/DENIED) 진입의 lazy-stamp 관측시각.
+  terminal_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_orbits_state ON orbits(state);
 CREATE INDEX IF NOT EXISTS idx_orbits_task ON orbits(task_id);
@@ -103,7 +114,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   read_synced_gen INTEGER,
   -- Bounded zombie recovery: durable across coordinator restart so a poison
   -- task cannot reset its retry budget by reopening the database.
-  reclaims INTEGER NOT NULL DEFAULT 0
+  reclaims INTEGER NOT NULL DEFAULT 0,
+  -- W2 terminal GC: terminal(MERGED/ABORTED/POISONED) 진입의 lazy-stamp 관측시각.
+  terminal_at REAL
 );
 -- 증분9(§D12): 응결 로그 — gen 마다 통합에 추가/변경된 write-globs. consumer connect 가
 -- read_synced_gen 이후 merge 들 중 자기 reads 와 겹치는 게 있는지 본다(유령 읽기 판정).
@@ -295,6 +308,9 @@ _MIGRATIONS = [
     # GAP-1: per-task 좀비회수/bail 재큐 카운터. _reclaim_agent_inline 이 abort→requeue 마다
     # 단조 증가시키고, max_reclaims 초과 시 POISONED(영구 terminal)로 종결(무한 flapping 차단).
     ("tasks", "reclaims", "INTEGER NOT NULL DEFAULT 0"),
+    # W2 terminal GC: terminal 진입 lazy-stamp(첫 관측 sweep 이 박음) — gc_terminal 참조.
+    ("tasks", "terminal_at", "REAL"),
+    ("orbits", "terminal_at", "REAL"),
 ]
 
 
@@ -383,6 +399,9 @@ class Store:
                 if col not in cols:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
                     added_columns.add((table, col))
+            # W2 terminal GC: archive 테이블을 live 스키마의 미러로 생성/동기화.
+            # live 컬럼 ALTER 가 모두 끝난 뒤에 돌아야 미러가 완전하다.
+            self._ensure_archive_schema()
             # The additive column defaults old rows to DB-only.  Recover the
             # durable mode for legacy Git attempts from fields that only a
             # repo-bound connect populated; otherwise a repo-less restart could
@@ -503,6 +522,29 @@ class Store:
             raise
         else:
             self.db.execute("COMMIT")
+
+    def _ensure_archive_schema(self):
+        """W2: tasks_archive/orbits_archive 를 live 스키마 미러 + archived_at 으로
+        생성/동기화(멱등). 컬럼은 PRAGMA 로 live 테이블에서 파생하므로, 향후 _MIGRATIONS
+        가 live 에 컬럼을 더해도 다음 migration 때 archive 가 자동으로 따라붙는다.
+        archive 는 감사 저장이라 제약(PK/NOT NULL/UNIQUE)을 걸지 않는다 — 같은 task_id
+        가 재선언 후 다시 종결되면 archive 에 세대별로 여러 행이 남는 게 정상."""
+        for live, archive in (("tasks", "tasks_archive"), ("orbits", "orbits_archive")):
+            live_cols = self.db.execute(f"PRAGMA table_info({live})").fetchall()
+            exists = self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (archive,)).fetchone()
+            if exists is None:
+                defs = ", ".join(
+                    f"{r['name']} {r['type']}".strip() for r in live_cols)
+                self.db.execute(
+                    f"CREATE TABLE IF NOT EXISTS {archive} ({defs}, archived_at REAL)")
+                continue
+            have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({archive})")}
+            for r in live_cols:
+                if r["name"] not in have:
+                    self.db.execute(
+                        f"ALTER TABLE {archive} ADD COLUMN {r['name']} {r['type']}".rstrip())
 
     # --- 트랜잭션 경계(재진입 가능) ---
     @contextmanager
@@ -1061,6 +1103,74 @@ class Store:
             "DELETE FROM idempotency WHERE status='DONE' AND completed_at IS NOT NULL"
             " AND completed_at < ?", (cutoff,))
         return cur.rowcount
+
+    def gc_terminal(self, now: float, retention_s: float) -> dict:
+        """W2 terminal 행 GC — 삭제가 아니라 *이동*(supersession): terminal 진입 후
+        retention_s 지난 task/orbit 행을 같은 tx 안에서 tasks_archive/orbits_archive 로
+        INSERT → DELETE. 감사 추적은 archive 에 archived_at 스탬프와 함께 보존된다.
+
+        정합성 절대조건: 살아있는(비terminal) task 가 deps 로 참조하는 terminal task 는
+        아카이브하지 않는다 — next_task/deps 게이트가 dep task 의 state('MERGED')를
+        get_task 로 읽으므로, 이동시키면 dep 판정이 영구 미충족으로 깨진다(NOT EXISTS
+        서브쿼리로 배제). orbit 도 살아있는 task 가 참조(소속 task_id 또는
+        connect_token_id)하면 배제.
+
+        terminal 진입 시각은 lazy-stamp: 첫 관측 sweep 이 terminal_at 을 박는다
+        (MERGED 는 merged_at, orbit 은 released_at 이 있으면 그 값 — 실제 종단 시각보다
+        늦을 수는 있어도 이를 수는 없음=보수적). terminal 을 떠난 행(예: ABORTED→requeue)
+        의 낡은 스탬프는 다음 sweep 이 자가치유로 제거. 멱등 — 두 번 돌려도 안전.
+        반환={"tasks": n, "orbits": m} (이번 호출로 이동된 행 수)."""
+        tq = ",".join("?" * len(TASK_TERMINAL_STATES))
+        oq = ",".join("?" * len(ORBIT_TERMINAL_STATES))
+        cutoff = now - retention_s
+        with self.tx():
+            # 0) 자가치유: terminal 을 떠난 task(requeue 재개 등)의 stale 스탬프 제거.
+            self.db.execute(
+                f"UPDATE tasks SET terminal_at=NULL WHERE terminal_at IS NOT NULL "
+                f"AND state NOT IN ({tq})", TASK_TERMINAL_STATES)
+            # 1) lazy-stamp: 이번 sweep 이 처음 본 terminal 행에 진입 관측시각을 박는다.
+            self.db.execute(
+                f"UPDATE tasks SET terminal_at=CASE WHEN state='MERGED' "
+                f"THEN COALESCE(merged_at, ?) ELSE ? END "
+                f"WHERE state IN ({tq}) AND terminal_at IS NULL",
+                (now, now, *TASK_TERMINAL_STATES))
+            self.db.execute(
+                f"UPDATE orbits SET terminal_at=COALESCE(released_at, ?) "
+                f"WHERE state IN ({oq}) AND terminal_at IS NULL",
+                (now, *ORBIT_TERMINAL_STATES))
+            # 2) task 이동 — live task 가 deps 로 참조하면 배제(정합성 절대조건).
+            task_where = (
+                f"state IN ({tq}) AND terminal_at IS NOT NULL AND terminal_at<=? "
+                f"AND NOT EXISTS (SELECT 1 FROM tasks live, "
+                f"json_each(COALESCE(live.deps,'[]')) dep "
+                f"WHERE live.state NOT IN ({tq}) AND dep.value=tasks.task_id)"
+            )
+            task_params = (*TASK_TERMINAL_STATES, cutoff, *TASK_TERMINAL_STATES)
+            task_cols = ",".join(
+                r["name"] for r in self.db.execute("PRAGMA table_info(tasks)"))
+            self.db.execute(
+                f"INSERT INTO tasks_archive({task_cols},archived_at) "
+                f"SELECT {task_cols},? FROM tasks WHERE {task_where}",
+                (now, *task_params))
+            n_tasks = self.db.execute(
+                f"DELETE FROM tasks WHERE {task_where}", task_params).rowcount
+            # 3) orbit 이동 — live task 가 참조(소속 task_id / connect_token_id)하면 배제.
+            orbit_where = (
+                f"state IN ({oq}) AND terminal_at IS NOT NULL AND terminal_at<=? "
+                f"AND NOT EXISTS (SELECT 1 FROM tasks lt "
+                f"WHERE lt.state NOT IN ({tq}) "
+                f"AND (lt.task_id=orbits.task_id OR lt.connect_token_id=orbits.orbit_id))"
+            )
+            orbit_params = (*ORBIT_TERMINAL_STATES, cutoff, *TASK_TERMINAL_STATES)
+            orbit_cols = ",".join(
+                r["name"] for r in self.db.execute("PRAGMA table_info(orbits)"))
+            self.db.execute(
+                f"INSERT INTO orbits_archive({orbit_cols},archived_at) "
+                f"SELECT {orbit_cols},? FROM orbits WHERE {orbit_where}",
+                (now, *orbit_params))
+            n_orbits = self.db.execute(
+                f"DELETE FROM orbits WHERE {orbit_where}", orbit_params).rowcount
+        return {"tasks": n_tasks, "orbits": n_orbits}
 
     # --- agents (물방울 heartbeat / 좀비 회수) ---
     def upsert_agent(self, agent_id, name=None, state="WORKING", now=None):

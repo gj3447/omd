@@ -269,6 +269,7 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                  enforce_single_coordinator: bool = True,
                  auto_push: str | None = None,
                  idem_ttl: float | None = 3600.0,
+                 terminal_retention: float | None = None,
                  max_reclaims: int = 3,
                  admission_wait_timeout: float = 3600.0,
                  admission_queue_capacity: int = DEFAULT_ADMISSION_QUEUE_CAPACITY,
@@ -671,6 +672,29 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # §D9 멱등 캐시 GC TTL(초). 기본 1h — 어떤 현실적 MCP 재시도 윈도우보다 길어 replay 안전.
         # None=GC 안 함(기존동작). _sweep_inline 이 idem_ttl 지난 DONE 행 정리(무한누적 차단).
         self.idem_ttl = idem_ttl
+        # W2 terminal GC retention(초): terminal(휴면 종단) task/orbit 행을 이 창 경과 후
+        # tasks_archive/orbits_archive 로 *이동*(supersession — 삭제 아님, 감사 추적 보존).
+        # 기본 7일(604800) — ABORTED→requeue 재개 여지·멱등 replay 창(idem_ttl)보다 충분히
+        # 길다. 0=off. 인자 미지정(None) 시 env OMD_TERMINAL_RETENTION 폴백(auto_push 패턴).
+        if terminal_retention is None:
+            raw = (os.environ.get("OMD_TERMINAL_RETENTION") or "").strip()
+            if raw:
+                try:
+                    terminal_retention = float(raw)
+                except ValueError as exc:
+                    raise ValueError(
+                        "OMD_TERMINAL_RETENTION must be a number of seconds") from exc
+            else:
+                terminal_retention = 604800.0
+        try:
+            terminal_retention = float(terminal_retention)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "terminal_retention must be a finite number >= 0 (0=off)") from exc
+        if not math.isfinite(terminal_retention) or terminal_retention < 0:
+            raise ValueError(
+                "terminal_retention must be a finite number >= 0 (0=off)")
+        self.terminal_retention = terminal_retention
         # M1 admission payloads carry a concrete wait deadline. Inline/periodic
         # sweep and restart reconciliation deliver WAIT_TIMEOUT before promotion.
         # Embedded omission is autonomous by default; MCP/CLI pass an explicit
@@ -2373,6 +2397,15 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         # completed_at NULL 로 보존. now 는 위에서 이미 정의됨(시각 일관).
         if self.idem_ttl:
             self.store.gc_idem(now - self.idem_ttl)
+        # W2 terminal GC: terminal 진입 후 retention 지난 task/orbit 행을 archive 로 이동
+        # (supersession — 삭제 아님). live task 가 deps/소속으로 참조하는 행은 store 쿼리가
+        # NOT EXISTS 로 배제(정합성 절대조건). 0/falsy=off.
+        if self.terminal_retention:
+            gc = self.store.gc_terminal(now, self.terminal_retention)
+            if gc["tasks"] or gc["orbits"]:
+                self._emit("terminal_gc", self.coordinator_id,
+                           tasks=gc["tasks"], orbits=gc["orbits"],
+                           retention=self.terminal_retention)
         return now
 
     def _reclaim_zombies_inline(self, *, now=None, promote=True):
