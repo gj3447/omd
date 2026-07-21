@@ -853,6 +853,7 @@ FEEDBACK §P3 잔여("경보 이후가 비어있다") 응답. 선행문헌: Zuul
 
 ### ⬜ 다음 증분 후보
 D13 git/FS 장애 분류 · **P3-O3 Slice 2**(resolve_complete 재무장 + claimability + MCP/CLI) ·
+**admission envelope heal-forward**(over-strict equality 결함 근본수정 — `docs/OPTION_C_ADMISSION_ENVELOPE_HEAL_FORWARD_2026-07-21.md`, PROM 스펙 완비, 재배포게이트) ·
 Contract dual declare-time gate
 (`docs/OMD_DEMPSEY_ROLL.md`의 `PRELIMINARY/VerdictPending`, 사용자 verdict 전 강제 금지).
 (P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6, D4 = 증분7, D5 = 증분8, D12+D14 = 증분9,
