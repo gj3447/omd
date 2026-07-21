@@ -1,5 +1,7 @@
 # OMD 동시성·실패모드 정밀 설계 (CONCURRENCY)
 
+> **STATUS: PARKED (806-green 동결) — 2026-07-21.** 정직한 실측 판정: OMD의 shared-lane은 plain git 대비 *병합가치가 없다*(동일 hot-file 대결에서 병합결과 100% 동일 — `scratchpad/omd_vs_git_contest.py`). 실채택 ~0%(shared 레인·P3·resolve-task 전부 live인 채로 R3 측정). **정체성 정정**: OMD = "병합가치를 더하는 disjoint-lease 조율자"가 *아니라* **worktree 격리 하네스 — 병합은 git이 처리하고, OMD는 그 위에 lease 조율 bookkeeping을 얹는다.** substrate(worktree+git-3way+crash-safe SQLite lease)는 유효하고 책(ai-agent-book ch5/ch10)도 業界主流로 지지하나, 조율 *모델*(pre-lock·file-glob·resource-layer)은 시대착오적. **동결 = 삭제 아님·확대 아님**: 806-green 아티팩트 보존, 활성 조율기능 개발 중단, R3 텔레메트리만 존속. 근거·해동트리거 = memory `project_omd_anachronism_contest_2026_07_21` + `project_dev123_harness_2026_07_21`. 이 문서 이하 설계는 그 동결 시점의 기록.
+
 > 군단장 코어(SINGULON)를 **모든 상황**에서 견디게 만드는 설계서.
 > [`CONCEPT.md`](./CONCEPT.md)·[`SERVER_SPEC.md`](./SERVER_SPEC.md)가 *정상 경로*(은유·데이터모델·상태머신)를 정의한다면,
 > 이 문서는 **물방울이 긴급 탈출하거나 죽거나 분단되거나 코디네이터가 크래시하는** 비정상 경로를 정의한다.
