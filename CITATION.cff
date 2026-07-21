@@ -9,7 +9,7 @@ authors:
     alias: "gj3447"
     affiliation: "Independent Researcher"
 repository-code: "https://github.com/gj3447/omd"
-license: Apache-2.0
+license: AGPL-3.0-or-later
 date-released: "2026-07-15"
 keywords:
   - agent-harness
