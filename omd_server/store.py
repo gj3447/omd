@@ -311,6 +311,12 @@ _MIGRATIONS = [
     # W2 terminal GC: terminal 진입 lazy-stamp(첫 관측 sweep 이 박음) — gc_terminal 참조.
     ("tasks", "terminal_at", "REAL"),
     ("orbits", "terminal_at", "REAL"),
+    # 증분17(P3-O3): 충돌 → resolve-task 자동 승격(jj first-class conflicts). resolve-task는
+    # 원 task(resolve_for)를 가리키고 충돌 경로(resolve_conflict_files)를 기록하는 큐 마커 —
+    # 궤도를 claim하지 않는다(원 task가 아직 write-orbit 보유중이라 같은 파일 claim=자기충돌).
+    # resolve_for + deterministic id(resolve::{task})로 task당 미해소 1개(dedup·멱등).
+    ("tasks", "resolve_for", "TEXT"),
+    ("tasks", "resolve_conflict_files", "TEXT"),
 ]
 
 
@@ -851,15 +857,22 @@ class Store:
         ))
 
     # --- tasks ---
-    def add_task(self, *, task_id, name, writes, reads, deps, state, priority, shared=None):
+    def add_task(self, *, task_id, name, writes, reads, deps, state, priority, shared=None,
+                 resolve_for=None, resolve_conflict_files=None):
         self.db.execute(
-            "INSERT INTO tasks(task_id,name,writes,reads,deps,state,priority,created_at,shared)"
-            " VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET "
+            "INSERT INTO tasks(task_id,name,writes,reads,deps,state,priority,created_at,shared,"
+            "resolve_for,resolve_conflict_files)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET "
             "name=excluded.name,writes=excluded.writes,reads=excluded.reads,"
-            "deps=excluded.deps,priority=excluded.priority,shared=excluded.shared",
+            "deps=excluded.deps,priority=excluded.priority,shared=excluded.shared,"
+            "resolve_for=excluded.resolve_for,"
+            "resolve_conflict_files=excluded.resolve_conflict_files",
             (task_id, name, json.dumps(writes), json.dumps(reads),
              json.dumps(deps), state, priority, time.time(),
-             json.dumps(shared or [])))
+             json.dumps(shared or []),
+             resolve_for,
+             json.dumps(resolve_conflict_files)
+             if resolve_conflict_files is not None else None))
 
     def get_task(self, task_id) -> dict | None:
         return _row(self.db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)))

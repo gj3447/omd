@@ -830,12 +830,35 @@ FEEDBACK §P3 잔여("경보 이후가 비어있다") 응답. 선행문헌: Zuul
 - Core/MCP/CLI가 동일 명령을 노출하고, release/expiry/cancel/timeout, exact replay/conflict, stale fence,
   concurrent `N→N+1`, restart, intent 복제 및 generation exhaustion을 회귀 테스트한다.
 
+### ✅ 증분 17 — P3-O3 충돌 → resolve-task 자동 승격 (jj first-class conflicts) — DONE
+
+증분13 잔여 O3("경보 이후가 비어있다"의 마지막 조각). 증분13은 진단(O1)+rerere(O2)로 '경보
+이후'를 채웠지만, 충돌을 *큐에 들어가는 정상 작업*으로 만드는 O3는 미구현이라 해소는 여전히
+큐 밖 수동작업(rebase→재connect)이었다. R3 실측(hot 공유파일 충돌 = OMD 최약점)이 승격 근거.
+
+- **승격**(`core._promote_resolve_task`): merge conflict(배타/shared 무관)마다 connect 응답에
+  `resolve_task_id` 동봉 + 그 id 의 resolve-task 를 큐에 PENDING 으로 올린다. deterministic id
+  `resolve::{task}` + `resolve_for` dedup → 원 task 당 미해소 resolve-task **정확히 1개(멱등)**.
+  원 task 재연결이 또 충돌하면 같은 id 재사용, 앞서 해소돼 terminal 이면 PENDING reopen.
+- **순수 큐 마커**: resolve-task 는 궤도를 claim 하지 않는다 — 원 task 가 아직 write-orbit 을
+  보유중이라 같은 파일 claim 은 자기충돌. `resolve_conflict_files` 에 충돌 경로만 기록(resolver 참조).
+- **충돌-게이트**: 성공 connect(깨끗한 3-way)는 resolve-task 를 만들지 않는다(무조건 승격 아님).
+- 스키마(additive·멱등 `_migrate`): tasks `resolve_for`/`resolve_conflict_files`. 승격은 connect
+  Phase C 의 `_cs`(락+tx) 안 add_task(원자). 이벤트 `resolve_task_promoted`.
+- 테스트(4 green): `test_p3_o3_resolve_task.py` — 배타승격/멱등(재충돌 1개)/shared승격/**음성오라클**
+  (성공 connect=resolve-task 0개). 음성이 gate teeth — 무조건 승격이면 성공 테스트가 RED.
+- **잔여(Slice 2, 정직)**: resolve-task 완료 → 원 task 재connect 자동 재무장(`resolve_complete`)은
+  미구현 — 현재는 승격(큐에 뜨고 resolver 가 집을 수 있는 데까지). 재무장 배선 + writes=[] task 의
+  next_task claimability(admission 엣지) + MCP/CLI 노출은 다음 슬라이스.
+
 ### ⬜ 다음 증분 후보
-D13 git/FS 장애 분류 · P3-O3 resolve-태스크 승격 · Contract dual declare-time gate
+D13 git/FS 장애 분류 · **P3-O3 Slice 2**(resolve_complete 재무장 + claimability + MCP/CLI) ·
+Contract dual declare-time gate
 (`docs/OMD_DEMPSEY_ROLL.md`의 `PRELIMINARY/VerdictPending`, 사용자 verdict 전 강제 금지).
 (P0-1~P0-11 = 증분1~4, D6 잔여+D9 = 증분5, D3 = 증분6, D4 = 증분7, D5 = 증분8, D12+D14 = 증분9,
 P2 shared 레인 = 증분10, §3.D 배리어 재기동+CONSUMED = 증분11, D14 멀티프로세스 실측 = 증분12,
-P3 충돌 복구 UX = 증분13, runtime guardrails = 증분14~15, request-generation rollover = 증분16에서 닫힘.)
+P3 충돌 복구 UX = 증분13, runtime guardrails = 증분14~15, request-generation rollover = 증분16,
+P3-O3 resolve-task 승격 = 증분17에서 닫힘.)
 
 ---
 

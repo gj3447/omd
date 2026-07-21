@@ -79,7 +79,7 @@ from ._barriers import BarrierMixin
 from ._const import LATCH_RANK, MERGE_PIN_GRACE_S, WRITE_MODES
 from ._flags import FlagMixin
 from ._sems import SemMixin
-from .store import Store
+from .store import Store, TASK_TERMINAL_STATES
 
 # Phase B(락밖 merge) 서브프로세스 타임아웃(§E — 무한 hang 방지). pin은 이보다 길게 잡아
 # 타임아웃→abort→rollback이 완료될 시간을 준다. MERGE_PIN_GRACE_S/WRITE_MODES/LATCH_RANK 는
@@ -5731,6 +5731,30 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
         except GitError:
             return []
 
+    def _promote_resolve_task(self, original_task_id, conflict_files):
+        """P3-O3(증분17): 충돌을 큐에 들어가는 정상 작업으로 승격(jj first-class conflicts).
+        증분13(O1/O2)이 '경보 이후'를 진단·rerere로 채웠지만, 충돌을 *큐 작업*으로 만드는 O3는
+        미구현이었다 — 에이전트가 큐 밖에서 rebase/재연결해야 했다. 이제 충돌마다 resolve-task를
+        큐에 올린다.
+
+        deterministic id `resolve::{task}` + resolve_for dedup 로 원 task당 미해소 resolve-task는
+        정확히 1개(멱등). resolve-task 자체는 궤도를 claim하지 않는 **순수 큐 마커** — 원 task가
+        아직 write-orbit 을 보유중이라 같은 파일 claim 은 자기충돌이 된다. 원 task 재연결이 또
+        충돌하면 같은 id 를 재사용하고, 앞서 해소돼 terminal 이 된 경우엔 PENDING 으로 reopen.
+        반환: resolve_task_id. 반드시 connect Phase C 의 _cs(락+tx) 안에서 호출(add_task 원자)."""
+        rid = f"resolve::{original_task_id}"
+        existing = self.store.get_task(rid)
+        if existing is not None and existing["state"] not in TASK_TERMINAL_STATES:
+            return rid  # 미해소 dedup — 그대로 재사용(멱등)
+        self.store.add_task(
+            task_id=rid, name=f"resolve conflict for {original_task_id}",
+            writes=[], reads=[], deps=[], state="PENDING", priority=0,
+            resolve_for=original_task_id,
+            resolve_conflict_files=list(conflict_files or []))
+        self._emit("resolve_task_promoted", rid, resolve_for=original_task_id,
+                   conflict_files=list(conflict_files or []))
+        return rid
+
     def _connect_phase_b(self, intent, push=None):
         """Phase B(**락 밖** — live tx 없음): 전용 통합 worktree에서 merge --no-ff(타임아웃, §E).
         절대 _cs()/store.tx()를 잡지 않는다 — 다른 코디네이터 변이가 이 동안 interleave 가능.
@@ -5965,6 +5989,10 @@ class Coordinator(FlagMixin, SemMixin, BarrierMixin):
                                                               intent.get("branch_tip_sha")
                                                               or intent.get("branch"),
                                                               err.conflicts)
+                    # P3-O3(증분17): 충돌을 큐에 들어가는 정상 작업으로 승격(jj) — 배타/shared
+                    # 무관. 에이전트가 큐 밖에서 rebase/재연결하는 대신 resolve-task 를 집어 해소.
+                    out["resolve_task_id"] = self._promote_resolve_task(
+                        task_id, err.conflicts)
                 # P2 shared 레인: shared 궤도를 쥔 task 의 merge conflict 는 불변식 버그가
                 # 아니라 **정상사건**(같은 hunk 동시편집) — 경보 대신 rebase 복구 힌트(P3).
                 # 배타(write-only) task 의 conflict 는 기존 '구조적 불가=경보' 의미론 유지.
